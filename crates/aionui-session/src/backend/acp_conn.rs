@@ -396,6 +396,32 @@ struct PendingPrompt {
     turn_gen: u64,
 }
 
+/// Which RESUME dialect the agent speaks. The ACP surface changed shape: the
+/// legacy dialect re-attaches with `session/load` (gated by
+/// `agentCapabilities.loadSession`), the newer one with `session/resume`
+/// (advertised as `sessionCapabilities.resume` — e.g. `dsh`, which does NOT
+/// implement `session/load`). Both take the same params
+/// (`{sessionId, cwd, mcpServers}`) and both answer `{configOptions}`, so the
+/// ONLY wire difference is the method string.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+enum ResumeMethod {
+    /// `session/load` — legacy dialect; also the fallback when the agent
+    /// advertises nothing (pre-existing behaviour).
+    #[default]
+    Load,
+    /// `session/resume` — newer dialect (`sessionCapabilities.resume`).
+    SessionResume,
+}
+
+impl ResumeMethod {
+    fn wire_method(self) -> &'static str {
+        match self {
+            Self::Load => "session/load",
+            Self::SessionResume => "session/resume",
+        }
+    }
+}
+
 /// Reader-discovered models/modes (from the `session/new`|`load` response).
 /// `capabilities()` merges these into the returned snapshot.
 #[derive(Default, Clone)]
@@ -408,6 +434,9 @@ struct Discovered {
     /// hermes returns e.g. `[bedrock, hermes-setup]`; claude ACP returns none.
     /// Non-empty ⇒ `capabilities().auth_methods` + `answer_auth` cap flip true.
     auth_methods: Vec<String>,
+    /// Which resume dialect this agent speaks, parsed from the `initialize`
+    /// RESPONSE. Drives the method string in `run_handshake`'s Resume branch.
+    resume_method: ResumeMethod,
     /// #101: slash commands from the `available_commands_update` session/update
     /// (`update.availableCommands[{name, description, input?}]` — wire-pinned from
     /// hermes + claude-acp captures). `capabilities()` merges them on read.
@@ -798,8 +827,18 @@ impl AcpSessionBackend {
                 // sid — clearing it makes the post-wake gate wait for the fresh load
                 // too, not release a prompt against a not-yet-reloaded session.
                 *self.acp_session_id.lock().await = None;
+                // Which resume dialect does this agent speak? `session/load`
+                // (legacy) or `session/resume` (newer — `dsh` implements ONLY
+                // this one and answers `session/load` with -32601). The capability
+                // rides the initialize RESPONSE, and the ACP spec requires that
+                // response before any `session/*` request anyway, so wait for it
+                // here (bounded: on timeout we keep the legacy method, i.e. the
+                // behaviour from before this change). The Fresh branch keeps
+                // pipelining — it has no dialect to choose.
+                self.await_initialize_discovery().await;
+                let resume_method = self.discovered.lock().unwrap_or_else(|e| e.into_inner()).resume_method;
                 self.write_frame(json!({
-                    "jsonrpc": "2.0", "id": id, "method": "session/load",
+                    "jsonrpc": "2.0", "id": id, "method": resume_method.wire_method(),
                     "params": load_session_params(sid, &self.wake.config)
                 }))
                 .await?;
@@ -813,6 +852,25 @@ impl AcpSessionBackend {
             }
         }
         Ok(())
+    }
+
+    /// Wait (bounded) for the `initialize` RESPONSE to land, so the Resume branch
+    /// can read the advertised resume dialect (`Discovered::resume_method`).
+    /// Returns immediately if it already arrived, and also returns silently on
+    /// timeout — every caller keeps the pre-existing legacy behaviour then, so a
+    /// slow/unresponsive agent degrades instead of hanging the handshake.
+    async fn await_initialize_discovery(&self) {
+        const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+        let deadline = tokio::time::Instant::now() + MAX_WAIT;
+        loop {
+            if self.pending_init.lock().await.is_none() {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
     }
 
     /// Wake from Dormant: re-spawn the ACP CLI/bridge, re-take its stdio, swap the
@@ -1334,9 +1392,24 @@ fn handle_initialize_response(result: &Value, discovered: &Arc<std::sync::Mutex<
                 .collect()
         })
         .unwrap_or_default();
-    if !methods.is_empty() {
+    // Resume dialect: newer ACP agents advertise `sessionCapabilities.resume`
+    // (and implement `session/resume` instead of `session/load` — `dsh` is one).
+    // Absent/null means the legacy `session/load` surface.
+    let resume_method = if result
+        .get("sessionCapabilities")
+        .and_then(|caps| caps.get("resume"))
+        .is_some_and(|v| !v.is_null())
+    {
+        ResumeMethod::SessionResume
+    } else {
+        ResumeMethod::Load
+    };
+    {
         let mut disc = discovered.lock().unwrap_or_else(|e| e.into_inner());
-        disc.auth_methods = methods;
+        if !methods.is_empty() {
+            disc.auth_methods = methods;
+        }
+        disc.resume_method = resume_method;
     }
 }
 
@@ -2854,6 +2927,43 @@ mod tests {
             assert_eq!(d.current_model.as_deref(), Some("opus"));
             assert_eq!(d.modes[0].id, "default");
         }
+    }
+
+    /// Resume dialect detection. Newer ACP agents advertise
+    /// `sessionCapabilities.resume` and implement `session/resume` ONLY — `dsh`
+    /// answers `session/load` with -32601, which used to leave the conversation
+    /// permanently broken ("unknown session"). Legacy agents advertise nothing
+    /// and keep `session/load`.
+    #[test]
+    fn initialize_response_selects_resume_dialect() {
+        let discover = |result: serde_json::Value| {
+            let disc = Arc::new(std::sync::Mutex::new(Discovered::default()));
+            handle_initialize_response(&result, &disc);
+            disc.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .resume_method
+                .wire_method()
+        };
+
+        // dsh shape: sessionCapabilities.resume present, loadSession false.
+        assert_eq!(
+            discover(json!({
+                "agentCapabilities": { "loadSession": false },
+                "sessionCapabilities": { "close": {}, "list": {}, "resume": {} },
+            })),
+            "session/resume"
+        );
+        // Legacy agents: no sessionCapabilities at all.
+        assert_eq!(
+            discover(json!({ "agentCapabilities": { "loadSession": true } })),
+            "session/load"
+        );
+        assert_eq!(discover(json!({})), "session/load");
+        // `null` advertises nothing — must not be mistaken for a capability.
+        assert_eq!(
+            discover(json!({ "sessionCapabilities": { "resume": null } })),
+            "session/load"
+        );
     }
 
     #[tokio::test]
