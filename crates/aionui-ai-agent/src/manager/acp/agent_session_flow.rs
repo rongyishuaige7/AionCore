@@ -10,8 +10,9 @@ use crate::protocol::send_error::AgentSendError;
 use crate::shared_kernel::SessionId as DomainSessionId;
 use crate::types::SendMessageData;
 use agent_client_protocol::schema::v1::{
-    AudioContent, AuthMethod, ContentBlock, ForkSessionRequest, ImageContent, LoadSessionRequest, PromptRequest,
-    PromptResponse, SessionId, StopReason, Usage, UsageUpdate,
+    AgentCapabilities, AudioContent, AuthMethod, ContentBlock, ForkSessionRequest, ImageContent, LoadSessionRequest,
+    PromptRequest, PromptResponse, ResumeSessionRequest, SessionConfigOption, SessionId, SessionModeState, StopReason,
+    Usage, UsageUpdate,
 };
 use aionui_api_types::SlashCommandItem;
 use serde_json::Value;
@@ -21,7 +22,7 @@ use super::agent::sdk_to_snake_value;
 use super::agent_close::STDERR_PEEK_LINES;
 use super::error_mapping::{AcpSendFailure, is_acp_session_not_found, is_missing_resumed_session};
 use super::legacy_session_model::LegacySessionModelState;
-use tracing::warn;
+use tracing::{info, warn};
 
 #[derive(Debug)]
 pub(super) enum PromptOutcome {
@@ -30,6 +31,39 @@ pub(super) enum PromptOutcome {
     TerminalError { session_id: String, error: ErrorEventData },
     InfoTip { session_id: String, tips: TipsEventData },
     WarningTip { session_id: String, tips: TipsEventData },
+}
+
+/// How `open_session_resume` re-attaches a persisted sid on a backend that
+/// does not use claude-meta-resume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReattachMethod {
+    /// `agentCapabilities.loadSession: true` → `session/load`.
+    Load,
+    /// `sessionCapabilities.resume: {}` → `session/resume`.
+    Resume,
+    /// Neither advertised: seed the aggregate and let the prompt try the sid.
+    Seed,
+}
+
+/// Pick the re-attach request from the advertised capabilities. `session/load`
+/// wins when both are advertised, so agents that already resume through it
+/// keep doing so. Key presence is the ACP signal for `resume` (`Some({})` =
+/// supported; verified: agent-client-protocol-schema 1.5.0
+/// `v1::SessionCapabilities::resume`).
+fn reattach_method(caps: Option<&AgentCapabilities>) -> ReattachMethod {
+    match caps {
+        Some(c) if c.load_session => ReattachMethod::Load,
+        Some(c) if c.session_capabilities.resume.is_some() => ReattachMethod::Resume,
+        _ => ReattachMethod::Seed,
+    }
+}
+
+/// What a `session/load` / `session/resume` reply advertised.
+struct ReattachedState {
+    /// Raw top-level `models` from legacy-surface agents (`session/load` only).
+    legacy_models: Option<Value>,
+    modes: Option<SessionModeState>,
+    config_options: Option<Vec<SessionConfigOption>>,
 }
 
 impl AcpAgentManager {
@@ -112,10 +146,12 @@ impl AcpAgentManager {
     ///   which we persist via `SessionAssigned`.
     /// - `session/load`-capable backends (e.g. Codex, OpenCode): `session/load`,
     ///   keep id.
-    /// - Backends that support neither: seed the aggregate and hope the CLI
-    ///   still recognises the id (legacy behaviour — matches pre-refactor).
+    /// - `session/resume`-capable backends without `session/load` (e.g. dsh):
+    ///   `session/resume`, keep id.
+    /// - Backends that support none of these: seed the aggregate and hope the
+    ///   CLI still recognises the id (legacy behaviour — matches pre-refactor).
     ///
-    /// In all three branches a `SessionNotFound` reply (the persisted sid
+    /// In every branch a `SessionNotFound` reply (the persisted sid
     /// became stale, e.g. after a CLI upgrade or restart) triggers
     /// `rebuild_after_session_not_found`, which clears the sid and
     /// re-runs `open_session_new`. ELECTRON-1HQ regressed because we
@@ -173,65 +209,110 @@ impl AcpAgentManager {
             };
         }
 
-        let (supports_load, preloaded_mode) = {
+        let (reattach, preloaded_mode) = {
             let session = self.session.read().await;
             (
-                session.agent_capabilities().map(|c| c.load_session).unwrap_or(false),
+                reattach_method(session.agent_capabilities()),
                 session.modes().map(|m| m.current_mode_id.to_string()),
             )
         };
 
-        if supports_load {
-            let mut load_req = LoadSessionRequest::new(SessionId::new(session_id), &self.params.workspace.path);
-            if !self.params.mcp_servers.is_empty() {
-                load_req = load_req.mcp_servers(self.params.mcp_servers.clone());
-            }
-            let (load_response, legacy_models) = match self.protocol.load_session(load_req).await {
-                Ok(r) => r,
-                Err(e) if is_acp_session_not_found(&e) => {
-                    return self.rebuild_after_acp_session_not_found(session_id, e).await;
+        match reattach {
+            ReattachMethod::Load => {
+                let mut load_req = LoadSessionRequest::new(SessionId::new(session_id), &self.params.workspace.path);
+                if !self.params.mcp_servers.is_empty() {
+                    load_req = load_req.mcp_servers(self.params.mcp_servers.clone());
                 }
-                Err(e) => return Err(e.into()),
-            };
-
-            {
-                let mut session = self.session.write().await;
-                if let Some(models) = legacy_models
-                    .as_ref()
-                    .and_then(LegacySessionModelState::from_state_value)
-                {
-                    session.apply_advertised_models(models);
-                }
-                if let Some(mut modes) = load_response.modes {
-                    if let Some(db_current) = preloaded_mode {
-                        modes.current_mode_id = db_current.into();
+                let (load_response, legacy_models) = match self.protocol.load_session(load_req).await {
+                    Ok(r) => r,
+                    Err(e) if is_acp_session_not_found(&e) => {
+                        return self.rebuild_after_acp_session_not_found(session_id, e).await;
                     }
-                    session.apply_advertised_modes(modes);
-                }
-                if let Some(config_options) = load_response.config_options {
-                    session.apply_advertised_config_options(config_options);
-                }
-                session.set_session_id(DomainSessionId::new(session_id.to_owned()));
-                self.commit_session_changes(&mut session).await;
+                    Err(e) => return Err(e.into()),
+                };
+                let advertised = ReattachedState {
+                    legacy_models,
+                    modes: load_response.modes,
+                    config_options: load_response.config_options,
+                };
+                return self.adopt_reattached(session_id, advertised, preloaded_mode).await;
             }
-            self.emit_snapshot_events().await;
-
-            return match self.reconcile_session(session_id).await {
-                Ok(()) => Ok(session_id.to_owned()),
-                Err(e) if is_acp_session_not_found(&e) => self.rebuild_after_session_not_found(session_id, &e).await,
-                Err(e) => Err(e.into()),
-            };
+            ReattachMethod::Resume => {
+                info!(
+                    conversation_id = %self.params.conversation_id,
+                    session_id = %session_id,
+                    "open_session_resume: re-attaching via session/resume"
+                );
+                let mut resume_req = ResumeSessionRequest::new(SessionId::new(session_id), &self.params.workspace.path);
+                if !self.params.mcp_servers.is_empty() {
+                    resume_req = resume_req.mcp_servers(self.params.mcp_servers.clone());
+                }
+                let resume_response = match self.protocol.resume_session(resume_req).await {
+                    Ok(r) => r,
+                    Err(e) if is_acp_session_not_found(&e) => {
+                        return self.rebuild_after_acp_session_not_found(session_id, e).await;
+                    }
+                    Err(e) => return Err(e.into()),
+                };
+                let advertised = ReattachedState {
+                    legacy_models: None,
+                    modes: resume_response.modes,
+                    config_options: resume_response.config_options,
+                };
+                return self.adopt_reattached(session_id, advertised, preloaded_mode).await;
+            }
+            ReattachMethod::Seed => {}
         }
 
-        // Legacy path: backend advertised neither claude-meta-resume nor
-        // session/load. Seed the aggregate with the stored id and let the
-        // caller prompt — matches pre-refactor behaviour.
+        // Legacy path: backend advertised neither claude-meta-resume,
+        // session/load nor session/resume. Seed the aggregate with the stored
+        // id and let the caller prompt — matches pre-refactor behaviour.
         {
             let mut session = self.session.write().await;
             session.set_session_id(DomainSessionId::new(session_id.to_owned()));
             self.commit_session_changes(&mut session).await;
         }
         self.emit_snapshot_events().await;
+        match self.reconcile_session(session_id).await {
+            Ok(()) => Ok(session_id.to_owned()),
+            Err(e) if is_acp_session_not_found(&e) => self.rebuild_after_session_not_found(session_id, &e).await,
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Absorb a `session/load` / `session/resume` reply for a re-attached sid
+    /// (the id is kept; neither reply carries a new one), then apply desired
+    /// mode/model/config. `preloaded_mode` is the mode restored from the DB,
+    /// which wins over the agent's reported current mode.
+    async fn adopt_reattached(
+        &self,
+        session_id: &str,
+        advertised: ReattachedState,
+        preloaded_mode: Option<String>,
+    ) -> Result<String, AgentError> {
+        {
+            let mut session = self.session.write().await;
+            if let Some(models) = advertised
+                .legacy_models
+                .as_ref()
+                .and_then(LegacySessionModelState::from_state_value)
+            {
+                session.apply_advertised_models(models);
+            }
+            if let Some(mut modes) = advertised.modes {
+                if let Some(db_current) = preloaded_mode {
+                    modes.current_mode_id = db_current.into();
+                }
+                session.apply_advertised_modes(modes);
+            }
+            if let Some(config_options) = advertised.config_options {
+                session.apply_advertised_config_options(config_options);
+            }
+            session.set_session_id(DomainSessionId::new(session_id.to_owned()));
+            self.commit_session_changes(&mut session).await;
+        }
+        self.emit_snapshot_events().await;
+
         match self.reconcile_session(session_id).await {
             Ok(()) => Ok(session_id.to_owned()),
             Err(e) if is_acp_session_not_found(&e) => self.rebuild_after_session_not_found(session_id, &e).await,
@@ -818,7 +899,10 @@ mod tests {
         AgentCapabilities, ContentBlock, Cost, PromptResponse, Usage, UsageUpdate,
     };
 
-    use super::{end_turn_usage_frame, end_turn_usage_frame_from_response, preserve_known_window};
+    use super::{
+        ReattachMethod, end_turn_usage_frame, end_turn_usage_frame_from_response, preserve_known_window,
+        reattach_method,
+    };
 
     /// The end-of-turn usage frame must stay deserializable as `UsageUpdate` —
     /// that is the contract with `agent_event_tracker`, which persists the
@@ -1060,6 +1144,47 @@ mod tests {
             .map(|c| c.session_capabilities.fork.is_some())
             .unwrap_or(false);
         assert!(!supports_fork, "a handshake without the fork key must be refused");
+    }
+
+    /// dsh advertises `sessionCapabilities.resume` and no `loadSession`
+    /// (verified: @deepseek-ai/dsh-acp 0.2.1-alpha.4 lib/index.js `initialize`,
+    /// capabilities copied verbatim). It used to fall to the seed path, which
+    /// sends no handshake, so a fresh dsh process rejected the first prompt
+    /// with `unknown session`.
+    #[test]
+    fn resume_capability_without_load_selects_session_resume() {
+        let caps: AgentCapabilities = serde_json::from_value(serde_json::json!({
+            "mcpCapabilities": { "http": true },
+            "promptCapabilities": { "image": true, "audio": false, "embeddedContext": false },
+            "sessionCapabilities": { "close": {}, "list": {}, "resume": {} }
+        }))
+        .expect("dsh's initialize capabilities must deserialize");
+        assert_eq!(reattach_method(Some(&caps)), ReattachMethod::Resume);
+    }
+
+    /// Agents that advertise both (Qwen's catalog row in migration 003) keep
+    /// resuming through `session/load`.
+    #[test]
+    fn load_session_wins_over_resume() {
+        let caps: AgentCapabilities = serde_json::from_value(serde_json::json!({
+            "loadSession": true,
+            "sessionCapabilities": { "list": {}, "resume": {} }
+        }))
+        .expect("capabilities must deserialize");
+        assert_eq!(reattach_method(Some(&caps)), ReattachMethod::Load);
+    }
+
+    #[test]
+    fn no_reattach_capability_seeds() {
+        assert_eq!(reattach_method(None), ReattachMethod::Seed);
+        assert_eq!(reattach_method(Some(&AgentCapabilities::new())), ReattachMethod::Seed);
+
+        // ACP: `null` means not advertised, same as an absent key.
+        let null_resume: AgentCapabilities = serde_json::from_value(serde_json::json!({
+            "sessionCapabilities": { "resume": null }
+        }))
+        .expect("capabilities must deserialize");
+        assert_eq!(reattach_method(Some(&null_resume)), ReattachMethod::Seed);
     }
 
     /// Simulate the aggregate-state effect of a successful warmup that
