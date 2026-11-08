@@ -287,11 +287,12 @@ impl AcpError {
     ///
     /// Mapping is by [`ErrorCode`], never by message text. The single
     /// exceptions are known stale-session shapes: `data.error == "Session not
-    /// found: ..."` and resource-not-found replies from `session/load`
-    /// without a concrete resource URI. OpenCode/Codex have emitted stale
-    /// resume failures with those shapes, so we re-classify them into
-    /// `SessionNotFound` to keep recovery paths uniform across agents.
-    /// See ELECTRON-1HQ.
+    /// found: ..."`, resource-not-found replies from `session/load`
+    /// without a concrete resource URI, and `InvalidParams` whose message
+    /// says the session id is unknown (see `is_unknown_session_message`).
+    /// OpenCode/Codex/dsh have emitted stale resume failures with those
+    /// shapes, so we re-classify them into `SessionNotFound` to keep recovery
+    /// paths uniform across agents. See ELECTRON-1HQ.
     /// `context` carries the session ID or method name for diagnostics.
     pub fn from_sdk(err: SdkError, context: &str) -> Self {
         match err.code {
@@ -318,6 +319,10 @@ impl AcpError {
             ErrorCode::InvalidParams => {
                 if let Some(sid) = extract_session_not_found(err.data.as_ref()) {
                     AcpError::SessionNotFound { session_id: sid }
+                } else if is_unknown_session_message(&err.message) {
+                    AcpError::SessionNotFound {
+                        session_id: session_id_after_phrase(&err.message).unwrap_or_else(|| context.to_owned()),
+                    }
                 } else {
                     AcpError::InvalidParams { message: err.message }
                 }
@@ -357,6 +362,45 @@ impl AcpError {
 
 fn is_session_load_method(context: &str) -> bool {
     context == "session/load"
+}
+
+/// Phrases an agent puts in an `InvalidParams` message when it no longer
+/// holds the session id it was handed: a lost session, not a bad argument.
+/// verified: @deepseek-ai/dsh-acp 0.2.1-alpha.4 lib/index.js — `requireSession`
+/// throws invalidParams `"unknown session: <id>"` and `resumeSession` throws
+/// invalidParams `"session is not resumable: <id>"` when nothing is persisted
+/// for the id; the TS SDK prefixes the wire message with `"Invalid params: "`
+/// (@agentclientprotocol/sdk 1.4.0 dist/jsonrpc.js `RequestError.invalidParams`).
+/// "session not found" is the phrase the data-payload shapes already carry.
+const UNKNOWN_SESSION_PHRASES: &[&str] = &["unknown session", "session is not resumable", "session not found"];
+
+/// The text after an [`UNKNOWN_SESSION_PHRASES`] match, when the phrase is
+/// followed by `:` or ends the message. The boundary keeps dsh's
+/// `"unknown session config option: <id>"` out: that is a bad config id on a
+/// live session (verified: dsh-acp lib/index.js `setConfig`), and treating it
+/// as lost would clear a binding the agent still holds. ASCII lowercasing
+/// keeps byte offsets, so `lower`'s index slices `message` on the same boundary.
+fn unknown_session_tail(message: &str) -> Option<&str> {
+    let lower = message.to_ascii_lowercase();
+    UNKNOWN_SESSION_PHRASES.iter().find_map(|phrase| {
+        let rest = &message[lower.find(phrase)? + phrase.len()..];
+        (rest.is_empty() || rest.starts_with(':')).then_some(rest)
+    })
+}
+
+/// True when `message` says the agent no longer holds the session id.
+pub(crate) fn is_unknown_session_message(message: &str) -> bool {
+    unknown_session_tail(message).is_some()
+}
+
+/// The id after the matched phrase (`unknown session: <id>`), if the message
+/// carries one.
+fn session_id_after_phrase(message: &str) -> Option<String> {
+    let sid = unknown_session_tail(message)?
+        .strip_prefix(':')?
+        .split_whitespace()
+        .next()?;
+    Some(sid.to_owned())
 }
 
 /// If `data` carries a `{"error": "Session not found: <sid>"}` payload
@@ -716,6 +760,60 @@ mod tests {
         match acp {
             AcpError::SessionNotFound { session_id } => assert_eq!(session_id, "sess-unknown-key"),
             other => panic!("expected SessionNotFound, got {other:?}"),
+        }
+    }
+
+    /// dsh rejects a prompt for a session its fresh process never opened with
+    /// `-32602` and the reason in the MESSAGE, no `data` (verified:
+    /// @deepseek-ai/dsh-acp 0.2.1-alpha.4 lib/index.js `requireSession`). It is
+    /// a lost session, so `open_session_resume`'s rebuild and the turn-level
+    /// self-heal must both see `SessionNotFound`.
+    #[test]
+    fn from_sdk_invalid_params_unknown_session_message_is_session_not_found() {
+        let sdk_err = SdkError::new(
+            -32602,
+            "Invalid params: unknown session: e993f56e-1dad-4920-aa60-6779066309ea",
+        );
+        match AcpError::from_sdk(sdk_err, "session/prompt") {
+            AcpError::SessionNotFound { session_id } => {
+                assert_eq!(session_id, "e993f56e-1dad-4920-aa60-6779066309ea");
+            }
+            other => panic!("expected SessionNotFound, got {other:?}"),
+        }
+
+        // dsh's session/resume answer when nothing is persisted for the id.
+        let sdk_err = SdkError::new(-32602, "Invalid params: session is not resumable: sess-gone");
+        match AcpError::from_sdk(sdk_err, "session/resume") {
+            AcpError::SessionNotFound { session_id } => assert_eq!(session_id, "sess-gone"),
+            other => panic!("expected SessionNotFound, got {other:?}"),
+        }
+
+        // No id after the phrase: fall back to the context, like the other
+        // context-keyed SessionNotFound shapes.
+        let sdk_err = SdkError::new(-32602, "Invalid params: Session not found");
+        match AcpError::from_sdk(sdk_err, "session/prompt") {
+            AcpError::SessionNotFound { session_id } => assert_eq!(session_id, "session/prompt"),
+            other => panic!("expected SessionNotFound, got {other:?}"),
+        }
+    }
+
+    /// dsh's other session-worded rejections name a real argument problem on a
+    /// session that still exists; clearing the binding for them would drop it
+    /// (verified: dsh-acp lib/index.js `resumeSession`, and `setConfig` for an
+    /// unknown config id via `setSessionConfigOption`).
+    #[test]
+    fn from_sdk_invalid_params_other_session_messages_stay_invalid_params() {
+        for message in [
+            "Invalid params: unknown session config option: thinking",
+            "Invalid params: session is already active: sess-1",
+            "Invalid params: session cwd does not match: /tmp/elsewhere",
+            "Invalid params: malformed request",
+        ] {
+            let acp = AcpError::from_sdk(SdkError::new(-32602, message), "session/resume");
+            assert!(
+                matches!(acp, AcpError::InvalidParams { .. }),
+                "{message:?} must stay InvalidParams, got {acp:?}"
+            );
         }
     }
 

@@ -3,7 +3,7 @@ use aionui_api_types::{
     AgentStreamErrorData,
 };
 
-use super::error::AcpError;
+use super::error::{AcpError, is_unknown_session_message};
 use crate::error::AgentError;
 
 const MAX_DETAIL_CHARS: usize = 1000;
@@ -143,9 +143,10 @@ impl AgentSendError {
                 false,
                 None,
             ),
-            // Same lost-session signal arriving as a plain BadRequest (non-ACP
-            // path): must be checked BEFORE the generic InvalidParams arm below,
-            // which would otherwise mark it non-retryable and skip the self-heal.
+            // A lost-session signal arriving as a plain BadRequest (non-ACP
+            // path; ACP replies are normalized in `AcpError::from_sdk`): must be
+            // checked BEFORE the generic InvalidParams arm below, which would
+            // otherwise mark it non-retryable and skip the self-heal.
             AgentError::BadRequest(msg) if is_unknown_session_message(msg) => Self::new(
                 "The Agent session was not found",
                 AgentErrorCode::UserAgentSessionNotFound,
@@ -252,23 +253,6 @@ impl AgentSendError {
 
     fn from_acp_non_internal(err: &AcpError, detail: String) -> Self {
         match err {
-            // An ACP agent that no longer knows the session id it was handed
-            // rejects the prompt with -32602 "Invalid params: unknown session:
-            // <id>" — typically after the agent process was reaped (idle sweep /
-            // crash / app restart) and the stale binding was replayed into a
-            // fresh process. That is a LOST SESSION, not a bad argument: report
-            // SessionNotFound so the existing self-heal (clear the persisted
-            // binding, replay the turn against a fresh `session/new`) kicks in
-            // instead of the conversation failing on every further message.
-            AcpError::InvalidParams { .. } if is_unknown_session_message(&detail) => Self::new(
-                "The Agent session was not found",
-                AgentErrorCode::UserAgentSessionNotFound,
-                AgentErrorOwnership::UserAgent,
-                Some(detail),
-                true,
-                false,
-                None,
-            ),
             AcpError::SpawnFailed { .. } => Self::new(
                 "The selected Agent executable could not be started",
                 AgentErrorCode::UserAgentNotInstalled,
@@ -1027,27 +1011,6 @@ fn resolution(
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
-}
-
-/// True when the agent says the session id it was handed no longer exists — as
-/// opposed to a genuinely malformed request. Kept separate from the generic
-/// "invalid params" signature so a lost session is retryable and self-heals.
-/// Phrasings observed: `dsh` answers `-32602 Invalid params: unknown session:
-/// <id>`; other ACP agents use "Session not found" / "no such session"; dsh also
-/// reports `session is not resumable` when its on-disk session cannot be opened.
-fn is_unknown_session_message(message: &str) -> bool {
-    let lower = message.to_ascii_lowercase();
-    contains_any(
-        &lower,
-        &[
-            "unknown session",
-            "session not found",
-            "session_not_found",
-            "no such session",
-            "session does not exist",
-            "session is not resumable",
-        ],
-    )
 }
 
 fn contains_sso_expired_auth_signature(lower: &str) -> bool {
@@ -2031,7 +1994,10 @@ mod tests {
     fn acp_unknown_session_is_a_lost_session_not_bad_params() {
         let detail = "Invalid params: unknown session: e993f56e-1dad-4920-aa60-6779066309ea";
 
-        let acp_err = AgentSendError::from(AcpError::InvalidParams { message: detail.into() });
+        // The wire shape goes through `AcpError::from_sdk`, which turns it into
+        // `SessionNotFound` before it is classified here.
+        let wire = agent_client_protocol::Error::new(-32602, detail);
+        let acp_err = AgentSendError::from(AcpError::from_sdk(wire, "session/prompt"));
         assert_eq!(acp_err.code(), Some(AgentErrorCode::UserAgentSessionNotFound));
         assert_eq!(acp_err.stream_error().retryable, Some(true));
         assert_eq!(acp_err.stream_error().feedback_recommended, Some(false));
@@ -2041,11 +2007,16 @@ mod tests {
         assert_eq!(api_err.code(), Some(AgentErrorCode::UserAgentSessionNotFound));
         assert_eq!(api_err.stream_error().retryable, Some(true));
 
-        // A genuinely malformed request must NOT be reclassified.
-        let other = AgentSendError::from(AcpError::InvalidParams {
-            message: "malformed request".into(),
-        });
-        assert_eq!(other.code(), Some(AgentErrorCode::UserAgentInvalidParams));
+        // A genuinely malformed request must NOT be reclassified, nor a bad
+        // config id on a session dsh still holds.
+        for message in [
+            "Invalid params: malformed request",
+            "Invalid params: unknown session config option: thinking",
+        ] {
+            let wire = agent_client_protocol::Error::new(-32602, message);
+            let other = AgentSendError::from(AcpError::from_sdk(wire, "session/set_config_option"));
+            assert_eq!(other.code(), Some(AgentErrorCode::UserAgentInvalidParams), "{message}");
+        }
     }
 
     // ELECTRON-3Q0: the codex dead-thread rejections (verified:
