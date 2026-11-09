@@ -348,3 +348,38 @@ are sufficient for success; add a payload-free error only for an impossible
 internal descriptor contract failure. No proxy/guard change or service restart
 is needed for this correction. Full gate/push and renewed real Team results
 are recorded separately when complete.
+
+
+## Daily deployment: passive subscription availability
+
+The daily backend hydrates builtin availability on startup and can queue slow
+version probes (`aionui-ai-agent/src/registry.rs`, `hydrate` and
+`validate_cli_availability`). Both locally configured subscription rows are
+builtin rows with explicit command overrides. Starting the backend would
+otherwise execute account 1 during deployment, contrary to the standing
+account-2-only test boundary.
+
+Validated home-local subscription selections now retain their path availability
+and existing check snapshot without automatic version execution or a background
+recheck. In particular, an existing Offline result is not rewritten to Online.
+Explicit user checks and session assembly keep their existing isolated version
+probes and fail-closed launcher validation. Invalid subscription paths are not
+exempted. This changes no provider, account, environment or guard policy.
+
+Focused regressions inject a probe function rather than executing either
+subscription: all four accepted entry names preserve an Offline/slow snapshot
+without invoking the function; an untrusted same-named path is not exempted.
+Existing ordinary CLI probe fixtures retain their real harmless executables.
+Existing startup availability summaries and session logs are sufficient; no new
+payload or credential logging is needed.
+
+
+Deployment-preparation verification on 2026-11-09: the two injected-probe
+regressions passed, affected all-target Clippy passed, and the full AI-agent
+crate passed with four test threads. The initial default-parallel run had
+1,019 passing library tests and one existing harmless executable fixture hit
+its unchanged five-second timeout (`version_probe_success_reports_duration`)
+while the release build was running. The recheck retained every assertion and
+the original timeout; the initial failure log is retained. No subscription CLI
+was executed by these regressions. Full push and deployment evidence follow
+separately.

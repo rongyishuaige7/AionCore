@@ -943,11 +943,37 @@ fn has_slow_probe_history(meta: &AgentMetadata, policy: &ProbePolicy) -> bool {
 }
 
 async fn validate_cli_availability(
-    mut meta: AgentMetadata,
+    meta: AgentMetadata,
     reason: Option<UnavailableReason>,
     policy: ProbePolicy,
 ) -> (AgentMetadata, Option<UnavailableReason>, InlineProbeOutcome) {
+    validate_cli_availability_with_probe(meta, reason, policy, |meta, budget| async move {
+        crate::cli_probe::validate_with_budget(&meta, budget).await
+    })
+    .await
+}
+
+async fn validate_cli_availability_with_probe<F, Fut>(
+    mut meta: AgentMetadata,
+    reason: Option<UnavailableReason>,
+    policy: ProbePolicy,
+    probe: F,
+) -> (AgentMetadata, Option<UnavailableReason>, InlineProbeOutcome)
+where
+    F: FnOnce(AgentMetadata, std::time::Duration) -> Fut,
+    Fut: std::future::Future<Output = Result<crate::cli_probe::ProbeSuccess, crate::cli_probe::ProbeFailure>>,
+{
     if !meta.available || meta.agent_source != AgentSource::Builtin {
+        return (meta, reason, InlineProbeOutcome::NotProbed);
+    }
+
+    // Passive availability must not start a credentialed subscription wrapper.
+    // Keep the existing snapshot, including failures, and do not queue a recheck.
+    // Explicit checks and actual session launches retain their version probes.
+    if matches!(
+        crate::factory::claude_subscription::SubscriptionLaunch::resolve(&meta),
+        Ok(Some(_))
+    ) {
         return (meta, reason, InlineProbeOutcome::NotProbed);
     }
 
@@ -959,7 +985,7 @@ async fn validate_cli_availability(
         return (meta, None, InlineProbeOutcome::PendingRecheck);
     }
 
-    match crate::cli_probe::validate_with_budget(&meta, policy.inline_budget).await {
+    match probe(meta.clone(), policy.inline_budget).await {
         Ok(_) => (meta, None, InlineProbeOutcome::Settled),
         Err(failure @ crate::cli_probe::ProbeFailure::VersionTimeout { .. }) => {
             // Slow load is not proof of corruption: keep the row installed,

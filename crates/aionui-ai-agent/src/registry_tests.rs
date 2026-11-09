@@ -788,3 +788,66 @@ async fn background_recheck_marks_corrupted_install_offline() {
             .is_some_and(|message| message.contains("native binary missing"))
     );
 }
+
+#[cfg(unix)]
+async fn passive_probe_fixture(command: &str) -> AgentMetadata {
+    let db = init_database_memory().await.unwrap();
+    let repo = SqliteAgentMetadataRepository::new(db.pool().clone());
+    let source_info = serde_json::json!({ "binary_name": command }).to_string();
+    let mut params = upsert_script_agent_params("passive-subscription", "Subscription", command, &source_info);
+    params.backend = Some("claude");
+    repo.upsert(&params).await.unwrap();
+    let (mut meta, _) = decode_row(
+        repo.get(params.id).await.unwrap().unwrap(),
+        AvailabilityProjection::Cached,
+    )
+    .unwrap();
+    meta.available = true;
+    meta.resolved_command = Some(PathBuf::from(command));
+    meta
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn passive_subscription_availability_preserves_failures_without_starting_either_account() {
+    for name in [
+        "claude-pro-danger",
+        "claude-pro-yi",
+        "claude-pro2-danger",
+        "claude-pro2-yi",
+    ] {
+        let command = dirs::home_dir().unwrap().join(".local/bin").join(name);
+        let mut meta = passive_probe_fixture(command.to_str().unwrap()).await;
+        meta.last_check_status = Some(AgentSnapshotCheckStatus::Offline);
+        meta.last_check_kind = Some(AgentSnapshotCheckKind::Startup);
+        meta.last_check_error_code = Some("version_probe_timeout".into());
+        let (meta, reason, outcome) =
+            validate_cli_availability_with_probe(meta, None, ProbePolicy::default(), |_, _| async {
+                panic!("passive availability must not execute a subscription launcher")
+            })
+            .await;
+        assert!(meta.available);
+        assert!(reason.is_none());
+        assert_eq!(outcome, InlineProbeOutcome::NotProbed);
+        assert_eq!(meta.last_check_status, Some(AgentSnapshotCheckStatus::Offline));
+        assert_eq!(meta.last_check_error_code.as_deref(), Some("version_probe_timeout"));
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn passive_availability_does_not_exempt_an_untrusted_subscription_path() {
+    let meta = passive_probe_fixture("/untrusted/claude-pro2-danger").await;
+    let (meta, reason, outcome) =
+        validate_cli_availability_with_probe(meta, None, ProbePolicy::default(), |_, _| async {
+            Err(crate::cli_probe::ProbeFailure::VersionFailed {
+                detail: "untrusted path refused".into(),
+                duration_ms: 0,
+            })
+        })
+        .await;
+    assert!(reason.is_none());
+    assert_eq!(outcome, InlineProbeOutcome::Settled);
+    assert_eq!(meta.last_check_status, Some(AgentSnapshotCheckStatus::Offline));
+    assert_eq!(meta.last_check_error_code.as_deref(), Some("version_probe_failed"));
+}
