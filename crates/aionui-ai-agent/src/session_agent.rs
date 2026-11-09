@@ -1879,6 +1879,16 @@ pub async fn build_session_instance(
         BackendConnection, ClaudeConnection, CodexConnection, McpServerSpec, SessionConfig, SessionInit, SessionSpec,
     };
 
+    let subscription = if backend_label == "claude" {
+        crate::factory::claude_subscription::SubscriptionLaunch::resolve(inputs.metadata)?
+    } else {
+        None
+    };
+    let spawner = match &subscription {
+        Some(launch) => launch.scope(spawner),
+        None => spawner,
+    };
+    let probe_spawner = subscription.as_ref().map(|_| Arc::clone(&spawner));
     let connection: Box<dyn BackendConnection> = match backend_label {
         "claude" => Box::new(ClaudeConnection::new(spawner)),
         "codex" => Box::new(CodexConnection::new(spawner)),
@@ -1974,7 +1984,10 @@ pub async fn build_session_instance(
         // `cmd.exe` since the BatBadBut fix). `None` (nothing on PATH either)
         // keeps the bare name so the spawn error stays diagnosable. Detection
         // (cli_probe) stays PATH-only and is unaffected.
-        cli_program: resolve_session_cli_program(backend_label, metadata),
+        cli_program: subscription
+            .as_ref()
+            .map(|launch| launch.program().to_path_buf())
+            .or_else(|| resolve_session_cli_program(backend_label, metadata)),
         // Layer 1 (argv). `--plugin-dir <view>` plus one `--add-dir <source>` per
         // enabled skill, already substituted by the delivery plan. Empty for a
         // non-argv vendor or an empty snapshot.
@@ -2012,7 +2025,7 @@ pub async fn build_session_instance(
 
     if backend_label == "claude"
         && let Some(program) = session_config.cli_program.clone()
-        && crate::claude_flags::supports_thinking_display(&program).await
+        && crate::claude_flags::supports_thinking_display(&program, probe_spawner.as_ref()).await
     {
         session_config
             .extra_args
@@ -2021,7 +2034,14 @@ pub async fn build_session_instance(
     }
 
     // Spawn env (legacy spawn-surface parity, claude AND codex).
-    session_config.spawn_env = assemble_spawn_env(&metadata.env, runtime_env);
+    session_config.spawn_env = if let Some(launch) = &subscription {
+        tracing::info!(conv_id = %conversation_id, account = launch.account(),
+            ignored_agent_env = metadata.env.len(), ignored_runtime_env = runtime_env.len(),
+            "official Claude subscription launch: fixed entrypoint and isolated environment");
+        launch.environment()
+    } else {
+        assemble_spawn_env(&metadata.env, runtime_env)
+    };
     if !session_config.spawn_env.is_empty() {
         let keys: Vec<&str> = session_config.spawn_env.iter().map(|e| e.name.as_str()).collect();
         tracing::info!(conv_id = %conversation_id, ?keys, "session spawn env: agent overrides + runtime context");
@@ -2030,7 +2050,7 @@ pub async fn build_session_instance(
     // GAP #5 — claude cc-switch provider env: inject ANTHROPIC_BASE_URL /
     // ANTHROPIC_AUTH_TOKEN (third-party relay creds) into the spawn, mirroring the
     // legacy ACP-claude path. Empty (no cc-switch config) = byte-identical spawn.
-    if backend_label == "claude" {
+    if backend_label == "claude" && subscription.is_none() {
         let provider_env = crate::cc_switch::read_claude_provider_env();
         if !provider_env.is_empty() {
             let keys: Vec<String> = provider_env.keys().cloned().collect();
@@ -4875,6 +4895,144 @@ mod build_mapping_tests {
             Err(aionui_process::ProcessError::internal(
                 "recording spawner deliberately stops after assembly",
             ))
+        }
+    }
+
+    #[cfg(unix)]
+    #[derive(Default)]
+    struct FixtureVersionSpawner {
+        commands: std::sync::Mutex<Vec<aionui_common::CommandSpec>>,
+    }
+
+    #[cfg(unix)]
+    #[async_trait::async_trait]
+    impl aionui_process::Spawner for FixtureVersionSpawner {
+        async fn spawn(
+            &self,
+            spec: aionui_common::CommandSpec,
+            extra_env: &[(String, String)],
+            _owner: &str,
+        ) -> Result<Arc<aionui_process::ManagedProcess>, aionui_process::ProcessError> {
+            let version = spec.args == ["--version"];
+            self.commands.lock().unwrap().push(spec);
+            assert!(extra_env.is_empty());
+            if version {
+                // Never execute the recorded subscription program, even for
+                // --version. Only a harmless fixture supplies the banner.
+                aionui_process::ManagedProcess::spawn(
+                    aionui_common::CommandSpec {
+                        clear_env: true,
+                        command: "/usr/bin/printf".into(),
+                        args: vec!["2.1.319 (Claude Code)\\n".into()],
+                        ..Default::default()
+                    },
+                    &[],
+                )
+                .await
+                .map(Arc::new)
+            } else {
+                Err(aionui_process::ProcessError::internal(
+                    "fixture stops before subscription execution",
+                ))
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn subscription_sessions_bind_both_accounts_and_isolate_fresh_resume_fork_and_version() {
+        let home = dirs::home_dir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let parent_id = "22222222-2222-4222-8222-222222222222";
+        for (alias, target) in [
+            ("claude-pro-yi", "claude-pro-danger"),
+            ("claude-pro2-yi", "claude-pro2-danger"),
+        ] {
+            for mode in ["fresh", "resume", "fork"] {
+                let mut metadata = test_metadata(Some("claude"), None);
+                metadata.command = Some(home.join(".local/bin").join(alias).to_string_lossy().into_owned());
+                // Persisted legacy profiles do not necessarily carry this bit.
+                metadata.has_command_override = false;
+                metadata.env = [
+                    ("ANTHROPIC_BASE_URL".into(), "fixture-invalid".into()),
+                    ("ANTHROPIC_AUTH_TOKEN".into(), "fixture-only".into()),
+                    ("HTTPS_PROXY".into(), "fixture-invalid".into()),
+                ]
+                .into_iter()
+                .map(|(name, value)| aionui_api_types::AgentEnvEntry {
+                    name,
+                    value,
+                    description: None,
+                })
+                .collect();
+                let config = AcpBuildExtra {
+                    backend: Some("claude".into()),
+                    preset_context: Some("Fixture additive rules".into()),
+                    fork: (mode == "fork").then(|| aionui_api_types::ForkSpec {
+                        parent_conversation_id: "fixture-parent".into(),
+                        parent_message_id: "fixture-message".into(),
+                        parent_session_id: parent_id.into(),
+                        last_turn_id: None,
+                    }),
+                    ..Default::default()
+                };
+                let spawner = Arc::new(FixtureVersionSpawner::default());
+                let result = build_session_instance(
+                    "claude",
+                    SessionBuildInputs {
+                        conversation_id: "11111111-1111-4111-8111-111111111111".into(),
+                        user_id: "fixture-user".into(),
+                        workspace: workspace.path().to_string_lossy().into_owned(),
+                        config: &config,
+                        metadata: &metadata,
+                        skill_delivery: Default::default(),
+                        session_snapshot: None,
+                        backend_session_id: (mode == "resume").then(|| parent_id.to_owned()),
+                        mcp_server_repo: None,
+                        runtime_env: &[("AIONUI_RUNTIME_TOKEN".into(), "fixture-only".into())],
+                        broadcaster: Arc::new(aionui_realtime::BroadcastEventBus::new(16)),
+                        catalog_writeback: None,
+                        acp_session_repo: None,
+                        prompt_dump_dir: None,
+                        permission_hook_body: None,
+                    },
+                    spawner.clone(),
+                )
+                .await;
+                assert!(matches!(result, Err(AgentError::BadGateway(ref message))
+                    if message.contains("fixture stops before subscription execution")));
+                let records = spawner.commands.lock().unwrap();
+                for spec in records.iter() {
+                    assert_eq!(spec.command, home.join(".local/bin").join(target));
+                    assert!(spec.clear_env);
+                    let keys = spec.env.iter().map(|entry| entry.name.as_str()).collect::<Vec<_>>();
+                    assert_eq!(keys, ["HOME", "PATH", "TERM"]);
+                }
+                let session = records.last().expect("session command captured");
+                assert!(session.args.contains(&"--include-partial-messages".into()));
+                assert!(session.args.contains(&"--replay-user-messages".into()));
+                assert!(
+                    session
+                        .args
+                        .windows(2)
+                        .any(|pair| pair == ["--thinking-display", "summarized"])
+                );
+                assert!(
+                    session
+                        .args
+                        .windows(2)
+                        .any(|pair| pair == ["--append-system-prompt", "Fixture additive rules"])
+                );
+                assert_eq!(session.cwd.as_deref(), workspace.path().to_str());
+                if mode == "fresh" {
+                    assert!(records.iter().any(|spec| spec.args == ["--version"]));
+                    assert!(session.args.contains(&"--session-id".into()));
+                    assert!(!session.args.contains(&"--resume".into()));
+                } else {
+                    assert!(session.args.windows(2).any(|pair| pair == ["--resume", parent_id]));
+                    assert_eq!(session.args.contains(&"--fork-session".into()), mode == "fork");
+                }
+            }
         }
     }
 

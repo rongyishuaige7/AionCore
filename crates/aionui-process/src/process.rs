@@ -168,6 +168,9 @@ impl ManagedProcess {
         };
 
         let mut builder = Builder::new(&spec.command);
+        if spec.clear_env {
+            builder.env_clear();
+        }
         builder
             .args(&spec.args)
             .envs(spec.env.iter().map(|e| (&e.name, &e.value)))
@@ -648,6 +651,62 @@ pub(crate) mod job_windows {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn clear_env_is_opt_in_and_only_explicit_keys_reach_the_child() {
+        use std::collections::BTreeSet;
+        use tokio::io::AsyncReadExt;
+
+        let mut reference = Builder::new("/usr/bin/env");
+        reference.arg("-0");
+        let reference = reference.output().await.unwrap();
+        assert!(reference.status.success());
+        // Compare with the existing Builder, including platform behavior such
+        // as macOS stripping DYLD_* from protected system executables.
+        let inherited = reference
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter_map(|entry| entry.iter().position(|byte| *byte == b'=').map(|at| &entry[..at]))
+            .map(|key| String::from_utf8_lossy(key).into_owned())
+            .collect::<BTreeSet<_>>();
+        for clear_env in [false, true] {
+            let spec = CommandSpec {
+                clear_env,
+                command: "/usr/bin/env".into(),
+                args: vec!["-0".into()],
+                env: vec![aionui_common::EnvVar {
+                    name: "AIONUI_FIXTURE_EXPLICIT".into(),
+                    value: "fixture-only".into(),
+                }],
+                ..Default::default()
+            };
+            let process = ManagedProcess::spawn(spec, &[("AIONUI_FIXTURE_EXTRA".into(), "fixture-only".into())])
+                .await
+                .unwrap();
+            let (stdin, mut stdout) = process.take_stdio().await.unwrap();
+            drop(stdin);
+            let keys = tokio::time::timeout(Duration::from_secs(5), async {
+                let mut output = Vec::new();
+                stdout.read_to_end(&mut output).await.unwrap();
+                assert!(process.wait_for_exit().await.unwrap().success());
+                // Keep only key names: diagnostics must never print host values.
+                output
+                    .split(|byte| *byte == 0)
+                    .filter_map(|entry| entry.iter().position(|byte| *byte == b'=').map(|at| &entry[..at]))
+                    .map(|key| String::from_utf8_lossy(key).into_owned())
+                    .collect::<BTreeSet<_>>()
+            })
+            .await
+            .unwrap();
+            let explicit = BTreeSet::from(["AIONUI_FIXTURE_EXPLICIT".to_owned(), "AIONUI_FIXTURE_EXTRA".to_owned()]);
+            if clear_env {
+                assert_eq!(keys, explicit);
+            } else {
+                assert_eq!(keys, inherited.union(&explicit).cloned().collect());
+            }
+        }
+    }
 
     /// Regression pin for Sentry ELECTRON-3PP / upstream #410: a workspace with
     /// whitespace in ANY path segment (iCloud Drive lives under

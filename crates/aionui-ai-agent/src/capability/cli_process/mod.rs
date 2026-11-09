@@ -264,6 +264,7 @@ pub(super) mod tests {
     pub(super) fn simple_script_config(script: &str) -> CommandSpec {
         let (command, args) = script_command(script);
         CommandSpec {
+            clear_env: false,
             command: command.into(),
             args,
             env: vec![],
@@ -481,6 +482,7 @@ pub(super) mod tests {
     #[tokio::test]
     async fn spawn_invalid_command_returns_error() {
         let config = CommandSpec {
+            clear_env: false,
             command: "/nonexistent/binary/that/does/not/exist".into(),
             args: vec![],
             env: vec![],
@@ -503,6 +505,7 @@ pub(super) mod tests {
         let marker_path = marker.path().to_string_lossy().into_owned();
 
         let config = CommandSpec {
+            clear_env: false,
             command: "sh".into(),
             args: vec![
                 "-c".into(),

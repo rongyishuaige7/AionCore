@@ -1129,6 +1129,7 @@ impl BackendAdapter for ClaudeAdapter {
         args.extend(extra_args.iter().cloned());
 
         let spec = CommandSpec {
+            clear_env: false,
             // Orchestration-resolved bundled CLI (packaged app) or bare "claude"
             // (dev → PATH). See SessionConfig.cli_program.
             command: cli_program.map(|p| p.to_path_buf()).unwrap_or_else(|| "claude".into()),

@@ -3622,6 +3622,7 @@ mod tests {
         use crate::testing::FakeSpawner;
         let spawner = Arc::new(FakeSpawner::new());
         let command = aionui_common::CommandSpec {
+            clear_env: false,
             command: "hermes".into(),
             args: vec!["acp".into()],
             env: Vec::new(),

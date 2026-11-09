@@ -73,6 +73,7 @@ pub(crate) async fn probe_models(
     spawn_env: &[EnvVar],
 ) -> Vec<ModelInfo> {
     let spec = CommandSpec {
+        clear_env: false,
         command: program.to_path_buf(),
         args: vec!["models".to_owned()],
         env: spawn_env.to_vec(),

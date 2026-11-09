@@ -228,6 +228,7 @@ pub async fn probe_cli_version(
     owner_tag: &str,
 ) -> Option<String> {
     let spec = CommandSpec {
+        clear_env: false,
         command: program.to_path_buf(),
         args: vec!["--version".to_owned()],
         env: Vec::new(),

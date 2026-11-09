@@ -325,6 +325,7 @@ mod tests {
 
     fn npx_command_spec(cache: &Path, args: &[&str]) -> CommandSpec {
         CommandSpec {
+            clear_env: false,
             command: PathBuf::from("npx"),
             args: args.iter().map(|arg| (*arg).to_owned()).collect(),
             env: vec![EnvVar {
@@ -339,6 +340,7 @@ mod tests {
         let mut all_args = vec![r"C:\AionUi\runtime\node\node_modules\npm\bin\npx-cli.js".to_owned()];
         all_args.extend(args.iter().map(|arg| (*arg).to_owned()));
         CommandSpec {
+            clear_env: false,
             command: PathBuf::from("node.exe"),
             args: all_args,
             env: vec![EnvVar {

@@ -82,7 +82,17 @@ pub(crate) fn command_name(meta: &AgentMetadata) -> Option<&str> {
 }
 
 pub(crate) async fn validate_with_budget(meta: &AgentMetadata, budget: Duration) -> Result<ProbeSuccess, ProbeFailure> {
+    let subscription = crate::factory::claude_subscription::SubscriptionLaunch::resolve(meta).map_err(|error| {
+        ProbeFailure::VersionFailed {
+            detail: error.public_message(),
+            duration_ms: 0,
+        }
+    })?;
     let command = command_name(meta).ok_or(ProbeFailure::NoCommand)?;
+    let command = subscription
+        .as_ref()
+        .map(|launch| launch.program().to_str().expect("home-local launcher"))
+        .unwrap_or(command);
     let path = resolve_command_path(command).ok_or_else(|| ProbeFailure::CommandNotFound {
         command: command.to_owned(),
     })?;
@@ -101,7 +111,7 @@ pub(crate) async fn validate_with_budget(meta: &AgentMetadata, budget: Duration)
             reported_version: None,
         });
     }
-    validate_version_with_timeout(&path, budget).await
+    validate_version_with_policy(&path, budget, subscription.as_ref()).await
 }
 
 #[cfg(test)]
@@ -113,8 +123,20 @@ async fn resolve_and_validate_command(command: &str) -> Result<PathBuf, ProbeFai
     Ok(path)
 }
 
+#[cfg(test)]
 async fn validate_version_with_timeout(path: &std::path::Path, budget: Duration) -> Result<ProbeSuccess, ProbeFailure> {
+    validate_version_with_policy(path, budget, None).await
+}
+
+async fn validate_version_with_policy(
+    path: &std::path::Path,
+    budget: Duration,
+    subscription: Option<&crate::factory::claude_subscription::SubscriptionLaunch>,
+) -> Result<ProbeSuccess, ProbeFailure> {
     let mut command = Builder::clean_cli(path);
+    if let Some(launch) = subscription {
+        launch.configure_probe(&mut command);
+    }
     command.arg("--version");
 
     let started = std::time::Instant::now();

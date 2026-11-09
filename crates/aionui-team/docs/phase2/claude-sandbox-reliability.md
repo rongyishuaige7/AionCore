@@ -101,3 +101,92 @@ residential egress, production sandbox behavior, or an account's live state.
 The delivery pause remains in memory until the later durability stage; restarting
 the backend can allow retained mail to be retried. Broadcast gaps now block
 replay, but this stage does not repair lost text or change incomplete-turn UI.
+
+The stage-1 full `just push` gate subsequently passed: 9,410 tests passed and
+52 existing tests were skipped. Commit `5a955753` was pushed to the personal fork.
+
+## Stage 2 design: subscription launch boundary
+
+Resolve only the two explicitly selected home-local subscription launchers.
+Legacy `claude-pro-yi` / `claude-pro2-yi` selections map to their account's
+`claude-pro-danger` / `claude-pro2-danger`. Never promote a restricted entry,
+accept a same-named script outside that home-local directory, search PATH on
+failure, or switch accounts. Other vendors and ordinary Claude installations
+keep their existing behavior.
+
+A scoped Spawner enforces the selected absolute program and replaces explicit
+environment entries with HOME, a fixed system PATH and TERM. A new default-off
+`CommandSpec.clear_env` instructs both process implementations to clear inherited
+environment first. This foundation change is source-only (no API/DB format
+change); existing command literals retain `false`. The scoped Spawner also
+discards extra environment supplied by callers. It is retained by the connection
+and its wake recipe, covering initial/resume/fork, version checks and idle wake.
+Registry and optional-flag probes must use the same isolated launch policy.
+Subscription assembly never reads cc-switch credentials or merges agent/runtime
+environment. Add one production-visible lifecycle log with profile and counts,
+never values, arguments, MCP payloads or credentials.
+
+The production guard's argument whitelist currently rejects the stream/control
+flags (`~/.local/share/claude-pro2-hardening/daily-policy.cjs`, bool/values sets).
+The sandbox repository supplies an opt-in argument-policy adapter for review;
+it is not a replacement launcher and is not deployed. It allows only the verified
+partial/replay flags, summarized/omitted thinking display, stdio permission control
+and additive preset text. Existing validation still controls workspace, local
+ports, commands and all other arguments. MCP config, plugins, settings, API and
+network options receive no new permission. Existing uncommitted first-message
+preset patches are preserved, not imported into this source commit.
+
+CLI evidence: `claude-pro2-danger --help` on 2026-11-09 documents
+`--include-partial-messages`, `--replay-user-messages` and
+`--append-system-prompt`. First-party `@anthropic-ai/claude-agent-sdk` 0.3.319
+(`sdk.mjs`, `sdk.d.ts`, fetched from registry.npmjs.org and verified against its
+published SHA-512 integrity) serializes `--permission-prompt-tool=stdio` and
+`--thinking-display`; ThinkingEnabled/ThinkingAdaptive permit only summarized
+or omitted display. These sources establish argument contracts, not a successful
+live session or MCP readiness.
+
+Verify with real harmless fixture processes that host variables disappear,
+injected provider/runtime variables never reach a subscription process, both
+account selections remain fixed through session variants and probes, and legacy
+launches keep their environment behavior. Account 1 is never executed by tests.
+Run affected-crate tests/Clippy and the full pre-push gate in an isolated target
+directory, so builds do not replace the running backend's on-disk executable.
+Sandbox validation uses task-created fixtures and listeners only.
+
+Deployment remains a separate reviewed step. The source changes require the
+matching guard integration before use; native MCP and its protected descriptor
+remain stage 3. No production services, credentials, routes, manifests or
+historical databases are changed by this stage.
+
+## Stage 2 verification and delivery boundary
+
+On 2026-11-09, the four affected crates (`aionui-common`, `aionui-process`,
+`aionui-ai-agent`, `aionui-session`) passed 1,809 tests, with 15 existing ignored
+tests, using `aionui-ai-agent/test-support` and the locked dependencies. Both
+real process implementations were exercised with harmless `/usr/bin/env -0`
+fixtures. Assertions retained only environment key names. The inherited-env
+baseline uses the existing Builder, including macOS's own DYLD-variable
+filtering; isolated children expose only their explicit entries.
+
+Session assembly fixtures cover both subscription accounts and fresh, resume,
+fork and optional-flag version probes. They capture the exact danger program,
+white-listed environment, working directory and additive/streaming arguments.
+Only `/usr/bin/printf` supplies the fake version banner; no recorded Claude
+command is executed. Scoped-spawner tests also reject a program mismatch and
+discard extra caller environment. Registry probe configuration is checked with
+a real harmless process. Idle wake retains the same scoped spawner in
+`crates/aionui-session/src/backend/claude_conn.rs`; this stage adds no live
+idle-wake or model-session evidence.
+
+The opt-in sandbox adapter is delivered separately as `6b83d5b` on
+`rongyishuaige7/claude-pro-sandbox`, branch `fix/claude-native-cli-arguments`.
+Its complete `node scripts/check.cjs` run passed 324 tests with zero skips,
+including 66/66 required real Seatbelt cases (profile prefix `d5831a681d8b`).
+The first temporary-worktree run triggered existing host-assist overlap denials;
+moving the fixture repository outside system temp resolved them without
+changing policy. Account 1 was never launched. The only real subscription CLI
+inspection in this stage was account 2's `--help`; no model turn was sent.
+
+The AionCore full pre-push gate is required after the focused commit and its
+result is reported with the pushed SHA. These source and fixture results do
+not make the guard adapter active in production or restore native Team MCP.

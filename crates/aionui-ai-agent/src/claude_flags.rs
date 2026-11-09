@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use aionui_runtime::Builder;
@@ -33,10 +33,10 @@ const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// wrong is a dead session rather than a missing thinking card.
 const THINKING_DISPLAY_MIN_VERSION: (u32, u32, u32) = (2, 1, 191);
 
-/// Probed support keyed by the resolved binary path, so the `--version` spawn
-/// happens once per binary per process rather than once per session.
-fn cache() -> &'static Mutex<HashMap<PathBuf, bool>> {
-    static CACHE: OnceLock<Mutex<HashMap<PathBuf, bool>>> = OnceLock::new();
+/// Cache per binary and launch policy; isolated probes never reuse a host-env
+/// result. Probe at most once per key rather than once per session.
+fn cache() -> &'static Mutex<HashMap<(PathBuf, bool), bool>> {
+    static CACHE: OnceLock<Mutex<HashMap<(PathBuf, bool), bool>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -57,9 +57,26 @@ fn parse_version(raw: &str) -> Option<(u32, u32, u32)> {
 /// Whether `program` accepts `--thinking-display`. Probes `--version` once per
 /// binary and caches the verdict; any failure (spawn error, timeout, exit != 0,
 /// unparseable output) resolves to `false`.
-pub(crate) async fn supports_thinking_display(program: &Path) -> bool {
-    if let Some(hit) = cache().lock().expect("claude flag cache poisoned").get(program) {
+pub(crate) async fn supports_thinking_display(
+    program: &Path,
+    spawner: Option<&Arc<dyn aionui_process::Spawner>>,
+) -> bool {
+    let key = (program.to_path_buf(), spawner.is_some());
+    if let Some(hit) = cache().lock().expect("claude flag cache poisoned").get(&key) {
         return *hit;
+    }
+
+    if let Some(spawner) = spawner {
+        let raw = probe_with_spawner(program, spawner).await;
+        let supported = raw
+            .as_deref()
+            .and_then(parse_version)
+            .is_some_and(|v| v >= THINKING_DISPLAY_MIN_VERSION);
+        cache()
+            .lock()
+            .expect("claude flag cache poisoned")
+            .insert(key, supported);
+        return supported;
     }
 
     let mut command = Builder::clean_cli(program);
@@ -91,8 +108,34 @@ pub(crate) async fn supports_thinking_display(program: &Path) -> bool {
     cache()
         .lock()
         .expect("claude flag cache poisoned")
-        .insert(program.to_path_buf(), supported);
+        .insert(key, supported);
     supported
+}
+
+async fn probe_with_spawner(program: &Path, spawner: &Arc<dyn aionui_process::Spawner>) -> Option<String> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let probe = async {
+        let spec = aionui_common::CommandSpec {
+            command: program.to_path_buf(),
+            args: vec!["--version".to_owned()],
+            ..Default::default()
+        };
+        let process = spawner.spawn(spec, &[], "claude-subscription-version").await.ok()?;
+        let (stdin, stdout) = process.take_stdio().await?;
+        drop(stdin);
+        // Bound diagnostics without collecting an untrusted process's full output.
+        let mut reader = BufReader::new(tokio::io::AsyncReadExt::take(stdout, 1024));
+        let mut line = String::new();
+        reader.read_line(&mut line).await.ok()?;
+        process.wait_for_exit().await?.success().then_some(line)
+    };
+    match tokio::time::timeout(VERSION_PROBE_TIMEOUT, probe).await {
+        Ok(Some(raw)) => Some(raw),
+        _ => {
+            tracing::warn!("isolated Claude version probe failed; thinking display support unverified");
+            None
+        }
+    }
 }
 
 #[cfg(test)]

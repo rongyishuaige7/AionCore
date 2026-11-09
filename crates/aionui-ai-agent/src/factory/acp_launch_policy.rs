@@ -148,6 +148,7 @@ mod tests {
     #[test]
     fn apply_acp_launch_policy_adds_runtime_env_and_codex_full_access_config() {
         let mut command_spec = CommandSpec {
+            clear_env: false,
             command: "node".into(),
             args: vec!["codex-acp.js".into()],
             env: vec![],
@@ -194,6 +195,7 @@ mod tests {
     #[test]
     fn apply_acp_launch_policy_adds_codex_full_access_config_for_agent_full_access() {
         let mut command_spec = CommandSpec {
+            clear_env: false,
             command: "node".into(),
             args: vec!["codex-acp.js".into()],
             env: vec![],
@@ -232,6 +234,7 @@ mod tests {
     #[test]
     fn apply_acp_launch_policy_keeps_legacy_full_access_dangerous_for_persisted_snapshots() {
         let mut command_spec = CommandSpec {
+            clear_env: false,
             command: "node".into(),
             args: vec!["codex-acp.js".into()],
             env: vec![],
@@ -270,6 +273,7 @@ mod tests {
     #[test]
     fn apply_acp_launch_policy_skips_codex_config_for_non_codex_agents() {
         let mut command_spec = CommandSpec {
+            clear_env: false,
             command: "node".into(),
             args: vec!["claude-agent-acp.js".into()],
             env: vec![],

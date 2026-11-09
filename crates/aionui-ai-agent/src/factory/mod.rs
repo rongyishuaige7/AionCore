@@ -4,6 +4,7 @@ mod acp;
 mod acp_launch_policy;
 pub(crate) mod aionrs;
 mod antigravity;
+pub(crate) mod claude_subscription;
 mod context;
 
 use std::path::PathBuf;

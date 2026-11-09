@@ -64,6 +64,7 @@ async fn fixture_params(
             },
             metadata,
             aionui_common::CommandSpec {
+                clear_env: false,
                 command: "/usr/bin/true".into(),
                 args: vec![],
                 env: vec![],

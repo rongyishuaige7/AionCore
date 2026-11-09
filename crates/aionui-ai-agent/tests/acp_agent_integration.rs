@@ -106,6 +106,7 @@ async fn make_mock_agent(script: &str, backend: &str) -> (Arc<AcpAgentManager>, 
             },
             metadata,
             aionui_common::CommandSpec {
+                clear_env: false,
                 command: script_path.into(),
                 args: vec![],
                 env: vec![],

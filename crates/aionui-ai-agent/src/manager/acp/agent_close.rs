@@ -202,6 +202,7 @@ mod tests {
         let payload = stderr_payload.replace('\'', "'\\''");
         let script = format!("cat <<'EOF' >&2\n{payload}\nEOF\nexit {exit_code}");
         CommandSpec {
+            clear_env: false,
             command: "sh".into(),
             args: vec!["-c".into(), script],
             env: vec![],
@@ -214,6 +215,7 @@ mod tests {
         let payload = stderr_payload.replace('\'', "''");
         let script = format!("[Console]::Error.WriteLine('{payload}'); exit {exit_code}");
         CommandSpec {
+            clear_env: false,
             command: "powershell.exe".into(),
             args: vec![
                 "-NoLogo".into(),

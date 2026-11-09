@@ -396,6 +396,7 @@ async fn resolve_agent_command_spec(
     }));
 
     Ok(CommandSpec {
+        clear_env: false,
         command: resolved.program,
         args,
         env,

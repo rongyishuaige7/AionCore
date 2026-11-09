@@ -23,6 +23,9 @@ pub struct CommandSpec {
     pub command: PathBuf,
     pub args: Vec<String>,
     pub env: Vec<EnvVar>,
+    /// Clear inherited environment before applying explicit entries.
+    /// Defaults to false to preserve existing launch behavior.
+    pub clear_env: bool,
     pub cwd: Option<String>,
 }
 

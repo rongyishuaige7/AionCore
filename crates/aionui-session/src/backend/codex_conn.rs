@@ -121,6 +121,7 @@ impl BackendConnection for CodexConnection {
         let args = codex_app_server_args(&config.extra_args);
         log_codex_runtime_policy(&config.spawn_env);
         let cmd = aionui_common::CommandSpec {
+            clear_env: false,
             // Orchestration-resolved bundled CLI (packaged app) or bare "codex"
             // (dev → PATH). See SessionConfig.cli_program.
             command: config.cli_program.clone().unwrap_or_else(|| "codex".into()),
@@ -1531,6 +1532,7 @@ impl CodexSessionBackend {
         let args = codex_app_server_args(&self.wake.config.extra_args);
         log_codex_runtime_policy(&self.wake.config.spawn_env);
         let cmd = aionui_common::CommandSpec {
+            clear_env: false,
             // Same bundled-CLI resolution + spawn env as the initial spawn
             // (R16 continuity).
             command: self.wake.config.cli_program.clone().unwrap_or_else(|| "codex".into()),

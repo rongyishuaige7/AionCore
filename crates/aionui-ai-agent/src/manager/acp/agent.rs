@@ -2134,6 +2134,7 @@ mod tests {
         let payload = stderr_payload.replace('\'', "'\\''");
         let script = format!("cat <<'EOF' >&2\n{payload}\nEOF\nexit {exit_code}");
         CommandSpec {
+            clear_env: false,
             command: "sh".into(),
             args: vec!["-c".into(), script],
             env: vec![],
@@ -2146,6 +2147,7 @@ mod tests {
         let payload = stderr_payload.replace('\'', "''");
         let script = format!("[Console]::Error.WriteLine('{payload}'); exit {exit_code}");
         CommandSpec {
+            clear_env: false,
             command: "powershell.exe".into(),
             args: vec![
                 "-NoLogo".into(),
@@ -2298,6 +2300,7 @@ mod tests {
 
         let process = Arc::new(
             CliAgentProcess::spawn_for_sdk(aionui_common::CommandSpec {
+                clear_env: false,
                 command: PathBuf::from("sh"),
                 args: vec!["-c".into(), "sleep 300".into()],
                 env: vec![],

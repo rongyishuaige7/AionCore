@@ -98,6 +98,7 @@ mod tests {
 
     fn npx_spec(cache: &Path) -> CommandSpec {
         CommandSpec {
+            clear_env: false,
             command: PathBuf::from("npx"),
             args: PINNED_ARGS.iter().map(|arg| (*arg).to_owned()).collect(),
             env: vec![EnvVar {
@@ -134,6 +135,7 @@ mod tests {
     #[test]
     fn direct_cli_launch_keeps_the_steady_state_budget() {
         let spec = CommandSpec {
+            clear_env: false,
             command: PathBuf::from("omp"),
             args: vec!["acp".to_owned()],
             env: vec![],
@@ -149,6 +151,7 @@ mod tests {
     #[test]
     fn npx_launch_without_a_cache_location_keeps_the_steady_state_budget() {
         let spec = CommandSpec {
+            clear_env: false,
             command: PathBuf::from("npx"),
             args: PINNED_ARGS.iter().map(|arg| (*arg).to_owned()).collect(),
             env: vec![],

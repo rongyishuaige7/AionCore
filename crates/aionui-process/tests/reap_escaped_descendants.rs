@@ -221,6 +221,7 @@ async fn managed_process_kill_reaps_a_child_that_left_the_group() {
     };
     let proc = ManagedProcess::spawn(
         CommandSpec {
+            clear_env: false,
             command: "/bin/sh".into(),
             args: vec![
                 "-c".to_owned(),

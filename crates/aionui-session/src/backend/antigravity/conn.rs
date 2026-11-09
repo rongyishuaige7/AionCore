@@ -679,6 +679,7 @@ impl AntigravitySessionBackend {
             });
         }
         let spec = CommandSpec {
+            clear_env: false,
             command: self
                 .config
                 .cli_program

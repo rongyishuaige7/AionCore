@@ -24,11 +24,11 @@ impl CliAgentProcess {
     /// - Process exit monitoring
     pub async fn spawn_for_sdk(config: CommandSpec) -> Result<Self, AgentError> {
         let mut cmd = CmdBuilder::new(&config.command);
-        let agent_env = aionui_runtime::agent_process_env().await;
-        cmd.args(&config.args)
-            .env_clear()
-            .envs(agent_env)
-            .envs(config.env.iter().map(|e| (&e.name, &e.value)))
+        cmd.args(&config.args).env_clear();
+        if !config.clear_env {
+            cmd.envs(aionui_runtime::agent_process_env().await);
+        }
+        cmd.envs(config.env.iter().map(|e| (&e.name, &e.value)))
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -137,6 +137,37 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn clear_env_skips_shell_environment_and_keeps_only_explicit_keys() {
+        let config = CommandSpec {
+            clear_env: true,
+            command: "/usr/bin/env".into(),
+            args: vec!["-0".into()],
+            env: vec![EnvVar {
+                name: "AIONUI_FIXTURE_EXPLICIT".into(),
+                value: "fixture-only".into(),
+            }],
+            ..Default::default()
+        };
+        let process = CliAgentProcess::spawn_for_sdk(config).await.unwrap();
+        let (stdin, mut stdout) = process.take_stdio().await.unwrap();
+        drop(stdin);
+        let keys = timeout(Duration::from_secs(5), async {
+            let mut output = Vec::new();
+            stdout.read_to_end(&mut output).await.unwrap();
+            assert!(process.wait_for_exit().await.unwrap().success());
+            output
+                .split(|byte| *byte == 0)
+                .filter_map(|entry| entry.iter().position(|byte| *byte == b'=').map(|at| &entry[..at]))
+                .map(|key| String::from_utf8_lossy(key).into_owned())
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap();
+        assert_eq!(keys, ["AIONUI_FIXTURE_EXPLICIT"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn spawn_for_sdk_uses_clean_agent_env_and_explicit_overrides() {
         const CHILD_ENV: &str = "AIONUI_TEST_SDK_AGENT_ENV_CHILD";
 
@@ -218,6 +249,7 @@ printf '%s\n' \
     #[test]
     fn sdk_spawn_preview_omits_env_values_and_arg_bodies() {
         let config = CommandSpec {
+            clear_env: false,
             command: "node".into(),
             args: vec!["--api-key=secret-arg-value".into()],
             env: vec![

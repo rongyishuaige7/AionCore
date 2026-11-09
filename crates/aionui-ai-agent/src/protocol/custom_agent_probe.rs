@@ -145,6 +145,7 @@ async fn spawn_probe_process(
     }));
 
     let spec = CommandSpec {
+        clear_env: false,
         command: resolved.program,
         args: final_args,
         env: final_env,
