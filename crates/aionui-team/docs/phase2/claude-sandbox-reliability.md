@@ -286,3 +286,34 @@ The launch/MCP fixtures share one test to avoid competing for the same global
 version-cache key; the cold-probe assertions remain intact. HTTP shutdown
 verification waits through a racing TCP reset until connections are refused.
 No real subscription process was launched during these checks.
+
+## Host acceptance: fixed launcher argument compatibility
+
+The first account-2 live Team fixture stopped before MCP initialization. The
+actual session argument builder adds `--allow-dangerously-skip-permissions`
+(`crates/aionui-session/src/backend/claude_conn.rs`, `build_claude_init_args`).
+Read-only validation against the installed account-2 policy rejected that argv
+shape with `ARGUMENT_NOT_ALLOWED`; removing only this flag passed validation.
+The existing `/Users/rongyi/.local/bin/claude-pro2-danger` already supplies
+`--dangerously-skip-permissions`. This is an argument compatibility failure;
+it is not evidence of a subscription quota or authentication failure.
+
+Session assembly now explicitly records that the selected fixed subscription
+launcher manages bypass. The Claude builder then omits only the redundant
+runtime unlock flag, leaving the requested permission mode and all other
+arguments intact. Ordinary CLI launches keep their previous flag. The config
+is retained by the wake recipe, and fresh/resume/fork assembly fixtures assert
+the omission for both fixed accounts without executing either CLI. No guard,
+entry script, environment, routing or credentials change for this correction.
+
+Existing launch lifecycle and redacted failure logs remain sufficient; no
+prompt, argument values, error payload or credential logging is added. Verify
+the affected session/AI-agent tests and Clippy, the full pre-push gate, then
+repeat the account-2 live Team fixture. Live and UI deployment results remain
+separate from source verification.
+
+Focused correction checks on 2026-11-09: the affected `aionui-session` and
+`aionui-ai-agent` tests (with `test-support`, locked/offline dependencies) passed
+1,679 tests with 15 existing ignored tests. All-target Clippy with `-D warnings`,
+format and whitespace checks passed. No account-1 CLI was executed. The full
+pre-push gate and repeated live Team result are recorded separately.

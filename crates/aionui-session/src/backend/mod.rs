@@ -264,6 +264,12 @@ pub struct SessionConfig {
     pub model: Option<String>,
     pub mode: Option<String>,
     pub extra_args: Vec<String>,
+    /// Claude only: the explicitly selected launcher already supplies
+    /// `--dangerously-skip-permissions`. Omit the redundant runtime bypass
+    /// unlock flag; this does not select or change the requested mode.
+    /// Default false preserves ordinary CLI launch arguments. Retained in the
+    /// cloned config for idle wake and resume.
+    pub claude_bypass_managed_by_launcher: bool,
     /// F-4 idle self-suspend TTL (ms). `None` (default) = never suspend: the
     /// backend keeps its process resident for life, byte-identical to the pre-F-4
     /// path. `Some(ttl)` = a backend that supports graceful resume (claude

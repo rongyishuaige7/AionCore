@@ -231,10 +231,14 @@ pub(crate) fn build_claude_init_args(config: &SessionConfig) -> Vec<String> {
     // the SDK's `allowDangerouslySkipPermissions` separately from `permissionMode`.
     // Without this flag the user can never switch to bypass at runtime (claude rejects
     // the in-band switch). bypass is unavailable as root (claude ignores it there); we
-    // pass the flag unconditionally and let the in-band control_response surface the
-    // rejection (the dispatch reconciles on the reply), keeping this builder a pure,
-    // syscall-free fn.
-    args.push("--allow-dangerously-skip-permissions".to_string());
+    // Normally pass the flag and let the in-band control_response surface the
+    // rejection (the dispatch reconciles on the reply). A host-selected launcher
+    // that already forces bypass can reject this redundant unlock option; the
+    // explicit config bit omits it without changing the requested mode. Keep
+    // this builder pure and syscall-free.
+    if !config.claude_bypass_managed_by_launcher {
+        args.push("--allow-dangerously-skip-permissions".to_string());
+    }
 
     // AskUserQuestion is ENABLED: the frontend now renders a real multi-question
     // card fed by `SessionEvent::Ask` and answers through `Command::AnswerAsk`
@@ -3736,6 +3740,26 @@ mod tests {
              (the Ask card renders multi-question payloads)"
         );
         assert_eq!(build_claude_mcp_config(&[]), None, "no servers → no --mcp-config");
+    }
+
+    #[test]
+    fn launcher_managed_bypass_omits_unlock_and_preserves_explicit_mode() {
+        for mode in [None, Some("default"), Some("bypassPermissions")] {
+            let config = SessionConfig {
+                mode: mode.map(str::to_owned),
+                claude_bypass_managed_by_launcher: true,
+                ..Default::default()
+            };
+            assert_eq!(
+                build_claude_init_args(&config),
+                ["--permission-mode", mode.unwrap_or("default")],
+            );
+            let ordinary = SessionConfig {
+                claude_bypass_managed_by_launcher: false,
+                ..config
+            };
+            assert!(build_claude_init_args(&ordinary).contains(&"--allow-dangerously-skip-permissions".to_owned()));
+        }
     }
 
     /// MCP servers → `--mcp-config <json>` + `--strict-mcp-config` (the latter ONLY

@@ -2021,6 +2021,7 @@ pub async fn build_session_instance(
             .as_ref()
             .map(|launch| launch.program().to_path_buf())
             .or_else(|| resolve_session_cli_program(backend_label, metadata)),
+        claude_bypass_managed_by_launcher: subscription.is_some(),
         // Layer 1 (argv). `--plugin-dir <view>` plus one `--add-dir <source>` per
         // enabled skill, already substituted by the delivery plan. Empty for a
         // non-argv vendor or an empty snapshot.
@@ -5056,6 +5057,7 @@ mod build_mapping_tests {
                     assert_eq!(keys, ["HOME", "PATH", "TERM"]);
                 }
                 let session = records.last().expect("session command captured");
+                assert!(!session.args.contains(&"--allow-dangerously-skip-permissions".into()));
                 assert!(session.args.contains(&"--include-partial-messages".into()));
                 assert!(session.args.contains(&"--replay-user-messages".into()));
                 assert!(
