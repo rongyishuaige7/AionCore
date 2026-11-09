@@ -40,8 +40,7 @@ use crate::team_run::{TeamRunManager, target_role_for};
 use crate::types::{MailboxMessage, MailboxMessageType, Team, TeamAgent, TeammateRole, TeammateStatus};
 use crate::work_coordinator::{
     CausalBinding, CommitResult, EnqueueCommit, EnqueueDisposition, EnqueueLease, EnqueueRequest,
-    MAX_MESSAGE_DELIVERY_FAILURES, ObserveMessagesResult, ReconcileDecision, RuntimeConstraint, SlotWorkCoordinator,
-    WorkBatch,
+    ObserveMessagesResult, ReconcileDecision, RuntimeConstraint, SlotWorkCoordinator, WorkBatch,
 };
 use crate::work_source::WorkSource;
 
@@ -2033,13 +2032,12 @@ impl TeamSession {
             .observe_messages(slot_id, expected_batch_id, message_ids))
     }
 
-    /// Tell the lead that a teammate burned through its delivery retries and is
-    /// now paused. Without this the slot stalls silently and the lead waits on a
-    /// teammate that will never answer. Mirrors `notify_leader_spawn_attach_failed`.
-    pub(crate) async fn notify_leader_delivery_exhausted(
+    /// Tell the lead that automatic delivery stopped while unread mail remains.
+    pub(crate) async fn notify_leader_delivery_paused(
         &self,
         slot_id: &str,
-        abandoned_count: usize,
+        retained_count: usize,
+        retry_limit_reached: bool,
     ) -> Result<(), TeamError> {
         let Some(lead_slot_id) = self.scheduler.find_lead_slot_id().await else {
             return Ok(());
@@ -2048,11 +2046,15 @@ impl TeamSession {
             // The lead itself stalled; there is no higher authority to notify.
             return Ok(());
         }
+        let reason = if retry_limit_reached {
+            "The automatic delivery retry limit was reached."
+        } else {
+            "The conversation did not authorize automatic replay."
+        };
         let content = format!(
-            "Teammate {slot_id} could not process {abandoned_count} queued message(s) after \
-             {MAX_MESSAGE_DELIVERY_FAILURES} delivery attempts. Those messages were dropped and the \
-             teammate is now paused: it will not pick up new work until you interrupt it with \
-             team_interrupt_agent or the user intervenes. Check on it before assigning more work."
+            "Teammate {slot_id} is paused with {retained_count} queued message(s) still unread. \
+             {reason} Review its error and any existing output before resuming it with \
+             team_interrupt_agent or explicit user intervention. The messages were retained."
         );
         self.mailbox
             .write(
@@ -2061,7 +2063,7 @@ impl TeamSession {
                 slot_id,
                 MailboxMessageType::Message,
                 &content,
-                Some("Delivery retry limit reached"),
+                Some("Automatic delivery paused"),
             )
             .await?;
         self.wake_leader_after_recovery_message(slot_id, WorkSource::DeliveryFailureNotification)
@@ -2496,6 +2498,7 @@ mod tests {
                 conversation_id: request.conversation_id,
                 turn_id: "turn-background".into(),
                 status: crate::ports::AgentTurnStatus::Completed,
+                auto_retry_allowed: false,
                 runtime: None,
             })
         }
@@ -2548,6 +2551,7 @@ mod tests {
                 conversation_id: request.conversation_id,
                 turn_id: "turn-test".into(),
                 status: crate::ports::AgentTurnStatus::Completed,
+                auto_retry_allowed: false,
                 runtime: None,
             })
         }

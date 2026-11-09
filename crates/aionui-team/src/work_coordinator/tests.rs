@@ -590,6 +590,58 @@ fn delivery_failures_pause_after_three_attempts() {
 }
 
 #[test]
+fn non_retryable_failure_pauses_atomically_and_retains_mail_for_user_recovery() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::UserMessage, "m1");
+    let ReconcileDecision::Claim(first) = coordinator.next("lead-1") else {
+        panic!("first delivery must be claimable");
+    };
+    let failure = coordinator.fail_batch_and_pause(&first, "no_replay");
+    assert!(failure.paused);
+    assert!(failure.exhausted_message_ids.is_empty());
+
+    coordinator.reconcile_mailbox("lead-1", &["m1".into()], TeamRunTargetRole::Lead);
+    enqueue(&coordinator, WorkSource::McpSendMessage, "m2");
+    assert_eq!(coordinator.slot_snapshot("lead-1").unwrap().state, SlotPhase::Paused);
+    assert!(!matches!(coordinator.next("lead-1"), ReconcileDecision::Claim(_)));
+
+    enqueue(&coordinator, WorkSource::UserMessage, "resume");
+    let ReconcileDecision::Claim(resumed) = coordinator.next("lead-1") else {
+        panic!("explicit user intervention must resume retained work");
+    };
+    let mut delivered = resumed.mailbox_message_ids.clone();
+    coordinator.complete_batch(&resumed);
+    while let ReconcileDecision::Claim(batch) = coordinator.next("lead-1") {
+        delivered.extend(batch.mailbox_message_ids.clone());
+        coordinator.complete_batch(&batch);
+    }
+    assert!(delivered.contains(&"m1".into()));
+}
+
+#[test]
+fn stale_failed_outcome_cannot_pause_a_replacement_batch() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::UserMessage, "m1");
+    let ReconcileDecision::Claim(first) = coordinator.next("lead-1") else {
+        panic!("first delivery must be claimable");
+    };
+    coordinator.complete_batch(&first);
+    enqueue(&coordinator, WorkSource::UserMessage, "m2");
+    let ReconcileDecision::Claim(replacement) = coordinator.next("lead-1") else {
+        panic!("replacement delivery must be claimable");
+    };
+    let failure = coordinator.fail_batch_and_pause(&first, "stale_failure");
+    assert_eq!(failure.commit_result, CommitResult::StaleOwner);
+    assert!(!failure.paused);
+    assert_eq!(
+        coordinator.slot_snapshot("lead-1").unwrap().active_batch,
+        Some(replacement)
+    );
+}
+
+#[test]
 fn successful_retry_clears_the_consecutive_failure_count() {
     let coordinator = coordinator();
     coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);

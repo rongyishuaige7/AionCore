@@ -13,7 +13,7 @@ use aionui_ai_agent::{
 use crate::message_cursor::{decode_message_cursor, encode_message_cursor};
 use crate::runtime_completion::RuntimeCompletionPublisher;
 use crate::runtime_persistence::{RuntimePersistenceCoordinator, RuntimeWriteKind};
-use crate::runtime_state::ConversationRuntimeStateService;
+use crate::runtime_state::{ConversationRuntimeStateService, RuntimeLifecycleState};
 use aionui_api_types::{
     ASSISTANT_MCP_BINDING_CHANGED_EVENT, ApprovalCheckResponse, AssistantConversationOverridesRequest,
     AssistantMcpBindingChanged, CancelConversationResponse, CloneConversationRequest, ConfirmRequest,
@@ -390,6 +390,8 @@ pub struct ConversationAgentTurnOutcome {
     pub turn_id: String,
     pub status: ConversationAgentTurnStatus,
     pub error_message: Option<String>,
+    /// Explicit authority for an outer scheduler to retry this failed delivery.
+    pub auto_retry_allowed: bool,
     pub runtime: ConversationRuntimeSummary,
 }
 
@@ -4133,6 +4135,8 @@ impl ConversationService {
                     Some(top_level_code),
                 )
                 .await;
+                let auto_retry_allowed = send_error.stream_error().retryable == Some(true)
+                    && self.runtime_state.lifecycle_for(&request.conversation_id) == RuntimeLifecycleState::Active;
                 let mut turn_claim = turn_claim;
                 let was_deleting = turn_claim.release();
                 self.complete_released_turn(&request.user_id, &request.conversation_id, &turn_id, was_deleting)
@@ -4142,6 +4146,7 @@ impl ConversationService {
                     turn_id,
                     status: ConversationAgentTurnStatus::Failed,
                     error_message: Some(send_error_display_message(&send_error)),
+                    auto_retry_allowed,
                     runtime: self.runtime_summary_for(&request.conversation_id).await,
                 });
             }
@@ -4175,6 +4180,7 @@ impl ConversationService {
                 ConversationTurnStatus::Failed => ConversationAgentTurnStatus::Failed,
             },
             error_message: result.error_message,
+            auto_retry_allowed: result.auto_retry_allowed,
         })
     }
 

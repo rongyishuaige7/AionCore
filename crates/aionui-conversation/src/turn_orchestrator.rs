@@ -54,6 +54,7 @@ pub(crate) enum ConversationTurnStatus {
 pub(crate) struct ConversationTurnResult {
     pub status: ConversationTurnStatus,
     pub error_message: Option<String>,
+    pub auto_retry_allowed: bool,
 }
 
 pub(crate) struct ConversationTurnOrchestrator {
@@ -172,6 +173,7 @@ impl ConversationTurnOrchestrator {
                 return Err(ConversationTurnResult {
                     status: ConversationTurnStatus::Failed,
                     error_message: Some(failure_message),
+                    auto_retry_allowed: send_error.stream_error().retryable == Some(true),
                 });
             }
         };
@@ -208,6 +210,7 @@ impl ConversationTurnOrchestrator {
             return Err(ConversationTurnResult {
                 status: ConversationTurnStatus::Failed,
                 error_message: Some(failure_message),
+                auto_retry_allowed: false,
             });
         }
 
@@ -265,6 +268,7 @@ impl ConversationTurnOrchestrator {
             return Err(ConversationTurnResult {
                 status: ConversationTurnStatus::Completed,
                 error_message: None,
+                auto_retry_allowed: false,
             });
         }
 
@@ -361,6 +365,7 @@ impl ConversationTurnOrchestrator {
                         return Err(ConversationTurnResult {
                             status: ConversationTurnStatus::Failed,
                             error_message: Some(failure_message),
+                            auto_retry_allowed: false,
                         });
                     }
                 }
@@ -476,6 +481,7 @@ impl ConversationTurnOrchestrator {
         let superseding_tips = SupersedingTipTotals::default();
         let mut replay_started_at = None;
         let mut final_error_message;
+        let mut auto_retry_allowed = false;
         let mut auth_failure = false;
 
         info!(conversation_id = %conv_id, turn_id = %turn_id, "conversation turn orchestrator started");
@@ -502,6 +508,9 @@ impl ConversationTurnOrchestrator {
                 Ok(result) => result,
                 Err(result) => {
                     final_error_message = result.error_message;
+                    auto_retry_allowed = result.auto_retry_allowed
+                        && !replayed
+                        && runtime_state.lifecycle_for(&conv_id) == RuntimeLifecycleState::Active;
                     break result.status == ConversationTurnStatus::Failed;
                 }
             };
@@ -540,6 +549,7 @@ impl ConversationTurnOrchestrator {
 
             let mut recovery_outcome = attempt_result.outcome.clone();
             recovery_outcome.attempt = attempt_result.summary.clone();
+            auto_retry_allowed = TurnRecoveryPolicy::allow_delivery_retry(&recovery_outcome, lifecycle, replayed);
             let decision = TurnRecoveryPolicy::decide(
                 attempt_result.agent_type,
                 attempt_result.backend.as_deref(),
@@ -653,6 +663,7 @@ impl ConversationTurnOrchestrator {
                 ConversationTurnStatus::Completed
             },
             error_message: if final_failed { final_error_message } else { None },
+            auto_retry_allowed: final_failed && auto_retry_allowed,
         }
     }
 }

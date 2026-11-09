@@ -857,6 +857,15 @@ impl SlotWorkCoordinator {
         )
     }
 
+    pub(crate) fn fail_batch_and_pause(&self, batch: &WorkBatch, classification: &'static str) -> BatchFailureResult {
+        self.terminalize_batch(
+            batch,
+            WorkIntentState::Failed { classification },
+            classification,
+            DeliveryOutcome::Paused,
+        )
+    }
+
     pub(crate) fn cancel_batch(&self, batch: &WorkBatch, classification: &'static str) -> CommitResult {
         // A cancelled batch never reached the agent, so it is not a failed delivery
         // attempt and must not consume the message's retry budget.
@@ -1510,6 +1519,7 @@ impl SlotWorkCoordinator {
             return BatchFailureResult {
                 commit_result: CommitResult::StaleOwner,
                 exhausted_message_ids: Vec::new(),
+                paused: false,
             };
         }
         for intent_id in &batch.intent_ids {
@@ -1521,6 +1531,9 @@ impl SlotWorkCoordinator {
         slot.active = None;
         let mut exhausted_message_ids = Vec::new();
         match delivery {
+            DeliveryOutcome::Paused => {
+                slot.paused = true;
+            }
             DeliveryOutcome::NotFailed => {
                 for message_id in &batch.mailbox_message_ids {
                     slot.delivery_failure_counts.remove(message_id);
@@ -1544,6 +1557,7 @@ impl SlotWorkCoordinator {
                 }
             }
         }
+        let paused = slot.paused;
         let slot_snapshot = Self::slot_snapshot_locked(&state, &batch.slot_id);
         let summaries = Self::run_summaries_locked(&state, batch.team_run_ids.iter().cloned());
         drop(state);
@@ -1562,6 +1576,7 @@ impl SlotWorkCoordinator {
         BatchFailureResult {
             commit_result: CommitResult::Committed,
             exhausted_message_ids,
+            paused,
         }
     }
 

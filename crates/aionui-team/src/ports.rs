@@ -229,6 +229,8 @@ pub struct AgentTurnOutcome {
     pub conversation_id: String,
     pub turn_id: String,
     pub status: AgentTurnStatus,
+    /// False unless the conversation layer explicitly authorizes a safe retry.
+    pub auto_retry_allowed: bool,
     pub runtime: Option<ConversationRuntimeSummary>,
 }
 

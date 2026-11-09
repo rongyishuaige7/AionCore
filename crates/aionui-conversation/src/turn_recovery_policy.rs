@@ -24,6 +24,20 @@ pub enum TurnRecoveryDecision {
 pub struct TurnRecoveryPolicy;
 
 impl TurnRecoveryPolicy {
+    /// Authorize a Team delivery retry only when this turn has not spent its
+    /// automatic replay and no visible output or side effect can be duplicated.
+    pub(crate) fn allow_delivery_retry(
+        outcome: &RelayOutcome,
+        lifecycle: RuntimeLifecycleState,
+        already_replayed: bool,
+    ) -> bool {
+        lifecycle == RuntimeLifecycleState::Active
+            && outcome.terminal.is_error()
+            && outcome.terminal.retryable() == Some(true)
+            && outcome.attempt.safe_to_auto_replay()
+            && !already_replayed
+    }
+
     pub fn decide(
         agent_type: AgentType,
         backend: Option<&str>,
@@ -66,6 +80,7 @@ impl TurnRecoveryPolicy {
             saw_visible_output = outcome.attempt.saw_visible_output,
             saw_tool_or_side_effect = outcome.attempt.saw_tool_or_side_effect,
             persisted_assistant_output = outcome.attempt.persisted_assistant_output,
+            saw_event_gap = outcome.attempt.saw_event_gap,
             decision = ?decision,
             "conversation turn recovery decision"
         );
@@ -140,6 +155,80 @@ mod tests {
             attempt: TurnAttemptSummary::default(),
             ..RelayOutcome::default()
         }
+    }
+
+    #[test]
+    fn outer_delivery_retry_requires_explicit_permission_and_an_unused_replay() {
+        let mut outcome = retryable_clean_error();
+        assert!(TurnRecoveryPolicy::allow_delivery_retry(
+            &outcome,
+            RuntimeLifecycleState::Active,
+            false,
+        ));
+        assert!(!TurnRecoveryPolicy::allow_delivery_retry(
+            &outcome,
+            RuntimeLifecycleState::Active,
+            true,
+        ));
+        for lifecycle in [
+            RuntimeLifecycleState::Deleting,
+            RuntimeLifecycleState::Cancelling,
+            RuntimeLifecycleState::ShuttingDown,
+        ] {
+            assert!(!TurnRecoveryPolicy::allow_delivery_retry(&outcome, lifecycle, false));
+        }
+        outcome.terminal = RelayTerminal::Error {
+            code: Some(AgentErrorCode::UserLlmProviderRateLimited),
+            retryable: Some(false),
+        };
+        assert!(!TurnRecoveryPolicy::allow_delivery_retry(
+            &outcome,
+            RuntimeLifecycleState::Active,
+            false,
+        ));
+    }
+
+    #[test]
+    fn outer_delivery_retry_rejects_output_side_effects_and_missing_events() {
+        for attempt in [
+            TurnAttemptSummary {
+                saw_visible_output: true,
+                ..Default::default()
+            },
+            TurnAttemptSummary {
+                saw_tool_or_side_effect: true,
+                ..Default::default()
+            },
+            TurnAttemptSummary {
+                persisted_assistant_output: true,
+                ..Default::default()
+            },
+            TurnAttemptSummary {
+                saw_event_gap: true,
+                ..Default::default()
+            },
+        ] {
+            let outcome = RelayOutcome {
+                attempt,
+                ..retryable_clean_error()
+            };
+            assert!(!TurnRecoveryPolicy::allow_delivery_retry(
+                &outcome,
+                RuntimeLifecycleState::Active,
+                false,
+            ));
+        }
+    }
+
+    #[test]
+    fn a_gap_in_an_earlier_continuation_keeps_the_turn_unsafe() {
+        let mut summary = TurnAttemptSummary::default();
+        summary.merge(&TurnAttemptSummary {
+            saw_event_gap: true,
+            ..Default::default()
+        });
+        summary.merge(&TurnAttemptSummary::default());
+        assert!(!summary.safe_to_auto_replay());
     }
 
     #[test]

@@ -3,13 +3,13 @@ use aionui_common::TimestampMs;
 
 use crate::work_source::WorkSource;
 
-/// How many times a single mailbox message may fail delivery before it is
-/// abandoned and its slot paused.
+/// How many times a single mailbox message may fail delivery before
+/// automatic delivery is paused. Messages remain unread for explicit recovery.
 ///
 /// Counted in memory, per slot: a process restart resets the count. That is
 /// deliberate — a restart is exactly the kind of change that can make a
 /// previously failing delivery succeed, so carrying the count across it would
-/// abandon messages that would now go through.
+/// pause messages that would now go through.
 pub(crate) const MAX_MESSAGE_DELIVERY_FAILURES: u8 = 3;
 
 /// What retiring a batch means for the delivery retry counters of the mailbox
@@ -24,6 +24,9 @@ pub(crate) enum DeliveryOutcome {
     /// counter and reports the ones that have now exhausted
     /// `MAX_MESSAGE_DELIVERY_FAILURES`, whose slot is then paused.
     Failed,
+    /// The conversation did not authorize automatic replay. Retain unread mail
+    /// and pause the slot without consuming a transient delivery retry.
+    Paused,
 }
 
 /// Lane a queued work intent sits in. Declared highest-priority first; the
@@ -206,6 +209,7 @@ pub(crate) enum CommitResult {
 pub(crate) struct BatchFailureResult {
     pub(crate) commit_result: CommitResult,
     pub(crate) exhausted_message_ids: Vec<String>,
+    pub(crate) paused: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

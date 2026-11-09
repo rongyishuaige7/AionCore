@@ -92,6 +92,7 @@ impl AgentTurnExecutionPort for RecordingTurnPort {
             conversation_id: request.conversation_id,
             turn_id,
             status: AgentTurnStatus::Completed,
+            auto_retry_allowed: false,
             runtime: None,
         })
     }
@@ -157,6 +158,7 @@ impl AgentTurnExecutionPort for ErrorBeforeStartTurnPort {
             conversation_id: request.conversation_id,
             turn_id,
             status: AgentTurnStatus::Completed,
+            auto_retry_allowed: false,
             runtime: None,
         })
     }
@@ -186,6 +188,8 @@ impl AgentTurnExecutionPort for SkippedBusyTurnPort {
 #[derive(Default)]
 struct StartedThenFailedTurnPort {
     requests: Arc<Mutex<Vec<AgentTurnRequest>>>,
+    auto_retry_allowed: bool,
+    execution_error: bool,
 }
 
 impl StartedThenFailedTurnPort {
@@ -213,6 +217,11 @@ impl AgentTurnExecutionPort for StartedThenFailedTurnPort {
             })
             .await;
         }
+        if self.execution_error {
+            return Err(AgentTurnExecutionError::Failed {
+                reason: "execution ended after start without an outcome".into(),
+            });
+        }
         Ok(AgentTurnOutcome {
             conversation_id: request.conversation_id,
             turn_id,
@@ -221,6 +230,7 @@ impl AgentTurnExecutionPort for StartedThenFailedTurnPort {
             } else {
                 AgentTurnStatus::Completed
             },
+            auto_retry_allowed: attempt == 1 && self.auto_retry_allowed,
             runtime: None,
         })
     }
@@ -283,6 +293,7 @@ impl AgentTurnExecutionPort for HoldFirstRunningTurnPort {
             conversation_id: request.conversation_id,
             turn_id,
             status: AgentTurnStatus::Completed,
+            auto_retry_allowed: false,
             runtime: None,
         })
     }
@@ -321,6 +332,7 @@ impl AgentTurnExecutionPort for BlockingStartTurnPort {
             conversation_id: request.conversation_id,
             turn_id: "turn-late-start".into(),
             status: AgentTurnStatus::Completed,
+            auto_retry_allowed: false,
             runtime: None,
         })
     }
@@ -1807,7 +1819,7 @@ async fn repeated_start_failure_stops_after_three_attempts_and_marks_slot_error(
         .expect("send_message must succeed");
 
     wait_for_turn_request_count(&requests, 3).await;
-    wait_for_unread_count(&session, "lead-1", 0).await;
+    wait_for_unread_count(&session, "lead-1", 1).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
     assert_eq!(requests.lock().unwrap().len(), 3, "delivery must not retry forever");
     assert_eq!(
@@ -1862,7 +1874,10 @@ async fn retryable_start_requeues_without_marking_mailbox_read() {
 #[tokio::test]
 async fn failed_started_turn_preserves_unread_and_retries_successfully() {
     let broadcaster = Arc::new(RecordingBroadcaster::new());
-    let turn_port = Arc::new(StartedThenFailedTurnPort::default());
+    let turn_port = Arc::new(StartedThenFailedTurnPort {
+        auto_retry_allowed: true,
+        ..Default::default()
+    });
     let requests = turn_port.requests();
     let session =
         setup_session_with_runtime_ports(turn_port, Arc::new(NoopCancellationPort), broadcaster.clone()).await;
@@ -1887,6 +1902,90 @@ async fn failed_started_turn_preserves_unread_and_retries_successfully() {
     } = &requests[1].source;
     assert_eq!(retry_ids, first_ids, "the retry must deliver the same mailbox message");
 
+    session.stop();
+}
+
+#[tokio::test]
+async fn non_retryable_started_failure_waits_for_user_and_retains_original_message() {
+    let broadcaster = Arc::new(RecordingBroadcaster::new());
+    let turn_port = Arc::new(StartedThenFailedTurnPort::default());
+    let requests = turn_port.requests();
+    let session =
+        setup_session_with_runtime_ports(turn_port, Arc::new(NoopCancellationPort), broadcaster.clone()).await;
+    session.send_message("original quota-blocked work", None).await.unwrap();
+    wait_for_event(&broadcaster, "team.runFailed").await;
+    wait_for_unread_count(&session, "lead-1", 1).await;
+
+    let original_ids = {
+        let log = requests.lock().unwrap();
+        let AgentTurnSource::Mailbox { unread_message_ids, .. } = &log[0].source;
+        unread_message_ids.clone()
+    };
+    assert_eq!(original_ids.len(), 1);
+    // A real idle notification and notifier wake must not resume a paused lead.
+    session
+        .scheduler()
+        .set_status("worker-1", aionui_team::TeammateStatus::Working)
+        .await
+        .unwrap();
+    assert_eq!(
+        session.on_agent_finish("conv-worker", false).await.unwrap().as_deref(),
+        Some("lead-1")
+    );
+    session.event_loops().notify("lead-1");
+    wait_for_unread_count(&session, "lead-1", 2).await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        1,
+        "idle notifications cannot authorize replay"
+    );
+
+    session.send_message("explicit user resume", None).await.unwrap();
+    wait_for_turn_request_count(&requests, 2).await;
+    wait_for_unread_count(&session, "lead-1", 0).await;
+    let log = requests.lock().unwrap();
+    // User work has foreground priority; retained mail is a separate RecoveryDrain
+    // batch. It must actually be delivered once before being acknowledged.
+    let original_deliveries = log[1..]
+        .iter()
+        .filter(|request| {
+            let AgentTurnSource::Mailbox { unread_message_ids, .. } = &request.source;
+            unread_message_ids.contains(&original_ids[0])
+        })
+        .count();
+    assert_eq!(
+        original_deliveries, 1,
+        "the retained message must be delivered exactly once after recovery"
+    );
+    drop(log);
+    session.stop();
+}
+
+#[tokio::test]
+async fn execution_error_after_start_pauses_instead_of_guessing_replay_is_safe() {
+    let broadcaster = Arc::new(RecordingBroadcaster::new());
+    let turn_port = Arc::new(StartedThenFailedTurnPort {
+        execution_error: true,
+        ..Default::default()
+    });
+    let requests = turn_port.requests();
+    let session = setup_session_with_runtime_ports(turn_port, Arc::new(NoopCancellationPort), broadcaster).await;
+    session
+        .send_message("work with an unknown execution result", None)
+        .await
+        .unwrap();
+    wait_for_turn_request_count(&requests, 1).await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    assert_eq!(
+        session.mailbox().peek_unread("e2e-team", "lead-1").await.unwrap().len(),
+        1
+    );
+    assert_eq!(
+        session.scheduler().get_status("lead-1").await.unwrap(),
+        aionui_team::TeammateStatus::Error
+    );
     session.stop();
 }
 

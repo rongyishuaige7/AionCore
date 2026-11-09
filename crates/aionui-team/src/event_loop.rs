@@ -330,7 +330,13 @@ async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: W
                 error = %error,
                 "agent turn start failed"
             );
-            let failure = ctx.session.work_coordinator().fail_batch(&batch, "turn_start_failed");
+            let failure = if started_seen.load(Ordering::SeqCst) {
+                ctx.session
+                    .work_coordinator()
+                    .fail_batch_and_pause(&batch, "turn_execution_unknown")
+            } else {
+                ctx.session.work_coordinator().fail_batch(&batch, "turn_start_failed")
+            };
             finalize_failed_delivery(ctx, &batch, &failure).await;
             let _ = ctx.scheduler.set_status(&ctx.slot_id, TeammateStatus::Error).await;
             return ExecuteResult::ContinueDraining;
@@ -350,7 +356,24 @@ async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: W
             completion.team_run_ids,
         )
     } else {
-        let failure = ctx.session.work_coordinator().fail_batch(&batch, "turn_failed");
+        let failure = if outcome.auto_retry_allowed {
+            ctx.session
+                .work_coordinator()
+                .fail_batch(&batch, "turn_failed_retryable")
+        } else {
+            ctx.session
+                .work_coordinator()
+                .fail_batch_and_pause(&batch, "turn_failed_no_replay")
+        };
+        info!(
+            team_id = %ctx.team_id,
+            slot_id = %ctx.slot_id,
+            batch_id = %batch.batch_id,
+            turn_id = %outcome.turn_id,
+            auto_retry_allowed = outcome.auto_retry_allowed,
+            paused = failure.paused,
+            "team failed turn delivery decision"
+        );
         finalize_failed_delivery(ctx, &batch, &failure).await;
         let _ = ctx.scheduler.set_status(&ctx.slot_id, TeammateStatus::Error).await;
         (
@@ -410,7 +433,7 @@ async fn finalize_scheduler_turn(ctx: &AgentLoopContext) {
 }
 
 async fn finalize_failed_delivery(ctx: &AgentLoopContext, batch: &WorkBatch, failure: &BatchFailureResult) {
-    if failure.exhausted_message_ids.is_empty() {
+    if !failure.paused {
         return;
     }
     warn!(
@@ -418,14 +441,18 @@ async fn finalize_failed_delivery(ctx: &AgentLoopContext, batch: &WorkBatch, fai
         slot_id = %ctx.slot_id,
         batch_id = %batch.batch_id,
         exhausted_message_count = failure.exhausted_message_ids.len(),
-        "team batch delivery retry limit reached; messages abandoned and slot paused"
+        retained_message_count = batch.mailbox_message_ids.len(),
+        "team batch delivery paused; unacknowledged messages retained"
     );
-    mark_message_ids_read(ctx, batch, &failure.exhausted_message_ids).await;
     // The slot is now paused and only a user or lead intervention can resume it,
     // so the lead has to hear about it or it will wait on a teammate forever.
     if let Err(error) = ctx
         .session
-        .notify_leader_delivery_exhausted(&ctx.slot_id, failure.exhausted_message_ids.len())
+        .notify_leader_delivery_paused(
+            &ctx.slot_id,
+            batch.mailbox_message_ids.len(),
+            !failure.exhausted_message_ids.is_empty(),
+        )
         .await
     {
         warn!(

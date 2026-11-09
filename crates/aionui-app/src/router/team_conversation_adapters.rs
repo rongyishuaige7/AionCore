@@ -140,6 +140,7 @@ impl AgentTurnExecutionPort for TeamConversationAdapters {
                 ConversationAgentTurnStatus::Failed => AgentTurnStatus::Failed,
             },
             runtime: Some(outcome.runtime),
+            auto_retry_allowed: outcome.auto_retry_allowed,
         })
     }
 }

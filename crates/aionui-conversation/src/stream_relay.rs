@@ -89,6 +89,7 @@ pub struct TurnAttemptSummary {
     pub saw_visible_output: bool,
     pub saw_tool_or_side_effect: bool,
     pub persisted_assistant_output: bool,
+    pub saw_event_gap: bool,
     pub terminal_error: Option<ErrorEventData>,
     pub terminal_error_deferred: bool,
     /// The turn ended benignly (a Finish, not an Error) but the agent signalled
@@ -100,13 +101,17 @@ pub struct TurnAttemptSummary {
 
 impl TurnAttemptSummary {
     pub fn safe_to_auto_replay(&self) -> bool {
-        !self.saw_visible_output && !self.saw_tool_or_side_effect && !self.persisted_assistant_output
+        !self.saw_visible_output
+            && !self.saw_tool_or_side_effect
+            && !self.persisted_assistant_output
+            && !self.saw_event_gap
     }
 
     pub fn merge(&mut self, other: &TurnAttemptSummary) {
         self.saw_visible_output |= other.saw_visible_output;
         self.saw_tool_or_side_effect |= other.saw_tool_or_side_effect;
         self.persisted_assistant_output |= other.persisted_assistant_output;
+        self.saw_event_gap |= other.saw_event_gap;
         self.needs_auth |= other.needs_auth;
         if other.terminal_error.is_some() {
             self.terminal_error = other.terminal_error.clone();
@@ -775,6 +780,7 @@ impl StreamRelay {
                     break outcome;
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
+                    attempt.saw_event_gap = true;
                     warn!(lagged = n, "Stream relay lagged, some events dropped");
                 }
             }
@@ -1901,6 +1907,52 @@ mod tests {
             repo.take_inserts().is_empty(),
             "no assistant error tip is persisted before replay"
         );
+    }
+
+    #[tokio::test]
+    async fn lost_events_prevent_clean_error_deferral_and_automatic_replay() {
+        use aionui_ai_agent::protocol::events::{TextEventData, TipType, TipsEventData};
+
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let (tx, rx) = broadcast::channel(2);
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "msg-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo,
+            bus,
+        )
+        .with_turn_completion(false)
+        .with_defer_clean_terminal_errors(true);
+
+        tx.send(AgentStreamEvent::Text(TextEventData {
+            content: "output that will be lost from the broadcast buffer".into(),
+        }))
+        .unwrap();
+        for _ in 0..4 {
+            tx.send(AgentStreamEvent::Tips(TipsEventData {
+                content: String::new(),
+                tip_type: TipType::Info,
+                code: None,
+                params: None,
+                supersedes_key: None,
+            }))
+            .unwrap();
+        }
+        tx.send(AgentStreamEvent::Error(ErrorEventData {
+            retryable: Some(true),
+            ..ErrorEventData::legacy("temporary failure", None)
+        }))
+        .unwrap();
+        drop(tx);
+
+        let outcome = relay.consume(rx).await;
+        assert!(outcome.attempt.saw_event_gap);
+        assert!(!outcome.attempt.saw_visible_output);
+        assert!(!outcome.attempt.terminal_error_deferred);
+        assert!(!outcome.attempt.safe_to_auto_replay());
     }
 
     #[tokio::test]

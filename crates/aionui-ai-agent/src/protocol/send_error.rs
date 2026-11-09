@@ -669,6 +669,19 @@ fn classify_agent_lifecycle(lower: &str) -> Option<ClassifiedError> {
 }
 
 fn classify_provider_text(lower: &str) -> Option<ClassifiedError> {
+    // Observed in Claude Code's actual 2026-11-08 session-limit response.
+    // A subscription window cannot recover through immediate process retries.
+    if lower.contains("you've hit your session limit") {
+        return Some(ClassifiedError {
+            message: "The Claude Code subscription session limit has been reached",
+            code: AgentErrorCode::UserLlmProviderRateLimited,
+            ownership: AgentErrorOwnership::UserLlmProvider,
+            retryable: false,
+            feedback_recommended: false,
+            resolution_kind: None,
+            resolution_target: None,
+        });
+    }
     if contains_sso_expired_auth_signature(lower) {
         return Some(provider_error(
             "The model provider rejected the request",
@@ -1847,6 +1860,23 @@ mod tests {
             AgentErrorOwnership::UserLlmProvider,
             AgentErrorResolutionKind::Retry,
         );
+    }
+
+    #[test]
+    fn subscription_session_limit_preserves_reset_detail_without_immediate_retry() {
+        let detail = "You've hit your session limit · resets 11am (America/New_York)";
+        let err = AgentSendError::from_agent_error(AgentError::bad_gateway(detail));
+        assert_eq!(err.code(), Some(AgentErrorCode::UserLlmProviderRateLimited));
+        assert_eq!(err.stream_error().retryable, Some(false));
+        assert_eq!(err.stream_error().detail.as_deref(), Some(detail));
+        assert_eq!(err.stream_error().resolution, None);
+    }
+
+    #[test]
+    fn transient_rate_limit_remains_retryable() {
+        let err = AgentSendError::from_agent_error(AgentError::bad_gateway("Rate limited, retry after 5000ms"));
+        assert_eq!(err.code(), Some(AgentErrorCode::UserLlmProviderRateLimited));
+        assert_eq!(err.stream_error().retryable, Some(true));
     }
 
     #[test]
