@@ -317,3 +317,34 @@ Focused correction checks on 2026-11-09: the affected `aionui-session` and
 1,679 tests with 15 existing ignored tests. All-target Clippy with `-D warnings`,
 format and whitespace checks passed. No account-1 CLI was executed. The full
 pre-push gate and repeated live Team result are recorded separately.
+
+
+## Native HTTP tool-schema correction after host acceptance
+
+The account-2 host guard's exact-port exclusion passed a zero-model official CLI
+control gate: selected-port initialize/tools/list succeeded; a redirect to a
+different loopback port retained broker HTTP 403 with zero target requests
+(verified: task capture `native-mcp-control-exact-port.log`, 2026-11-09). Formal
+installed-entry checks passed 21/21, including original residential TLS and a
+real subscribed call. The subsequent Team run initialized/listed native MCP but
+completed its lead turn with tool searches only, without automatic dispatch;
+that run is not passing Team acceptance.
+
+Source trace located a separate HTTP wire mismatch: the shared TCP dispatcher
+returns internal `TeamToolDescriptor` fields, including `input_schema`, while
+the official MCP 2025-06-18 `Tool` schema requires `inputSchema` (verified:
+`https://github.com/modelcontextprotocol/specification/blob/main/schema/2025-06-18/schema.ts`,
+Tool interface; `src/mcp/server.rs`, `handle_tools_list`; API descriptor in
+`aionui-api-types/src/team_tools.rs`). The existing TCP adapter contract must
+remain unchanged. Project descriptors at the native HTTP boundary using the
+existing MCP JSON projection, exposing only name, description and inputSchema.
+Keep caller-role filtering, bearer checks and execution authorization intact.
+
+The new real-socket regression failed on the original seven-field internal
+wire object, then passed after the projection. It checks every lead/worker tool,
+required message arguments and lead-only visibility. All 773 Team tests passed
+with six existing ignored cases. Existing native initialization/list diagnostics
+are sufficient for success; add a payload-free error only for an impossible
+internal descriptor contract failure. No proxy/guard change or service restart
+is needed for this correction. Full gate/push and renewed real Team results
+are recorded separately when complete.

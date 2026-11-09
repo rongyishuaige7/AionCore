@@ -1610,6 +1610,40 @@ async fn native_http_handshake_notifications_and_large_chunked_frames() {
 }
 
 #[tokio::test]
+async fn native_http_tools_list_uses_official_mcp_schema_without_internal_metadata() {
+    let env = setup().await;
+    for slot in ["lead-1", "worker-1"] {
+        let reply = http_rpc(
+            &env.server,
+            slot,
+            json!({"jsonrpc":"2.0","id":"native-tools","method":"tools/list"}),
+        )
+        .await;
+        assert_eq!(reply["id"], "native-tools");
+        let tools = reply["result"]["tools"].as_array().unwrap();
+        assert!(!tools.is_empty());
+        for tool in tools {
+            let object = tool.as_object().unwrap();
+            assert_eq!(object.len(), 3);
+            assert!(tool["name"].is_string());
+            assert!(tool["description"].is_string());
+            assert_eq!(tool["inputSchema"]["type"], "object", "MCP requires inputSchema");
+            assert!(!object.contains_key("input_schema"));
+            assert!(!object.contains_key("cli_command"));
+            assert!(!object.contains_key("permission"));
+        }
+        let send = tools.iter().find(|tool| tool["name"] == "team_send_message").unwrap();
+        assert_eq!(send["inputSchema"]["required"], json!(["to", "message"]));
+        assert!(send["inputSchema"]["properties"]["to"].is_object());
+        assert!(send["inputSchema"]["properties"]["message"].is_object());
+        assert_eq!(
+            tools.iter().any(|tool| tool["name"] == "team_spawn_agent"),
+            slot == "lead-1"
+        );
+    }
+}
+
+#[tokio::test]
 async fn native_http_slot_tokens_cannot_impersonate_lead_or_use_shared_tcp_auth() {
     let env = setup().await;
     let lead = env.server.native_http_config("lead-1");

@@ -402,7 +402,7 @@ async fn handle_tools_list(
     JsonRpcResponse::success(id, json!({ "tools": tools }))
 }
 
-fn tool_descriptors_to_mcp_json(tools: &[super::tools::ToolDescriptor]) -> Vec<Value> {
+pub(super) fn tool_descriptors_to_mcp_json(tools: &[super::tools::ToolDescriptor]) -> Vec<Value> {
     tools
         .iter()
         .map(|d| {

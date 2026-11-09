@@ -17,7 +17,7 @@ use crate::prompt_dump::TeamPromptDumpConfig;
 use crate::scheduler::TeammateManager;
 use crate::service::TeamSessionService;
 
-use super::protocol::{INVALID_PARAMS, INVALID_REQUEST, JsonRpcRequest, SERVER_NAME, SERVER_VERSION};
+use super::protocol::{INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST, JsonRpcRequest, SERVER_NAME, SERVER_VERSION};
 
 const HTTP_PROTOCOL_VERSION: &str = "2025-06-18";
 
@@ -186,7 +186,7 @@ async fn rpc(State(state): State<HttpState>, headers: HeaderMap, body: Bytes) ->
         method: method.into(),
         params: value.get("params").cloned(),
     };
-    let response = super::server::handle_method(
+    let mut response = super::server::handle_method(
         &request,
         &state.scheduler,
         &state.service,
@@ -195,6 +195,21 @@ async fn rpc(State(state): State<HttpState>, headers: HeaderMap, body: Bytes) ->
         &state.prompt_dump,
     )
     .await;
+    if method == "tools/list" && response.error.is_none() {
+        // The legacy TCP transport exposes internal descriptors to its own
+        // adapter. Native MCP clients require the official Tool wire shape.
+        let tools = response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("tools"))
+            .cloned()
+            .and_then(|tools| serde_json::from_value::<Vec<super::tools::ToolDescriptor>>(tools).ok());
+        let Some(tools) = tools else {
+            tracing::error!(team_id = %state.team_id, slot_id = slot, "native Team MCP tool descriptor contract failed");
+            return error(StatusCode::OK, id, INTERNAL_ERROR, "Tool schema unavailable");
+        };
+        response.result = Some(json!({"tools": super::server::tool_descriptors_to_mcp_json(&tools)}));
+    }
     let mut response = serde_json::to_value(response).expect("JSON-RPC response serializable");
     response["id"] = id;
     if method == "tools/list" {
