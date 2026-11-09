@@ -215,7 +215,7 @@ pub use team::{
     TeamSlotBlockedReason, TeamSlotWorkChangedPayload, TeamSlotWorkPayload, TeamSlotWorkState, TeamTaskChange,
     TeamTaskChangedPayload, TeamTaskResponse, TeammateMessagePayload, assistant_mcp_binding_fingerprint,
 };
-pub use team_mcp::{TEAM_MCP_SERVER_NAME, TeamMcpStdioConfig};
+pub use team_mcp::{TEAM_MCP_SERVER_NAME, TeamMcpHttpConfig, TeamMcpStdioConfig};
 pub use team_tools::{
     TEAM_DESCRIBE_ASSISTANT_DESCRIPTION, TEAM_LIST_ASSISTANTS_DESCRIPTION, TEAM_SPAWN_AGENT_DESCRIPTION,
     TEAM_TOOLS_SCHEMA_VERSION, TeamToolCall, TeamToolCliEnvelope, TeamToolCliMeta, TeamToolContextResponse,

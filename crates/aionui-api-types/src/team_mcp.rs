@@ -28,6 +28,25 @@ pub struct TeamMcpStdioConfig {
     pub token: String,
     pub slot_id: String,
     pub binary_path: String,
+    /// Native HTTP credentials bound to this slot; absent in legacy snapshots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_http: Option<TeamMcpHttpConfig>,
+}
+
+/// Slot-scoped native MCP HTTP connection, separate from the legacy TCP token.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamMcpHttpConfig {
+    pub port: u16,
+    pub token: String,
+}
+
+impl std::fmt::Debug for TeamMcpHttpConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TeamMcpHttpConfig")
+            .field("port", &self.port)
+            .field("token", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl TeamMcpStdioConfig {
@@ -44,8 +63,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn native_http_is_optional_for_legacy_snapshots_and_redacted_in_debug() {
+        let legacy = serde_json::json!({"team_id":"fixture","port":12345,"token":"legacy-fixture",
+            "slot_id":"slot-1","binary_path":"/fixture/backend"});
+        let mut parsed: TeamMcpStdioConfig = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(parsed.native_http.is_none());
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), legacy);
+        parsed.native_http = Some(TeamMcpHttpConfig {
+            port: 55001,
+            token: "native-fixture-only".into(),
+        });
+        assert!(!format!("{parsed:?}").contains("native-fixture-only"));
+        let roundtrip: TeamMcpStdioConfig = serde_json::from_value(serde_json::to_value(&parsed).unwrap()).unwrap();
+        assert_eq!(roundtrip, parsed);
+    }
+
+    #[test]
     fn json_roundtrip_preserves_all_fields() {
         let cfg = TeamMcpStdioConfig {
+            native_http: None,
             team_id: "team-42".into(),
             port: 54321,
             token: "tok-abc".into(),

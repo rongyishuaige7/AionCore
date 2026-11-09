@@ -190,3 +190,99 @@ inspection in this stage was account 2's `--help`; no model turn was sent.
 The AionCore full pre-push gate is required after the focused commit and its
 result is reported with the pushed SHA. These source and fixture results do
 not make the guard adapter active in production or restore native Team MCP.
+
+## Stage 3 design: native Team MCP
+
+Replace the handwritten HTTP reader with the existing Axum/Hyper stack: bounded
+bodies, fragmented/chunked requests, JSON-RPC notifications, protocol negotiation,
+and explicit HTTP status codes. Keep the endpoint on an ephemeral IPv4 loopback
+port, reject browser origins and incorrect Host headers, and stop it with its
+team. Issue a separate random HTTP credential per slot; the shared TCP bridge
+credential must not authorize HTTP. Validate the live slot and bind its role on
+the server. Log only lifecycle IDs and method names, never auth headers or bodies.
+
+Add an optional native HTTP config to the existing internal Team launch snapshot.
+Existing stdio consumers keep their existing fields; old persisted snapshots do
+not authorize a subscription fallback. Official subscription assembly uses only
+the native Team HTTP server and refuses unreviewed stdio/remote servers. Write
+the native MCP JSON to a private, per-launch file outside workspace grants, pass
+only its path to `--mcp-config`, and retain it through the connection's wake
+recipe. No bearer token appears in argv or environment; delete the owned file
+when the owning session is dropped. Version probes keep the clean launch policy.
+
+The sandbox library adds a default-off, host-configured descriptor root. It
+validates exact schema, ownership, permissions, links, size and IPv4 loopback URL;
+the original validator still handles all other arguments. The profile grants
+read access to this one config, denies writes and sibling config reads, and
+allows only the exact Team loopback port. Preserve the inference route, TLS,
+proxy environment and Keychain; never add a local API inference bridge.
+
+Verify HTTP fragmentation/chunking, handshake/notifications, malformed requests,
+slot spoofing, missing/invalid/shared credentials, lead permissions and real
+task/message effects against isolated fixtures. Verify descriptor lifetime,
+permissions, clean spawn assembly, and both positive/negative Seatbelt file and
+network controls. Run affected checks and full push gates. Live Claude readiness
+requires account-2 evidence through the existing danger entry; source or fixture
+success alone is not that evidence. Host candidate activation/production changes
+remain separately reviewed, with no service restarts in this source stage.
+
+
+### Stage 3 contracts and verification boundary
+
+The MCP config/strict arguments are grounded in first-party
+`@anthropic-ai/claude-agent-sdk@0.3.319/sdk.mjs` (the argv serialization code).
+The earlier account-2 `claude-pro2-danger --help` inspection covered streaming
+flags; this stage has not executed a subscription CLI. Its `sdk.d.ts`
+`McpHttpServerConfig` declares `type: 'http'`, `url`, and `headers`. The official
+MCP schema at
+`https://github.com/modelcontextprotocol/specification/blob/main/schema/2025-06-18/schema.ts`
+is the reference for request IDs, initialization, notifications and tools.
+The same official specification
+`docs/specification/2025-06-18/basic/transports.mdx` defines POST/202/405 and
+version-header behavior. HTTP supports 2025-06-18 and 2025-03-26; an unknown initialize version receives
+2025-06-18, not the older TCP transport version. GET/DELETE are unsupported (405);
+notifications return 202 without a body. JSON-only request bodies are bounded
+at 1 MiB. Browser Origin and mismatched Host headers are rejected.
+
+Focused tests use real local HTTP sockets for split headers/body, chunked
+100 KiB input, handshake/version negotiation, string IDs, malformed/oversized
+requests and endpoint shutdown. Per-slot HTTP credentials reject shared TCP
+auth, cross-slot impersonation, absent/removed slots and duplicate headers.
+Lead/worker tool lists and permission checks reuse the existing dispatcher.
+Task creation/listing changes the fixture task board. A live TeamSessionService
+with a held execution fixture verifies lead-to-worker dispatch and worker-to-lead
+reply against persisted mailbox rows and sender/recipient IDs.
+
+Subscription assembly tests inspect the private file at spawn time, verify
+path-only argv and clean environment, reject old credentials and additional
+MCP servers before spawning, and verify file cleanup after assembly failure. Before writing any bearer file,
+the backend also rejects roots overlapping the canonical workspace; guard-side
+refusal alone would be too late to protect a token written into a project.
+A shared-spawner lifetime test keeps the file while a wake-recipe clone exists
+and removes it when the final owner drops. These are fixture checks; no real
+subscription process is executed. They do not prove live CLI MCP connectivity.
+
+The sandbox's new exact IPv4 rule uses the macOS-supported
+`(remote tcp4 "localhost:<port>")`: the literal `127.0.0.1` form failed profile
+compilation and was corrected without widening to IPv6 or other ports. Both
+access profiles verify the selected config read, sibling read/write refusal,
+exact IPv4 connection, same-port IPv6 refusal and no MCP grant by default.
+The legacy auth/metadata overlay keeps the entire MCP root closed.
+
+Full source gates and personal-fork commit IDs are reported with delivery.
+No production launcher, service, credential, route, environment or historical
+database is changed. Production guard activation needs separate host review;
+real initialized/tools/list and agent tool execution through the existing
+account-2 danger entry remain unverified. In particular, do not assume how
+the deployed official CLI handles loopback MCP with its existing proxy env,
+and do not silently change NO_PROXY or add a bridge to make a fixture pass.
+
+
+Stage 3 focused verification on 2026-11-09: `cargo test -p aionui-api-types
+-p aionui-ai-agent -p aionui-team --features aionui-ai-agent/test-support
+--locked` passed 2,396 tests with 18 existing ignored tests. All-target affected
+Clippy with `--locked -- -D warnings`, format and whitespace checks passed.
+The launch/MCP fixtures share one test to avoid competing for the same global
+version-cache key; the cold-probe assertions remain intact. HTTP shutdown
+verification waits through a racing TCP reset until connections are refused.
+No real subscription process was launched during these checks.

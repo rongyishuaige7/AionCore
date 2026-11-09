@@ -10,6 +10,7 @@
 //! `AgentStreamEvent` on the channel `subscribe()` hands out. Commands lower to
 //! `SessionBackend::dispatch`.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
@@ -1551,6 +1552,8 @@ pub struct SessionBuildInputs<'a> {
     /// `SessionConfig.spawn_env` so team/helper tooling inside the agent process
     /// keeps working. Empty ⇒ nothing injected.
     pub runtime_env: &'a [(String, String)],
+    /// Host-reviewed private native MCP launch root for subscription sessions.
+    pub subscription_mcp_root: Option<PathBuf>,
     /// Broadcaster forwarded to the MCP resolver for runtime-resolution reporting
     /// parity with the legacy ACP path.
     pub broadcaster: Arc<dyn EventBroadcaster>,
@@ -1768,6 +1771,7 @@ pub async fn build_antigravity_instance(
         backend_session_id,
         mcp_server_repo,
         runtime_env,
+        subscription_mcp_root: _,
         broadcaster,
         catalog_writeback,
         acp_session_repo,
@@ -1884,16 +1888,6 @@ pub async fn build_session_instance(
     } else {
         None
     };
-    let spawner = match &subscription {
-        Some(launch) => launch.scope(spawner),
-        None => spawner,
-    };
-    let probe_spawner = subscription.as_ref().map(|_| Arc::clone(&spawner));
-    let connection: Box<dyn BackendConnection> = match backend_label {
-        "claude" => Box::new(ClaudeConnection::new(spawner)),
-        "codex" => Box::new(CodexConnection::new(spawner)),
-        _ => return Ok(None),
-    };
 
     let SessionBuildInputs {
         conversation_id,
@@ -1906,6 +1900,7 @@ pub async fn build_session_instance(
         backend_session_id,
         mcp_server_repo,
         runtime_env,
+        subscription_mcp_root,
         broadcaster,
         catalog_writeback,
         acp_session_repo,
@@ -1953,6 +1948,44 @@ pub async fn build_session_instance(
         coordination.append(&mut mcp_servers);
         mcp_servers = coordination;
     }
+
+    let native_mcp = if subscription.is_some() {
+        if !neutral.is_empty() {
+            return Err(AgentError::bad_request(
+                "Subscription MCP accepts only the reviewed native Team server",
+            ));
+        }
+        if let Some(cfg) = config.team_mcp_stdio_config.as_ref() {
+            let root = subscription_mcp_root
+                .as_ref()
+                .ok_or_else(|| AgentError::bad_request("Native MCP launch root is not configured"))?;
+            Some(crate::factory::claude_mcp::NativeMcpFile::create(
+                root,
+                cfg,
+                std::path::Path::new(&workspace),
+            )?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let native_mcp_path = native_mcp
+        .as_ref()
+        .map(|file| file.path().to_string_lossy().into_owned());
+    if subscription.is_some() {
+        mcp_servers.clear();
+    }
+    let spawner = match &subscription {
+        Some(launch) => launch.scope_with_mcp(spawner, native_mcp),
+        None => spawner,
+    };
+    let probe_spawner = subscription.as_ref().map(|_| Arc::clone(&spawner));
+    let connection: Box<dyn BackendConnection> = match backend_label {
+        "claude" => Box::new(ClaudeConnection::new(spawner)),
+        "codex" => Box::new(CodexConnection::new(spawner)),
+        _ => return Ok(None),
+    };
 
     // GAP #4 — preset_context + skills carried into the init surface.
     let init = SessionInit {
@@ -2021,6 +2054,12 @@ pub async fn build_session_instance(
     // process's own spend. codex reports no cost; other backends ignore it.
     if backend_label == "claude" {
         session_config.initial_cost_usd = initial_cost_usd_from_snapshot(session_snapshot);
+    }
+
+    if let Some(path) = native_mcp_path {
+        session_config
+            .extra_args
+            .extend(["--mcp-config".to_owned(), path, "--strict-mcp-config".to_owned()]);
     }
 
     if backend_label == "claude"
@@ -4902,6 +4941,7 @@ mod build_mapping_tests {
     #[derive(Default)]
     struct FixtureVersionSpawner {
         commands: std::sync::Mutex<Vec<aionui_common::CommandSpec>>,
+        native_configs: std::sync::Mutex<Vec<(PathBuf, serde_json::Value)>>,
     }
 
     #[cfg(unix)]
@@ -4914,6 +4954,12 @@ mod build_mapping_tests {
             _owner: &str,
         ) -> Result<Arc<aionui_process::ManagedProcess>, aionui_process::ProcessError> {
             let version = spec.args == ["--version"];
+            if let Some(at) = spec.args.iter().position(|arg| arg == "--mcp-config") {
+                let path = PathBuf::from(&spec.args[at + 1]);
+                let config = serde_json::from_slice(&std::fs::read(&path).expect("private MCP config exists at spawn"))
+                    .expect("native MCP config is JSON");
+                self.native_configs.lock().unwrap().push((path, config));
+            }
             self.commands.lock().unwrap().push(spec);
             assert!(extra_env.is_empty());
             if version {
@@ -4990,6 +5036,7 @@ mod build_mapping_tests {
                         backend_session_id: (mode == "resume").then(|| parent_id.to_owned()),
                         mcp_server_repo: None,
                         runtime_env: &[("AIONUI_RUNTIME_TOKEN".into(), "fixture-only".into())],
+                        subscription_mcp_root: None,
                         broadcaster: Arc::new(aionui_realtime::BroadcastEventBus::new(16)),
                         catalog_writeback: None,
                         acp_session_repo: None,
@@ -5031,6 +5078,131 @@ mod build_mapping_tests {
                 } else {
                     assert!(session.args.windows(2).any(|pair| pair == ["--resume", parent_id]));
                     assert_eq!(session.args.contains(&"--fork-session".into()), mode == "fork");
+                }
+            }
+        }
+        subscription_native_mcp_is_private_path_only_and_never_falls_back_to_stdio().await;
+    }
+
+    // Shares the version-cache keys with the launch fixture above. Run in the
+    // same test after its cold-probe assertions, not concurrently against them.
+    #[cfg(unix)]
+    async fn subscription_native_mcp_is_private_path_only_and_never_falls_back_to_stdio() {
+        use aionui_api_types::{TeamMcpHttpConfig, TeamMcpStdioConfig};
+        let workspace = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let root = data.path().join("native-mcp");
+        for account in ["claude-pro-danger", "claude-pro2-danger"] {
+            for scenario in ["fresh", "resume", "legacy", "extra", "missing-root"] {
+                let mut metadata = test_metadata(Some("claude"), None);
+                metadata.command = Some(
+                    dirs::home_dir()
+                        .unwrap()
+                        .join(".local/bin")
+                        .join(account)
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+                let config = AcpBuildExtra {
+                    backend: Some("claude".into()),
+                    team_mcp_stdio_config: Some(TeamMcpStdioConfig {
+                        team_id: "team-fixture".into(),
+                        port: 55000,
+                        token: "legacy-fixture-must-not-be-used".into(),
+                        binary_path: "/unreviewed/stdio-bridge".into(),
+                        slot_id: "lead-1".into(),
+                        native_http: (scenario != "legacy").then(|| TeamMcpHttpConfig {
+                            port: 55001,
+                            token: "native-fixture-".repeat(5),
+                        }),
+                    }),
+                    session_mcp_servers: if scenario == "extra" {
+                        vec![aionui_api_types::SessionMcpServer {
+                            id: "extra".into(),
+                            name: "extra-server".into(),
+                            transport: aionui_api_types::SessionMcpTransport::Stdio {
+                                command: "/unreviewed/mcp".into(),
+                                args: vec![],
+                                env: Default::default(),
+                            },
+                        }]
+                    } else {
+                        vec![]
+                    },
+                    ..Default::default()
+                };
+                let spawner = Arc::new(FixtureVersionSpawner::default());
+                let result = build_session_instance(
+                    "claude",
+                    SessionBuildInputs {
+                        conversation_id: "11111111-1111-4111-8111-111111111111".into(),
+                        user_id: "fixture-user".into(),
+                        workspace: workspace.path().to_string_lossy().into_owned(),
+                        config: &config,
+                        metadata: &metadata,
+                        skill_delivery: Default::default(),
+                        session_snapshot: None,
+                        backend_session_id: (scenario == "resume")
+                            .then(|| "22222222-2222-4222-8222-222222222222".into()),
+                        mcp_server_repo: None,
+                        runtime_env: &[],
+                        subscription_mcp_root: (scenario != "missing-root").then(|| root.clone()),
+                        broadcaster: Arc::new(aionui_realtime::BroadcastEventBus::new(16)),
+                        catalog_writeback: None,
+                        acp_session_repo: None,
+                        prompt_dump_dir: None,
+                        permission_hook_body: None,
+                    },
+                    spawner.clone(),
+                )
+                .await;
+                let records = spawner.commands.lock().unwrap();
+                let configs = spawner.native_configs.lock().unwrap();
+                match scenario {
+                    "legacy" | "extra" | "missing-root" => {
+                        let expected = match scenario {
+                            "legacy" => "fresh native HTTP",
+                            "extra" => "only the reviewed native",
+                            _ => "root is not configured",
+                        };
+                        assert!(
+                            matches!(result, Err(AgentError::BadRequest(ref message)) if message.contains(expected))
+                        );
+                        assert!(records.is_empty());
+                        assert!(configs.is_empty());
+                    }
+                    _ => {
+                        assert!(
+                            matches!(result, Err(AgentError::BadGateway(ref message)) if message.contains("fixture stops"))
+                        );
+                        assert_eq!(configs.len(), 1);
+                        let (file, value) = &configs[0];
+                        assert_eq!(value["mcpServers"].as_object().unwrap().len(), 1);
+                        let server = &value["mcpServers"]["aionui-team"];
+                        assert_eq!(server["type"], "http");
+                        assert_eq!(server["url"], "http://127.0.0.1:55001/mcp");
+                        assert_eq!(server["headers"]["X-Slot-Id"], "lead-1");
+                        assert!(server.get("command").is_none());
+                        let session = records.last().unwrap();
+                        assert!(session.clear_env);
+                        assert_eq!(
+                            session.env.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+                            ["HOME", "PATH", "TERM"]
+                        );
+                        assert!(
+                            session
+                                .args
+                                .windows(2)
+                                .any(|pair| pair[0] == "--mcp-config" && std::path::Path::new(&pair[1]) == file)
+                        );
+                        assert!(session.args.iter().any(|arg| arg == "--strict-mcp-config"));
+                        assert!(!session.args.iter().any(|arg| arg.contains("fixture-must-not")
+                            || arg.contains("native-fixture-")
+                            || arg.contains("stdio-bridge")));
+                        // Assembly failed after spawn: its launch-scoped owner is gone.
+                        assert!(!file.exists());
+                        assert!(!file.parent().unwrap().exists());
+                    }
                 }
             }
         }
@@ -5166,6 +5338,7 @@ mod build_mapping_tests {
                 },
             ],
             team_mcp_stdio_config: Some(TeamMcpStdioConfig {
+                native_http: None,
                 team_id: "team-1".into(),
                 port: 9000,
                 token: "tok".into(),
@@ -5202,6 +5375,7 @@ mod build_mapping_tests {
                 backend_session_id: None,
                 mcp_server_repo: Some(&repo),
                 runtime_env: &[],
+                subscription_mcp_root: None,
                 broadcaster,
                 catalog_writeback: None,
                 acp_session_repo: None,

@@ -67,6 +67,7 @@ fn make_agents() -> Vec<TeamAgent> {
 
 struct TestEnv {
     server: TeamMcpServer,
+    scheduler: Arc<TeammateManager>,
     _repo: Arc<MockTeamRepo>,
 }
 
@@ -96,7 +97,7 @@ async fn setup_with_prompt_dump(prompt_dump: Option<TeamPromptDumpConfig>) -> Te
     // flows directly and do not hit this path.
     let server = TeamMcpServer::start_with_prompt_dump(
         "test-token-123".into(),
-        scheduler,
+        scheduler.clone(),
         "team-1".into(),
         broadcaster,
         std::sync::Weak::new(),
@@ -105,7 +106,11 @@ async fn setup_with_prompt_dump(prompt_dump: Option<TeamPromptDumpConfig>) -> Te
     .await
     .unwrap();
 
-    TestEnv { server, _repo: repo }
+    TestEnv {
+        server,
+        scheduler,
+        _repo: repo,
+    }
 }
 
 async fn connect_and_init(port: u16, token: &str, slot_id: &str) -> TcpStream {
@@ -140,8 +145,9 @@ async fn read_response(stream: &mut TcpStream) -> Value {
     serde_json::from_slice(&frame).unwrap()
 }
 
-async fn http_rpc(port: u16, slot_id: &str, payload: Value) -> Value {
-    http_rpc_with_auth(port, slot_id, Some("test-token-123"), payload).await
+async fn http_rpc(server: &TeamMcpServer, slot_id: &str, payload: Value) -> Value {
+    let config = server.native_http_config(slot_id);
+    http_rpc_with_auth(config.port, slot_id, Some(&config.token), payload).await
 }
 
 async fn http_rpc_with_auth(port: u16, slot_id: &str, token: Option<&str>, payload: Value) -> Value {
@@ -152,7 +158,7 @@ async fn http_rpc_with_auth(port: u16, slot_id: &str, token: Option<&str>, paylo
         .map(|token| format!("Authorization: Bearer {token}\r\n"))
         .unwrap_or_default();
     let request = format!(
-        "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\n{auth_header}x-slot-id: {slot_id}\r\nContent-Length: {}\r\n\r\n{body}",
+        "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nConnection: close\r\n{auth_header}x-slot-id: {slot_id}\r\nContent-Length: {}\r\n\r\n{body}",
         body.len()
     );
     let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).await.unwrap();
@@ -1084,7 +1090,7 @@ async fn http_mcp_tools_list_filters_lead_only_tools() {
     let env = setup().await;
 
     let resp = http_rpc(
-        env.server.http_port(),
+        &env.server,
         "worker-1",
         json!({"jsonrpc": "2.0", "id": 10, "method": "tools/list"}),
     )
@@ -1109,7 +1115,7 @@ async fn http_mcp_non_lead_cannot_rename_agent() {
     let env = setup().await;
 
     let resp = http_rpc(
-        env.server.http_port(),
+        &env.server,
         "worker-1",
         json!({
             "jsonrpc": "2.0",
@@ -1500,4 +1506,312 @@ async fn tsr3_send_message_without_sentinel_rejects_without_live_team_run_servic
     drop(state);
 
     env.server.stop();
+}
+
+// Native HTTP transport uses actual sockets; no agent CLI or account is run.
+async fn native_exchange(port: u16, request: &[u8], fragment: Option<usize>) -> (u16, Vec<u8>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        if let Some(size) = fragment {
+            for piece in request.chunks(size) {
+                stream.write_all(piece).await.unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+        } else {
+            stream.write_all(request).await.unwrap();
+        }
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let at = response.windows(4).position(|p| p == b"\r\n\r\n").unwrap();
+        let headers = std::str::from_utf8(&response[..at]).unwrap();
+        let status = headers.split_whitespace().nth(1).unwrap().parse().unwrap();
+        (status, response[at + 4..].to_vec())
+    })
+    .await
+    .expect("native HTTP exchange timed out")
+}
+
+fn native_request(port: u16, slot: &str, token: &str, body: &str, extra: &str, chunked: bool) -> Vec<u8> {
+    let mut request = format!(
+        "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nConnection: close\r\nAuthorization: Bearer {token}\r\nX-Slot-Id: {slot}\r\n{extra}"
+    );
+    if chunked {
+        request.push_str("Transfer-Encoding: chunked\r\n\r\n");
+        for piece in body.as_bytes().chunks(4096) {
+            request.push_str(&format!(
+                "{:x}\r\n{}\r\n",
+                piece.len(),
+                std::str::from_utf8(piece).unwrap()
+            ));
+        }
+        request.push_str("0\r\n\r\n");
+    } else {
+        request.push_str(&format!("Content-Length: {}\r\n\r\n{body}", body.len()));
+    }
+    request.into_bytes()
+}
+
+#[tokio::test]
+async fn native_http_handshake_notifications_and_large_chunked_frames() {
+    let env = setup().await;
+    let config = env.server.native_http_config("lead-1");
+    let init = json!({"jsonrpc":"2.0","id":"initialize-1","method":"initialize","params":{
+        "protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"fixture","version":"1"}
+    }})
+    .to_string();
+    // Split both the HTTP headers and JSON body across separate writes.
+    let (status, body) = native_exchange(
+        config.port,
+        &native_request(config.port, "lead-1", &config.token, &init, "", false),
+        Some(41),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let reply: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(reply["id"], "initialize-1");
+    assert_eq!(reply["result"]["protocolVersion"], "2025-06-18");
+    assert_eq!(reply["result"]["capabilities"]["tools"], json!({}));
+    let notification = json!({"jsonrpc":"2.0","method":"notifications/initialized"}).to_string();
+    let (status, body) = native_exchange(
+        config.port,
+        &native_request(
+            config.port,
+            "lead-1",
+            &config.token,
+            &notification,
+            "MCP-Protocol-Version: 2025-06-18\r\n",
+            false,
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(status, 202);
+    assert!(body.is_empty());
+    let large = json!({"jsonrpc":"2.0","id":"large-tools","method":"tools/list","params":{"_meta":{"fixture":"x".repeat(100_000)}}}).to_string();
+    let (status, body) = native_exchange(
+        config.port,
+        &native_request(config.port, "lead-1", &config.token, &large, "", true),
+        Some(8000),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let reply: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(reply["id"], "large-tools");
+    let tools = reply["result"]["tools"].as_array().unwrap();
+    for name in [
+        "team_members",
+        "team_send_message",
+        "team_task_create",
+        "team_spawn_agent",
+    ] {
+        assert!(tools.iter().any(|tool| tool["name"] == name), "missing {name}");
+    }
+}
+
+#[tokio::test]
+async fn native_http_slot_tokens_cannot_impersonate_lead_or_use_shared_tcp_auth() {
+    let env = setup().await;
+    let lead = env.server.native_http_config("lead-1");
+    let worker = env.server.native_http_config("worker-1");
+    assert_ne!(lead.token, worker.token);
+    assert_eq!(worker, env.server.native_http_config("worker-1"));
+    let payload = json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}).to_string();
+    for (slot, token) in [
+        ("lead-1", worker.token.as_str()),
+        ("worker-1", env.server.auth_token()),
+        ("worker-1", "wrong-token"),
+    ] {
+        let (status, body) = native_exchange(
+            lead.port,
+            &native_request(lead.port, slot, token, &payload, "", false),
+            None,
+        )
+        .await;
+        assert_eq!(status, 401);
+        let reply: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(reply["error"]["message"], "Authentication failed");
+        assert!(!body.windows(token.len()).any(|piece| piece == token.as_bytes()));
+    }
+    let unknown = env.server.native_http_config("ghost");
+    let (status, _) = native_exchange(
+        lead.port,
+        &native_request(lead.port, "ghost", &unknown.token, &payload, "", false),
+        None,
+    )
+    .await;
+    assert_eq!(status, 401);
+    env.scheduler.remove_agent("worker-1").await.unwrap();
+    let (status, _) = native_exchange(
+        lead.port,
+        &native_request(lead.port, "worker-1", &worker.token, &payload, "", false),
+        None,
+    )
+    .await;
+    assert_eq!(status, 401);
+}
+
+#[tokio::test]
+async fn native_http_rejects_browser_hosts_duplicate_auth_and_invalid_frames() {
+    let env = setup().await;
+    let config = env.server.native_http_config("lead-1");
+    let payload = json!({"jsonrpc":"2.0","id":1,"method":"ping"}).to_string();
+    for (extra, expected) in [
+        ("Origin: http://localhost\r\n", 403),
+        ("Authorization: Bearer another\r\n", 401),
+        ("X-Slot-Id: worker-1\r\n", 401),
+        ("MCP-Protocol-Version: unimplemented\r\n", 400),
+    ] {
+        let (status, _) = native_exchange(
+            config.port,
+            &native_request(config.port, "lead-1", &config.token, &payload, extra, false),
+            None,
+        )
+        .await;
+        assert_eq!(status, expected);
+    }
+    let request = String::from_utf8(native_request(
+        config.port,
+        "lead-1",
+        &config.token,
+        &payload,
+        "",
+        false,
+    ))
+    .unwrap();
+    let bad_host = request.replace(&format!("Host: 127.0.0.1:{}", config.port), "Host: attacker.invalid");
+    assert_eq!(native_exchange(config.port, bad_host.as_bytes(), None).await.0, 403);
+    let bad_content_type = request.replace("Content-Type: application/json", "Content-Type: text/plain");
+    assert_eq!(
+        native_exchange(config.port, bad_content_type.as_bytes(), None).await.0,
+        415
+    );
+    for (payload, code) in [
+        ("{", -32700),
+        (r#"{"jsonrpc":"1.0","id":1,"method":"ping"}"#, -32600),
+        ("[]", -32600),
+    ] {
+        let (status, body) = native_exchange(
+            config.port,
+            &native_request(config.port, "lead-1", &config.token, payload, "", false),
+            None,
+        )
+        .await;
+        assert_eq!(status, 400);
+        let reply: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(reply["error"]["code"], code);
+    }
+
+    for (payload, code) in [
+        (json!({"jsonrpc":"2.0","id":null,"method":"ping"}), -32600),
+        (json!({"jsonrpc":"2.0","id":{},"method":"ping"}), -32600),
+        (json!({"jsonrpc":"2.0","id":1,"method":"ping","params":[]}), -32602),
+    ] {
+        let (status, body) = native_exchange(
+            config.port,
+            &native_request(config.port, "lead-1", &config.token, &payload.to_string(), "", false),
+            None,
+        )
+        .await;
+        assert_eq!(status, 400);
+        let reply: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(reply["error"]["code"], code);
+    }
+    let oversized = " ".repeat(1024 * 1024 + 1);
+    assert_eq!(
+        native_exchange(
+            config.port,
+            &native_request(config.port, "lead-1", &config.token, &oversized, "", false),
+            None
+        )
+        .await
+        .0,
+        413
+    );
+    for method in ["GET", "DELETE"] {
+        let request = format!(
+            "{method} /mcp HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+            config.port
+        );
+        assert_eq!(native_exchange(config.port, request.as_bytes(), None).await.0, 405);
+    }
+}
+
+#[tokio::test]
+async fn native_http_tool_calls_change_the_real_task_board_with_caller_identity() {
+    let env = setup().await;
+    let created = http_rpc(
+        &env.server,
+        "lead-1",
+        json!({"jsonrpc":"2.0","id":"create","method":"tools/call","params":{
+            "name":"team_task_create","arguments":{"subject":"Review native MCP","owner":"worker-1"}
+        }}),
+    )
+    .await;
+    assert!(!is_error_response(&created), "{created}");
+    let tasks = env.scheduler.list_tasks().await.unwrap();
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].subject, "Review native MCP");
+    let listed = http_rpc(
+        &env.server,
+        "worker-1",
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+            "name":"team_task_list","arguments":{}
+        }}),
+    )
+    .await;
+    assert!(extract_text(&listed).contains("Review native MCP"));
+    let renamed = http_rpc(
+        &env.server,
+        "lead-1",
+        json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
+            "name":"team_rename_agent","arguments":{"slot_id":"worker-1","new_name":"Reviewer"}
+        }}),
+    )
+    .await;
+    assert!(!is_error_response(&renamed), "{renamed}");
+    assert_eq!(env.scheduler.get_agent("worker-1").await.unwrap().name, "Reviewer");
+}
+
+#[tokio::test]
+async fn native_http_negotiates_supported_versions_and_stops_with_team() {
+    let env = setup().await;
+    for (requested, expected) in [
+        ("2025-06-18", "2025-06-18"),
+        ("2025-03-26", "2025-03-26"),
+        ("unimplemented", "2025-06-18"),
+    ] {
+        let response = http_rpc(
+            &env.server,
+            "lead-1",
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":requested}}),
+        )
+        .await;
+        assert_eq!(response["result"]["protocolVersion"], expected);
+    }
+    let missing = http_rpc(
+        &env.server,
+        "lead-1",
+        json!({"jsonrpc":"2.0","id":2,"method":"initialize","params":{}}),
+    )
+    .await;
+    assert_eq!(missing["error"]["code"], -32602);
+    let port = env.server.http_port();
+    env.server.stop();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            match TcpStream::connect(("127.0.0.1", port)).await {
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => break,
+                // A connect racing listener shutdown can be reset first. Keep
+                // waiting; only a refused connection proves the listener closed.
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!("unexpected listener error: {error}"),
+                Ok(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+            }
+        }
+    })
+    .await
+    .expect("HTTP listener stops with team");
 }

@@ -1888,6 +1888,7 @@ mod tests {
     fn resolve_mcp_servers_team_takes_priority() {
         let overrides = AionrsBuildExtra {
             team_mcp_stdio_config: Some(TeamMcpStdioConfig {
+                native_http: None,
                 team_id: "team-42".into(),
                 port: 9000,
                 token: "tok".into(),
@@ -1956,6 +1957,7 @@ mod tests {
         ];
         let mut extra_mcp_servers = resolve_mcp_servers(&AionrsBuildExtra {
             team_mcp_stdio_config: Some(TeamMcpStdioConfig {
+                native_http: None,
                 team_id: "team-42".into(),
                 port: 9000,
                 token: "tok".into(),
@@ -2008,6 +2010,7 @@ mod tests {
         };
         let overrides = AionrsBuildExtra {
             team_mcp_stdio_config: Some(TeamMcpStdioConfig {
+                native_http: None,
                 team_id: "team-42".into(),
                 port: 9000,
                 token: "tok".into(),

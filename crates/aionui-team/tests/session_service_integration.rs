@@ -298,6 +298,7 @@ impl AgentTurnExecutionPort for NoopTurnPort {
 #[derive(Default)]
 struct RecordingTurnPort {
     requests: Mutex<Vec<AgentTurnRequest>>,
+    hold: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 #[async_trait::async_trait]
@@ -314,6 +315,9 @@ impl AgentTurnExecutionPort for RecordingTurnPort {
             .await;
         }
         self.requests.lock().unwrap().push(request.clone());
+        if let Some(hold) = &self.hold {
+            hold.acquire().await.expect("fixture gate open").forget();
+        }
         Ok(AgentTurnOutcome {
             conversation_id: request.conversation_id,
             turn_id: "turn-recorded".into(),
@@ -2289,6 +2293,17 @@ fn setup_with_recording_turn_port() -> (
     Arc<RecordingTurnPort>,
     Arc<MockConversationRepo>,
 ) {
+    setup_with_recording_turn_port_instance(Arc::new(RecordingTurnPort::default()))
+}
+
+fn setup_with_recording_turn_port_instance(
+    turn_port: Arc<RecordingTurnPort>,
+) -> (
+    Arc<TeamSessionService>,
+    Arc<FullMockTeamRepo>,
+    Arc<RecordingTurnPort>,
+    Arc<MockConversationRepo>,
+) {
     let team_repo = Arc::new(FullMockTeamRepo::new());
     let team_repo_dyn: Arc<dyn ITeamRepository> = team_repo.clone();
     let conv_repo = Arc::new(MockConversationRepo::new());
@@ -2297,7 +2312,6 @@ fn setup_with_recording_turn_port() -> (
     let conversation_port: Arc<dyn TeamConversationProvisioningPort> = conversation_ports.clone();
     let projection_store: Arc<dyn TeamProjectionMessageStore> = conversation_ports.clone();
     let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(CountingTaskManager::new(success_factory()));
-    let turn_port = Arc::new(RecordingTurnPort::default());
     let backend_binary_path = Arc::new(std::path::PathBuf::from("/tmp/aioncore-test"));
     let provider_repo: Arc<dyn IProviderRepository> = Arc::new(EmptyProviderRepo);
     let svc = TeamSessionService::new_with_capability_port(
@@ -8743,4 +8757,100 @@ async fn activity_rejects_other_user() {
         .await
         .unwrap_err();
     assert!(matches!(err, TeamError::TeamNotFound(_)));
+}
+
+#[tokio::test]
+async fn native_http_team_message_flow_persists_both_directions_with_bound_slot_identity() {
+    let hold = Arc::new(tokio::sync::Semaphore::new(0));
+    let turn_port = Arc::new(RecordingTurnPort {
+        requests: Mutex::new(Vec::new()),
+        hold: Some(hold.clone()),
+    });
+    let (svc, _repo, turn_port, _conversations) = setup_with_recording_turn_port_instance(turn_port);
+    let team = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Native HTTP fixture".into(),
+                agents: aionrs_two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    svc.ensure_session("user1", &team.id).await.unwrap();
+    let lead = team.leader_assistant_id.as_ref().unwrap();
+    let worker = &team.assistants[1].slot_id;
+    svc.send_message("user1", &team.id, "Coordinate fixture review", None)
+        .await
+        .unwrap();
+    let wait_started = |slot: String| {
+        let turn_port = turn_port.clone();
+        async move {
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                loop {
+                    if turn_port
+                        .requests
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|request| request.slot_id == slot)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("fixture turn starts");
+        }
+    };
+    wait_started(lead.clone()).await;
+    let server = aionui_team::TeamMcpServer::start(
+        "legacy-fixture-only".into(),
+        svc.get_session_scheduler(&team.id).unwrap(),
+        team.id.clone(),
+        Arc::new(NullBroadcaster),
+        Arc::downgrade(&svc),
+    )
+    .await
+    .unwrap();
+    // A separate, isolated native endpoint uses the live service and mailbox;
+    // the execution port is a held fixture, never a real subscription process.
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .unwrap();
+    for (from, to, message) in [
+        (lead, worker, "Please review the transport"),
+        (worker, lead, "Review complete"),
+    ] {
+        let config = server.native_http_config(from);
+        let response = client
+            .post(format!("http://127.0.0.1:{}/mcp", config.port))
+            .bearer_auth(&config.token)
+            .header("X-Slot-Id", from)
+            .json(
+                &serde_json::json!({"jsonrpc":"2.0","id":"message","method":"tools/call","params":{
+                    "name":"team_send_message","arguments":{"to":to,"message":message}
+                }}),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let result: serde_json::Value = response.json().await.unwrap();
+        assert_ne!(result["result"]["isError"], true, "{result}");
+        let mailbox = svc.list_team_mailbox("user1", &team.id, 100).await.unwrap();
+        assert!(
+            mailbox
+                .iter()
+                .any(|entry| entry.from_agent_id == *from && entry.to_agent_id == *to && entry.content == message)
+        );
+        wait_started(to.clone()).await;
+    }
+    hold.add_permits(8);
+    server.stop();
+    svc.stop_session("user1", &team.id).await.unwrap();
 }

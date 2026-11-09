@@ -1461,6 +1461,7 @@ mod tests {
 
     fn test_mcp_config() -> TeamMcpStdioConfig {
         TeamMcpStdioConfig {
+            native_http: None,
             team_id: "team-1".into(),
             port: 12345,
             token: "token".into(),

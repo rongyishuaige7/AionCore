@@ -136,6 +136,7 @@ pub(super) async fn build(
                 // injects via apply_acp_launch_policy — forwarded into
                 // SessionConfig.spawn_env so direct-CLI spawns get it too.
                 runtime_env: &ctx.runtime_env,
+                subscription_mcp_root: Some(deps.data_dir.join("runtime/claude-mcp")),
                 broadcaster: deps.broadcaster.clone(),
                 // G5: keyed by the resolved catalog row so the discovered
                 // modes/models/commands refresh the `/api/agents` picker (the

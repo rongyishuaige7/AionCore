@@ -35,6 +35,7 @@ pub struct TeamMcpServer {
     http_addr: SocketAddr,
     auth_token: String,
     shutdown_tx: watch::Sender<bool>,
+    http_credentials: super::http::SlotCredentials,
 }
 
 impl TeamMcpServer {
@@ -100,18 +101,17 @@ impl TeamMcpServer {
             .local_addr()
             .map_err(|e| TeamError::InvalidRequest(format!("Failed to get HTTP addr: {e}")))?;
 
-        let http_token = auth_token.clone();
-        let http_sched = scheduler.clone();
-        let http_service = service.clone();
-        let http_team_id = team_id.clone();
-        let http_prompt_dump = prompt_dump.clone();
-        tokio::spawn(http_mcp_loop(
+        let http_credentials = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        tokio::spawn(super::http::serve(
             http_listener,
-            http_token,
-            http_sched,
-            http_service,
-            http_team_id,
-            http_prompt_dump,
+            super::http::HttpState {
+                credentials: http_credentials.clone(),
+                scheduler,
+                service,
+                team_id,
+                prompt_dump,
+                host: http_addr.to_string(),
+            },
             shutdown_rx,
         ));
 
@@ -126,6 +126,7 @@ impl TeamMcpServer {
             http_addr,
             auth_token,
             shutdown_tx,
+            http_credentials,
         })
     }
 
@@ -135,6 +136,21 @@ impl TeamMcpServer {
 
     pub fn http_port(&self) -> u16 {
         self.http_addr.port()
+    }
+
+    /// Issue an independent HTTP credential bound to one slot of this team.
+    pub fn native_http_config(&self, slot_id: &str) -> aionui_api_types::TeamMcpHttpConfig {
+        let token = self
+            .http_credentials
+            .lock()
+            .expect("MCP credentials poisoned")
+            .entry(slot_id.to_owned())
+            .or_insert_with(aionui_auth::generate_random_secret_string)
+            .clone();
+        aionui_api_types::TeamMcpHttpConfig {
+            port: self.http_port(),
+            token,
+        }
     }
 
     pub fn auth_token(&self) -> &str {
@@ -319,7 +335,7 @@ fn handle_initialize(request: &super::protocol::JsonRpcRequest, auth_token: &str
 // Method router
 // ---------------------------------------------------------------------------
 
-async fn handle_method(
+pub(super) async fn handle_method(
     request: &super::protocol::JsonRpcRequest,
     scheduler: &TeammateManager,
     service: &Weak<TeamSessionService>,
@@ -1385,182 +1401,6 @@ async fn exec_shutdown_agent(
 // ---------------------------------------------------------------------------
 // HTTP MCP endpoint (Streamable HTTP transport for MCP)
 // ---------------------------------------------------------------------------
-
-async fn http_mcp_loop(
-    listener: TcpListener,
-    auth_token: String,
-    scheduler: Arc<TeammateManager>,
-    service: Weak<TeamSessionService>,
-    team_id: String,
-    prompt_dump: TeamPromptDumpConfig,
-    mut shutdown_rx: watch::Receiver<bool>,
-) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    loop {
-        tokio::select! {
-            accept = listener.accept() => {
-                let Ok((mut stream, peer)) = accept else { continue };
-                info!(team_id = %team_id, ?peer, "HTTP MCP: new connection accepted");
-                let token = auth_token.clone();
-                let sched = scheduler.clone();
-                let svc = service.clone();
-                let tid = team_id.clone();
-                let dump = prompt_dump.clone();
-                tokio::spawn(async move {
-                    let mut buf = vec![0u8; 65536];
-                    let n = match stream.read(&mut buf).await {
-                        Ok(n) if n > 0 => n,
-                        _ => return,
-                    };
-                    let request = String::from_utf8_lossy(&buf[..n]);
-
-                    // Extract JSON body (after \r\n\r\n)
-                    let body = request.split("\r\n\r\n").nth(1).unwrap_or("");
-                    let Ok(value): Result<Value, _> = serde_json::from_str(body) else {
-                        let resp = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
-                        let _ = stream.write_all(resp.as_bytes()).await;
-                        return;
-                    };
-
-                    // Handle JSON-RPC request
-                    let method = value.get("method").and_then(Value::as_str).unwrap_or("");
-                    let id = value.get("id").cloned();
-                    let auth_ok = http_bearer_token(&request).is_some_and(|provided| provided == token);
-                    if !auth_ok {
-                        let response_body = json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "error": {
-                                "code": INVALID_REQUEST,
-                                "message": "Authentication failed: invalid auth_token"
-                            }
-                        });
-                        let body_bytes = serde_json::to_vec(&response_body).unwrap_or_default();
-                        let header = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-                            body_bytes.len()
-                        );
-                        let _ = stream.write_all(header.as_bytes()).await;
-                        let _ = stream.write_all(&body_bytes).await;
-                        return;
-                    }
-                    let caller_slot_id = request.lines()
-                        .find(|l| l.to_lowercase().starts_with("x-slot-id:"))
-                        .and_then(|l| l.split_once(':').map(|(_, v)| v.trim()))
-                        .unwrap_or("");
-                    let caller_role = caller_role_for_tools_list(&sched, caller_slot_id).await;
-
-                    let result = match method {
-                        "initialize" => {
-                            json!({
-                                "capabilities": { "tools": {} },
-                                "protocolVersion": PROTOCOL_VERSION,
-                                "serverInfo": { "name": SERVER_NAME, "version": SERVER_VERSION }
-                            })
-                        }
-                        "notifications/initialized" => {
-                            let resp = "HTTP/1.1 204 No Content\r\n\r\n";
-                            let _ = stream.write_all(resp.as_bytes()).await;
-                            return;
-                        }
-                        "tools/list" => {
-                            let context = TeamToolContext {
-                                team_id: tid.clone(),
-                                caller_slot_id: caller_slot_id.to_owned(),
-                                caller_role,
-                                user_id: None,
-                                conversation_id: None,
-                                transport: aionui_api_types::TeamToolTransport::Mcp,
-                            };
-                            let descriptors = TeamToolExecutor::new(&sched, &svc).list_tools(&context);
-                            let tools: Vec<Value> = tool_descriptors_to_mcp_json(&descriptors);
-                            if let Err(error) = dump_team_tools_list(
-                                &dump,
-                                TeamToolsListDump {
-                                    team_id: &tid,
-                                    caller_slot_id,
-                                    caller_role,
-                                    tools: &tools,
-                                },
-                            ) {
-                                warn!(
-                                    team_id = %tid,
-                                    caller_slot_id,
-                                    error = %error,
-                                    "team HTTP tools/list prompt dump failed"
-                                );
-                            }
-                            json!({ "tools": tools })
-                        }
-                        "tools/call" => {
-                            let params = value.get("params").cloned().unwrap_or(json!({}));
-                            let tool_name = params.get("name").and_then(Value::as_str).unwrap_or("");
-                            let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
-                            let context = TeamToolContext {
-                                team_id: tid.clone(),
-                                caller_slot_id: caller_slot_id.to_owned(),
-                                caller_role,
-                                user_id: None,
-                                conversation_id: None,
-                                transport: aionui_api_types::TeamToolTransport::Mcp,
-                            };
-                            let call_result = match team_tool_call_from_name(tool_name, arguments) {
-                                Ok(call) => TeamToolExecutor::new(&sched, &svc).execute(&context, call).await,
-                                Err(error) => Err(error),
-                            };
-                            match call_result {
-                                Ok(value) => json!({
-                                    "content": [{
-                                        "type": "text",
-                                        "text": serde_json::to_string(&value).unwrap_or_else(|_| value.to_string())
-                                    }]
-                                }),
-                                Err(err) => {
-                                    let mut result = json!({
-                                        "content": [{"type": "text", "text": err.message}],
-                                        "isError": true,
-                                    });
-                                    result["structuredContent"] = serde_json::to_value(&err).unwrap_or_else(|_| json!({}));
-                                    result
-                                }
-                            }
-                        }
-                        _ => {
-                            json!({"error": {"code": -32601, "message": "Method not found"}})
-                        }
-                    };
-
-                    let response_body = if result.get("error").is_some() {
-                        json!({"jsonrpc": "2.0", "id": id, "error": result["error"]})
-                    } else {
-                        json!({"jsonrpc": "2.0", "id": id, "result": result})
-                    };
-                    let body_bytes = serde_json::to_vec(&response_body).unwrap_or_default();
-                    let header = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-                        body_bytes.len()
-                    );
-                    let _ = stream.write_all(header.as_bytes()).await;
-                    let _ = stream.write_all(&body_bytes).await;
-                });
-            }
-            _ = shutdown_rx.changed() => {
-                if *shutdown_rx.borrow() { break; }
-            }
-        }
-    }
-}
-
-fn http_bearer_token(request: &str) -> Option<&str> {
-    request
-        .lines()
-        .find(|line| line.to_ascii_lowercase().starts_with("authorization:"))
-        .and_then(|line| line.split_once(':').map(|(_, value)| value.trim()))
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-}
 
 // ---------------------------------------------------------------------------
 // Tests — exec_spawn_agent dispatch-layer unit tests

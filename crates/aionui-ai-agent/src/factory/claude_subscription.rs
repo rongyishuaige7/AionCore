@@ -96,10 +96,19 @@ impl SubscriptionLaunch {
     }
 
     /// The connection retains this spawner in its resume/wake/version recipes.
+    #[cfg(test)]
     pub(crate) fn scope(&self, inner: Arc<dyn Spawner>) -> Arc<dyn Spawner> {
+        self.scope_with_mcp(inner, None)
+    }
+    pub(crate) fn scope_with_mcp(
+        &self,
+        inner: Arc<dyn Spawner>,
+        file: Option<super::claude_mcp::NativeMcpFile>,
+    ) -> Arc<dyn Spawner> {
         Arc::new(SubscriptionSpawner {
             launch: self.clone(),
             inner,
+            _mcp_file: file,
         })
     }
 }
@@ -116,6 +125,7 @@ fn account_for_command(command: &str) -> Result<Option<u8>, AgentError> {
 }
 
 struct SubscriptionSpawner {
+    _mcp_file: Option<super::claude_mcp::NativeMcpFile>,
     launch: SubscriptionLaunch,
     inner: Arc<dyn Spawner>,
 }
@@ -213,6 +223,41 @@ mod tests {
     struct Recorder(std::sync::Mutex<Vec<SpawnRecord>>);
 
     type SpawnRecord = (CommandSpec, Vec<(String, String)>, String);
+
+    #[cfg(unix)]
+    #[test]
+    fn native_mcp_file_survives_connection_recipe_clones_until_last_owner_drops() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let file = super::super::claude_mcp::NativeMcpFile::create(
+            &temp.path().join("native-mcp"),
+            &aionui_api_types::TeamMcpStdioConfig {
+                team_id: "team-fixture".into(),
+                port: 55000,
+                token: "legacy-fixture".into(),
+                slot_id: "lead-1".into(),
+                binary_path: "/unreviewed/bridge".into(),
+                native_http: Some(aionui_api_types::TeamMcpHttpConfig {
+                    port: 55001,
+                    token: "fixture-only-".repeat(5),
+                }),
+            },
+            workspace.path(),
+        )
+        .unwrap();
+        let path = file.path().to_owned();
+        let home = Path::new("/Users/fixture");
+        let launch = SubscriptionLaunch::resolve_for_home("/Users/fixture/.local/bin/claude-pro2-danger", None, home)
+            .unwrap()
+            .unwrap();
+        let scoped = launch.scope_with_mcp(Arc::new(Recorder::default()), Some(file));
+        let wake_recipe = scoped.clone();
+        drop(scoped);
+        assert!(path.exists());
+        drop(wake_recipe);
+        assert!(!path.exists());
+        assert!(!path.parent().unwrap().exists());
+    }
 
     #[async_trait::async_trait]
     impl Spawner for Recorder {

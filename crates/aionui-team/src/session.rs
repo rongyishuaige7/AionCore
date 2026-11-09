@@ -314,6 +314,7 @@ impl TeamSession {
 
     pub fn mcp_stdio_config(&self, slot_id: &str) -> TeamMcpStdioConfig {
         TeamMcpStdioConfig {
+            native_http: Some(self.mcp_server.native_http_config(slot_id)),
             team_id: self.team.id.clone(),
             port: self.mcp_server.port(),
             token: self.mcp_server.auth_token().to_owned(),
