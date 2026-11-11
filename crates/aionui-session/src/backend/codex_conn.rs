@@ -3429,6 +3429,7 @@ fn map_usage(params: &Value) -> Vec<SessionEvent> {
         input_tokens: g("inputTokens"),
         output_tokens: g("outputTokens"),
         total_tokens: g("totalTokens"),
+        context_tokens: last.get("totalTokens").and_then(Value::as_u64),
         cost_usd: None,
         // DELIBERATELY NOT REPORTED, despite `tokenUsage.modelContextWindow` being
         // the only context-window field in the whole codex protocol.

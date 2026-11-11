@@ -4,6 +4,8 @@
 //! counting across a `--conversation` resume, so `step-<index>` is a stable
 //! id for pairing a tool's ACTIVE and DONE frames.
 
+use std::collections::BTreeMap;
+
 use super::CODE_STEPS_FAILED;
 use super::wire::{AgyEvent, AgyState, AgyStepType, AgyStepUpdate, AgySubagent, AgyUsage};
 use crate::event::{
@@ -45,6 +47,9 @@ pub(crate) struct Translator {
     /// and its closing message claims the work is done. Counting these is the
     /// only way to notice, because the terminal frame carries no trace of them.
     failed_steps: u32,
+    /// Per-call counters keyed by step, not result's session-cumulative counters.
+    /// Verified: agy 1.3.5 captures summarized in ARCHITECTURE.md.
+    step_usage: BTreeMap<u64, AgyUsage>,
 }
 
 impl Translator {
@@ -63,6 +68,7 @@ impl Translator {
     pub(crate) fn translate(&mut self, ev: AgyEvent) -> Vec<SessionEvent> {
         match ev {
             AgyEvent::Init(init) => {
+                self.step_usage.clear();
                 if !init.conversation_id.is_empty() {
                     self.backend_session_id = Some(init.conversation_id.clone());
                 }
@@ -92,8 +98,10 @@ impl Translator {
                     r.response
                 };
                 let mut out = Vec::with_capacity(3);
-                if let Some(u) = r.usage {
-                    out.push(usage_delta(&u));
+                // A resumed result includes PREVIOUS turns. Only the completed
+                // steps in this turn can supply current occupancy or new spend.
+                if let Some(usage) = self.take_turn_usage() {
+                    out.push(usage);
                 }
                 // BEFORE the terminal, and it MUST stay there. `StreamRelay`
                 // breaks out of its receive loop the moment it sees the turn's
@@ -294,10 +302,68 @@ impl Translator {
             AgyStepType::UserInput | AgyStepType::Checkpoint | AgyStepType::SystemMessage | AgyStepType::Unknown => {}
         }
 
-        if let Some(u) = su.usage.as_ref() {
-            out.push(usage_delta(u));
+        if su.state == AgyState::Done
+            && let Some(u) = su.usage
+        {
+            self.step_usage.insert(su.step_index, u);
+            if let Some(used) = self.context_tokens() {
+                // Live waterline only. Publish the billed breakdown once, at
+                // result, so the spend ledger does not count each step twice.
+                out.push(SessionEvent::UsageDelta {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    total_tokens: 0,
+                    context_tokens: Some(used),
+                    cost_usd: None,
+                    breakdown: UsageBreakdown::default(),
+                    context_window: None,
+                });
+            }
         }
         out
+    }
+
+    fn context_tokens(&self) -> Option<u64> {
+        self.step_usage
+            .values()
+            .rev()
+            .find_map(|u| u.input_tokens.map(|input| input.saturating_add(u.cache_read_tokens)))
+    }
+
+    /// Flush completed calls on result or EOF; a cancelled process may omit result.
+    pub(crate) fn take_turn_usage(&mut self) -> Option<SessionEvent> {
+        if self.step_usage.is_empty() {
+            return None;
+        }
+        let usage = self.turn_usage();
+        self.step_usage.clear();
+        Some(usage)
+    }
+
+    fn turn_usage(&self) -> SessionEvent {
+        let mut input_tokens = 0u64;
+        let mut output_tokens = 0u64;
+        let mut total_tokens = 0u64;
+        let mut breakdown = UsageBreakdown::default();
+        for usage in self.step_usage.values() {
+            input_tokens = input_tokens.saturating_add(usage.input_tokens.unwrap_or(0));
+            output_tokens = output_tokens.saturating_add(usage.output_tokens);
+            total_tokens = total_tokens
+                .saturating_add(usage.input_tokens.unwrap_or(0))
+                .saturating_add(usage.output_tokens)
+                .saturating_add(usage.cache_read_tokens);
+            breakdown.cached_read_tokens = breakdown.cached_read_tokens.saturating_add(usage.cache_read_tokens);
+            breakdown.thought_tokens = breakdown.thought_tokens.saturating_add(usage.thinking_tokens);
+        }
+        SessionEvent::UsageDelta {
+            input_tokens,
+            output_tokens,
+            total_tokens,
+            context_tokens: self.context_tokens(),
+            cost_usd: None,
+            breakdown,
+            context_window: None,
+        }
     }
 }
 
@@ -337,22 +403,6 @@ fn subagent_input(agents: &[AgySubagent]) -> serde_json::Value {
             })
             .collect(),
     )
-}
-
-fn usage_delta(u: &AgyUsage) -> SessionEvent {
-    SessionEvent::UsageDelta {
-        input_tokens: u.input_tokens,
-        output_tokens: u.output_tokens,
-        total_tokens: u.total_tokens,
-        // agy reports no cost figures.
-        cost_usd: None,
-        breakdown: UsageBreakdown {
-            cached_read_tokens: u.cache_read_tokens,
-            cached_write_tokens: 0,
-            thought_tokens: u.thinking_tokens,
-        },
-        context_window: None,
-    }
 }
 
 #[cfg(test)]
@@ -507,11 +557,158 @@ mod tests {
     fn usage_is_forwarded_as_usage_delta() {
         let (_, evs) = tr(&[
             r#"{"event":"step_update","step_update":{"step_index":5,"state":"DONE","step_type":"agent_response","usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}}}"#,
+            r#"{"event":"result","result":{"status":"SUCCESS","usage":{"input_tokens":1000,"output_tokens":200,"total_tokens":1200}}}"#,
         ]);
-        assert!(
-            evs.iter()
-                .any(|e| matches!(e, SessionEvent::UsageDelta { total_tokens: 12, .. }))
-        );
+        assert!(evs.iter().any(|e| matches!(
+            e,
+            SessionEvent::UsageDelta {
+                total_tokens: 12,
+                context_tokens: Some(10),
+                ..
+            }
+        )));
+    }
+
+    /// Usage-only excerpts of real agy 1.3.5 resumed turns.
+    /// Source: /tmp/aion-context-usage.DZEJKK/{turn1,turn2}.ndjson.
+    #[test]
+    fn captured_resumed_result_cannot_replace_the_latest_step_with_session_spend() {
+        let (_, events) = tr(&[
+            r#"{"event":"step_update","step_update":{"step_index":4,"state":"DONE","step_type":"agent_response","usage":{"input_tokens":16026,"output_tokens":108,"thinking_tokens":107,"cache_read_tokens":0,"total_tokens":16134}}}"#,
+            r#"{"event":"result","result":{"status":"SUCCESS","usage":{"input_tokens":31743,"output_tokens":206,"thinking_tokens":204,"cache_read_tokens":0,"total_tokens":31949}}}"#,
+        ]);
+        assert!(matches!(
+            events[0],
+            SessionEvent::UsageDelta {
+                context_tokens: Some(16_026),
+                input_tokens: 0,
+                ..
+            }
+        ));
+        assert!(matches!(
+            events[1],
+            SessionEvent::UsageDelta {
+                context_tokens: Some(16_026),
+                input_tokens: 16_026,
+                output_tokens: 108,
+                total_tokens: 16_134,
+                ..
+            }
+        ));
+        assert!(matches!(events[2], SessionEvent::TurnResult { .. }));
+    }
+
+    #[test]
+    fn smaller_post_compact_step_wins_even_as_cumulative_billing_rises() {
+        let (_, events) = tr(&[
+            r#"{"event":"step_update","step_update":{"step_index":10,"state":"DONE","step_type":"agent_response","usage":{"input_tokens":900000,"output_tokens":100,"total_tokens":900100}}}"#,
+            r#"{"event":"step_update","step_update":{"step_index":14,"state":"DONE","step_type":"agent_response","usage":{"input_tokens":20000,"cache_read_tokens":10000,"output_tokens":100,"total_tokens":30100}}}"#,
+            r#"{"event":"result","result":{"status":"SUCCESS","usage":{"input_tokens":1759000,"output_tokens":285,"total_tokens":1759285}}}"#,
+        ]);
+        assert!(matches!(
+            events[1],
+            SessionEvent::UsageDelta {
+                context_tokens: Some(30_000),
+                ..
+            }
+        ));
+        assert!(matches!(
+            events[2],
+            SessionEvent::UsageDelta {
+                context_tokens: Some(30_000),
+                input_tokens: 920_000,
+                total_tokens: 930_200,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn duplicated_and_out_of_order_steps_do_not_double_bill_or_rewind_the_waterline() {
+        let older = r#"{"event":"step_update","step_update":{"step_index":2,"state":"DONE","step_type":"agent_response","usage":{"input_tokens":900,"output_tokens":100,"total_tokens":1000}}}"#;
+        let newer = r#"{"event":"step_update","step_update":{"step_index":5,"state":"DONE","step_type":"agent_response","usage":{"input_tokens":100,"output_tokens":10,"total_tokens":110}}}"#;
+        let (_, events) = tr(&[
+            older,
+            newer,
+            older,
+            newer,
+            r#"{"event":"result","result":{"status":"SUCCESS"}}"#,
+        ]);
+        assert!(matches!(
+            events[2],
+            SessionEvent::UsageDelta {
+                context_tokens: Some(100),
+                ..
+            }
+        ));
+        assert!(matches!(
+            events[4],
+            SessionEvent::UsageDelta {
+                total_tokens: 1110,
+                input_tokens: 1000,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn result_without_a_step_measurement_never_invents_context_or_rebills_history() {
+        let (_, events) = tr(&[
+            r#"{"event":"result","result":{"status":"SUCCESS","usage":{"input_tokens":31743,"total_tokens":31949}}}"#,
+        ]);
+        assert!(matches!(events.as_slice(), [SessionEvent::TurnResult { .. }]));
+    }
+
+    /// Real two-call tool turn: source
+    /// /tmp/aion-context-usage.DZEJKK/tool_turn.ndjson (agy 1.3.5).
+    #[test]
+    fn captured_cache_read_counts_once_in_context_and_once_per_call_in_spend() {
+        let (_, events) = tr(&[
+            r#"{"event":"step_update","step_update":{"step_index":13,"state":"DONE","step_type":"agent_response","usage":{"input_tokens":16882,"output_tokens":126,"thinking_tokens":96,"cache_read_tokens":0,"total_tokens":17008}}}"#,
+            r#"{"event":"step_update","step_update":{"step_index":15,"state":"DONE","step_type":"agent_response","usage":{"input_tokens":3569,"output_tokens":82,"thinking_tokens":77,"cache_read_tokens":16891,"total_tokens":3651}}}"#,
+            r#"{"event":"result","result":{"status":"SUCCESS","usage":{"input_tokens":68517,"output_tokens":497,"thinking_tokens":459,"cache_read_tokens":16891,"total_tokens":69014}}}"#,
+        ]);
+        assert!(matches!(
+            events[2],
+            SessionEvent::UsageDelta {
+                context_tokens: Some(20_460),
+                input_tokens: 20_451,
+                output_tokens: 208,
+                total_tokens: 37_550,
+                breakdown: UsageBreakdown {
+                    cached_read_tokens: 16_891,
+                    thought_tokens: 173,
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn explicit_zero_input_is_a_measurement_but_missing_input_is_not() {
+        let (_, zero) = tr(&[
+            r#"{"event":"step_update","step_update":{"step_index":2,"state":"DONE","step_type":"agent_response","usage":{"input_tokens":0}}}"#,
+        ]);
+        assert!(matches!(
+            zero.as_slice(),
+            [SessionEvent::UsageDelta {
+                context_tokens: Some(0),
+                ..
+            }]
+        ));
+        let (_, missing) = tr(&[
+            r#"{"event":"step_update","step_update":{"step_index":2,"state":"DONE","step_type":"agent_response","usage":{"output_tokens":100}}}"#,
+            r#"{"event":"result","result":{"status":"SUCCESS"}}"#,
+        ]);
+        assert!(matches!(
+            missing[0],
+            SessionEvent::UsageDelta {
+                context_tokens: None,
+                output_tokens: 100,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -528,6 +725,27 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn interrupted_turn_retains_completed_call_spend_without_billing_twice_on_eof() {
+        let (mut translator, _) = tr(&[
+            r#"{"event":"step_update","step_update":{"step_index":2,"state":"DONE","step_type":"agent_response","usage":{"input_tokens":100,"output_tokens":20}}}"#,
+        ]);
+        assert!(matches!(
+            translator.take_turn_usage(),
+            Some(SessionEvent::UsageDelta {
+                context_tokens: Some(100),
+                total_tokens: 120,
+                ..
+            })
+        ));
+        assert!(translator.take_turn_usage().is_none());
+        let (mut finished, _) = tr(&[
+            r#"{"event":"step_update","step_update":{"step_index":2,"state":"DONE","step_type":"agent_response","usage":{"input_tokens":100,"output_tokens":20}}}"#,
+            r#"{"event":"result","result":{"status":"SUCCESS"}}"#,
+        ]);
+        assert!(finished.take_turn_usage().is_none());
     }
 
     #[test]

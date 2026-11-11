@@ -19,7 +19,7 @@
 /// fewer traits than available is always legal ⇒ the shape compiles as-is.
 /// Per-turn token counters for the usage indicator's detail line
 /// ("input · output · cache read · thinking"). Every field is a per-turn total,
-/// NOT a running context figure — `UsageDelta.total_tokens` carries occupancy.
+/// NOT a running context figure — `UsageDelta.context_tokens` carries occupancy.
 ///
 /// Both direct backends report all of it (live-verified): claude via
 /// `result.usage` plus the `thinking_tokens` summed off each `message_delta`,
@@ -315,8 +315,8 @@ pub enum SessionEvent {
     /// hermes prompt-result (Native) / opencode POST-ack (Native). Reducer no-op.
     PromptAccepted { client_msg_id: String },
 
-    /// Per-turn typed usage/cost (Addendum 5 / U15). Adapter normalizes a
-    /// cumulative wire counter to a per-turn DELTA (G6). Reducer no-op (pure
+    /// Typed usage/cost (Addendum 5 / U15). Billed counters and current context
+    /// occupancy have separate fields. Reducer no-op (pure
     /// consumer signal). codex `thread/tokenUsage/updated.last`; claude
     /// `result.usage`; cost_usd may be None. When present, `cost_usd` is the
     /// SESSION-cumulative spend: claude's wire value (`total_cost_usd`) is only
@@ -325,10 +325,15 @@ pub enum SessionEvent {
     UsageDelta {
         input_tokens: u64,
         output_tokens: u64,
+        /// Billed token volume for this report; never used as context occupancy.
         total_tokens: u64,
+        /// Current context occupancy, independent of billed counters. `Some(0)`
+        /// is an explicit empty reading; `None` means no measurement was supplied.
+        #[serde(default)]
+        context_tokens: Option<u64>,
         cost_usd: Option<f64>,
         /// Per-turn counters behind the indicator's detail line. Separate from
-        /// `total_tokens`, which is context OCCUPANCY: on claude the two even come
+        /// `context_tokens`: on claude the two even come
         /// from different frames (the turn aggregate vs. the last API call).
         breakdown: UsageBreakdown,
         /// The model's total context window, when the backend reports one
@@ -1365,6 +1370,7 @@ mod additive_tests {
                     input_tokens: 1,
                     output_tokens: 1,
                     total_tokens: 2,
+                    context_tokens: Some(2),
                     cost_usd: None,
                     context_window: None,
                     breakdown: Default::default(),
@@ -1644,6 +1650,7 @@ mod additive_tests {
                 input_tokens: 100,
                 output_tokens: 50,
                 total_tokens: 150,
+                context_tokens: Some(150),
                 cost_usd: Some(0.0021),
                 context_window: None,
                 breakdown: Default::default(),

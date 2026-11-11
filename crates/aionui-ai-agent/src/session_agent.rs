@@ -3357,7 +3357,13 @@ fn spawn_event_pump(
             // room. Broadcasting straight from the pump (session-scoped, still alive)
             // is what turns claude's indicator on without waiting for a reload.
             if let (Some(bus), Some(_)) = (broadcaster.as_ref(), informative_usage(&env.event)) {
-                broadcast_usage_frame(bus.as_ref(), &conversation_id, &user_id, &env.event);
+                broadcast_usage_frame(
+                    bus.as_ref(),
+                    &conversation_id,
+                    &user_id,
+                    &env.event,
+                    terminal_result_seen,
+                );
             }
             for mut ev in translate_event(env.event, &conversation_id, terminal_result_seen) {
                 // Keep the tool name alive across a call's multi-frame lifecycle (see
@@ -3571,7 +3577,10 @@ async fn persist_side_effects(
 /// occupancy. Both consumers — the durable snapshot and the live broadcast — ask
 /// this, so a report can never be broadcast without being stored, or vice versa.
 ///
-/// A zero-token report is DISCARDED. claude ends a no-op turn with an all-zero
+/// Missing occupancy is distinct from an explicit zero. Claude's adapter maps
+/// its no-op all-zero aggregate to `context_tokens: None`; actual measurements,
+/// including `Some(0)`, remain informative. The observed legacy case follows:
+/// claude ends a no-op turn with an all-zero
 /// `usage` object — live-captured (2.1.220) on all three variants:
 ///
 /// | turn                | `usage`  | `total_cost_usd`      | `modelUsage` |
@@ -3595,11 +3604,19 @@ async fn persist_side_effects(
 /// (~25k here). Different baselines; mixing them would understate occupancy ~13x.
 fn informative_usage(event: &SessionEvent) -> Option<&SessionEvent> {
     match event {
-        SessionEvent::UsageDelta { total_tokens, .. } if *total_tokens > 0 => Some(event),
+        SessionEvent::UsageDelta {
+            context_tokens,
+            input_tokens,
+            output_tokens,
+            breakdown,
+            ..
+        } if context_tokens.is_some() || *input_tokens > 0 || *output_tokens > 0 || !breakdown.is_empty() => {
+            Some(event)
+        }
         // Discarding is silent otherwise, which makes "the indicator is stuck on an
         // old number" undiagnosable from logs. One line per no-op turn is cheap.
         SessionEvent::UsageDelta { .. } => {
-            tracing::debug!("usage report carries zero tokens; keeping the previous reading");
+            tracing::debug!("usage report has no context measurement or billed tokens; keeping the previous reading");
             None
         }
         _ => None,
@@ -3616,13 +3633,23 @@ fn informative_usage(event: &SessionEvent) -> Option<&SessionEvent> {
 /// by the time claude's arrives its turn is already closed, so there is no message
 /// to attach it to. The indicator reads `data`, keyed by conversation.
 ///
-/// Fires for every backend, which means codex/ACP — whose reports land mid-turn,
-/// while the relay is still forwarding — deliver TWO frames: the relay's catch-all
-/// (with a real `msg_id`) and this one. Accepted deliberately: the renderer's
-/// `setTokenUsage` replaces wholesale, so the duplicate is idempotent, and gating
-/// on backend here would trade a harmless repeat for a rule that silently rots the
-/// moment another backend starts reporting after its turn ends.
-fn broadcast_usage_frame(bus: &dyn EventBroadcaster, conversation_id: &str, user_id: &str, event: &SessionEvent) {
+/// A billed report goes through the open relay OR this late-report path. Sending
+/// both copies would bill the spend ledger twice, because the relay carries a
+/// turn id while the session-scoped frame does not. Context-only reports remain
+/// safe to duplicate and reach inactive views immediately.
+fn broadcast_usage_frame(
+    bus: &dyn EventBroadcaster,
+    conversation_id: &str,
+    user_id: &str,
+    event: &SessionEvent,
+    terminal_result_seen: bool,
+) {
+    if !terminal_result_seen
+        && matches!(event, SessionEvent::UsageDelta { input_tokens, output_tokens, breakdown, .. }
+            if *input_tokens > 0 || *output_tokens > 0 || !breakdown.is_empty())
+    {
+        return;
+    }
     let Some(frame) = translate_event(event.clone(), conversation_id, false)
         .into_iter()
         .next()
@@ -3654,7 +3681,7 @@ fn broadcast_usage_frame(bus: &dyn EventBroadcaster, conversation_id: &str, user
 /// Shape is the ACP `UsageUpdate` the frontend already consumes:
 /// `{used, size, cost:{amount, currency}}`.
 ///
-/// MERGE, not replace (mirrors the ACP path): `used` always takes the newer value,
+/// MERGE, not replace (mirrors the ACP path): an explicit `used` takes the newer value,
 /// while `size`/`cost` are only overwritten when the incoming report carries them.
 /// codex sends no cost at all and may send `modelContextWindow: null`, so a blind
 /// replace would blank a window the previous turn had already established.
@@ -3667,10 +3694,11 @@ async fn persist_context_usage(
     let SessionEvent::UsageDelta {
         input_tokens,
         output_tokens,
-        total_tokens: used,
+        context_tokens: used,
         cost_usd,
         context_window,
         breakdown,
+        ..
     } = event
     else {
         return;
@@ -3689,7 +3717,9 @@ async fn persist_context_usage(
             return;
         }
     };
-    usage.insert("used".into(), serde_json::json!(used));
+    if let Some(used) = used {
+        usage.insert("used".into(), serde_json::json!(used));
+    }
     if let Some(size) = context_window {
         usage.insert("size".into(), serde_json::json!(size));
     }
@@ -3699,7 +3729,7 @@ async fn persist_context_usage(
     // The detail line must survive a reload too — the renderer reads `_meta` off
     // the GET /usage snapshot exactly as it does off a live frame. Merged like
     // `size`/`cost`: only replaced when the incoming turn actually reported one.
-    if !breakdown.is_empty() {
+    if *input_tokens > 0 || *output_tokens > 0 || !breakdown.is_empty() {
         usage.insert(
             "_meta".into(),
             serde_json::json!({
@@ -4233,6 +4263,10 @@ fn empty_turn_tip(outcome: &aionui_session::TurnOutcome) -> Option<TipsEventData
 /// replicate the reducer's `crash_outcome` guard (a Detached AFTER the turn's
 /// result is an absorbed teardown, not a crash). Immaterial for every other arm.
 fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_seen: bool) -> Vec<AgentStreamEvent> {
+    // The relay and the pump must apply the same gate, including after compact.
+    if matches!(&event, SessionEvent::UsageDelta { .. }) && informative_usage(&event).is_none() {
+        return Vec::new();
+    }
     match event {
         // NOTE: the Start lifecycle frame is emitted by `send_message` (before
         // dispatch), mirroring the ACP path which emits Start right before prompt().
@@ -4442,15 +4476,16 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
         // card on its own answer. A cross-client "someone else answered" push is a
         // follow-up (the recovery REST path re-lists open asks on reload).
         SessionEvent::AskResolved { .. } => Vec::new(),
-        // Per-turn usage/cost → the AcpContextUsage passthrough frame the frontend
-        // usage indicator reads (shape: cumulative token counters).
+        // Current context and per-turn billed counters share a frame, but never
+        // a number: only an explicit context measurement may supply `used`.
         SessionEvent::UsageDelta {
             input_tokens,
             output_tokens,
-            total_tokens,
+            context_tokens,
             cost_usd,
             context_window,
             breakdown,
+            ..
         } => {
             // The frontend ContextUsageIndicator reads `used` (tokens consumed) and,
             // optionally, `size` (context window) + `cost` — the exact shape the ACP
@@ -4458,16 +4493,12 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
             // cost:{amount,currency}}). Emitting the raw {input_tokens,…} shape left
             // the indicator blank (no `used` key).
             //
-            // `used` = total_tokens, which BOTH direct backends compute as current
-            // context occupancy, not a per-turn delta: codex reports `last.totalTokens`
-            // (its `inputTokens` already includes the cached part) and claude's
-            // adapter sums input + output + both cache buckets. The cumulative
-            // counters (codex `total.*`) are deliberately NOT used — they outgrow the
-            // window on a long session.
-            //
             // `size` is emitted only when the backend reported a window; the frontend
             // guards `if size>0`, so `None` degrades to a counter with no percentage.
-            let mut usage = serde_json::json!({ "used": total_tokens });
+            let mut usage = serde_json::json!({});
+            if let Some(used) = context_tokens {
+                usage["used"] = serde_json::json!(used);
+            }
             if let Some(size) = context_window {
                 usage["size"] = serde_json::json!(size);
             }
@@ -4476,7 +4507,7 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
             // useAcpMessage.ts `BREAKDOWN_KEYS`) and drops the line when none are
             // present — so a backend that reports nothing simply has no line,
             // rather than a row of zeros.
-            if !breakdown.is_empty() {
+            if input_tokens > 0 || output_tokens > 0 || !breakdown.is_empty() {
                 usage["_meta"] = serde_json::json!({
                     "input_tokens": input_tokens,
                     "output_tokens": output_tokens,
@@ -5461,9 +5492,10 @@ mod translate_tests {
     fn usage_frame(total: u64, cost: Option<f64>, window: Option<u64>) -> serde_json::Value {
         let events = translate_event(
             SessionEvent::UsageDelta {
-                input_tokens: 10,
-                output_tokens: 5,
+                input_tokens: 0,
+                output_tokens: 0,
                 total_tokens: total,
+                context_tokens: Some(total),
                 cost_usd: cost,
                 context_window: window,
                 breakdown: Default::default(),
@@ -5499,6 +5531,7 @@ mod translate_tests {
                 input_tokens: 1_100,
                 output_tokens: 194,
                 total_tokens: 18_400,
+                context_tokens: Some(18_400),
                 cost_usd: None,
                 context_window: Some(256_000),
                 breakdown: aionui_session::UsageBreakdown {
@@ -5706,7 +5739,8 @@ mod translate_tests {
             SessionEvent::UsageDelta {
                 input_tokens: 10,
                 output_tokens: 20,
-                total_tokens: 30,
+                total_tokens: 1_759_285,
+                context_tokens: Some(30),
                 cost_usd: Some(0.5),
                 context_window: None,
                 breakdown: Default::default(),
@@ -5720,7 +5754,11 @@ mod translate_tests {
         };
         // Frontend ContextUsageIndicator reads `used` (not `total_tokens`) — the
         // shape the ACP path forwards. `cost` rides as {amount,currency}.
-        assert_eq!(v.get("used").and_then(|x| x.as_u64()), Some(30), "used = total_tokens");
+        assert_eq!(
+            v.get("used").and_then(|x| x.as_u64()),
+            Some(30),
+            "used = context_tokens"
+        );
         assert_eq!(
             v.get("cost").and_then(|c| c.get("amount")).and_then(|x| x.as_f64()),
             Some(0.5)
@@ -6132,6 +6170,7 @@ mod persist_tests {
             input_tokens: 0,
             output_tokens: 0,
             total_tokens: total,
+            context_tokens: (total > 0).then_some(total),
             cost_usd: cost,
             context_window: window,
             breakdown: Default::default(),
@@ -6145,6 +6184,84 @@ mod persist_tests {
             .unwrap()
             .expect("runtime state exists");
         serde_json::from_str(state.context_usage_json.as_deref().expect("context_usage written")).unwrap()
+    }
+
+    fn measured_usage(context_tokens: Option<u64>, billed: u64) -> SessionEvent {
+        SessionEvent::UsageDelta {
+            input_tokens: billed,
+            output_tokens: 100,
+            total_tokens: billed + 100,
+            context_tokens,
+            cost_usd: None,
+            context_window: None,
+            breakdown: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_smaller_measurement_replaces_the_full_waterline_while_spend_rises() {
+        let (repo, _db) = seeded_repo().await;
+        persist_side_effects(
+            repo.as_ref(),
+            "user-1",
+            "conv-1",
+            &usage(950_000, Some(1.0), Some(1_048_576)),
+        )
+        .await;
+        let event = measured_usage(Some(30_000), 1_759_185);
+        persist_side_effects(repo.as_ref(), "user-1", "conv-1", &event).await;
+        let stored = stored_usage(repo.as_ref()).await;
+        assert_eq!(stored["used"], 30_000);
+        assert_eq!(stored["size"], 1_048_576);
+        assert_eq!(stored["cost"]["amount"], 1.0);
+        assert_eq!(stored["_meta"]["input_tokens"], 1_759_185);
+        let AgentStreamEvent::AcpContextUsage(frame) = &translate_event(event, "conv-1", false)[0] else {
+            panic!("usage frame expected");
+        };
+        assert_eq!(frame["used"], stored["used"], "live and reload waterlines agree");
+    }
+
+    #[tokio::test]
+    async fn an_explicit_zero_is_persisted_and_forwarded() {
+        let (repo, _db) = seeded_repo().await;
+        persist_side_effects(
+            repo.as_ref(),
+            "user-1",
+            "conv-1",
+            &usage(950_000, None, Some(1_048_576)),
+        )
+        .await;
+        let mut event = usage(0, None, None);
+        if let SessionEvent::UsageDelta { context_tokens, .. } = &mut event {
+            *context_tokens = Some(0);
+        }
+        assert!(informative_usage(&event).is_some());
+        persist_side_effects(repo.as_ref(), "user-1", "conv-1", &event).await;
+        assert_eq!(stored_usage(repo.as_ref()).await["used"], 0);
+        let AgentStreamEvent::AcpContextUsage(frame) = &translate_event(event, "conv-1", false)[0] else {
+            panic!("usage frame expected");
+        };
+        assert_eq!(frame["used"], 0);
+    }
+
+    #[tokio::test]
+    async fn billed_counters_without_occupancy_never_replace_the_waterline() {
+        let (repo, _db) = seeded_repo().await;
+        persist_side_effects(repo.as_ref(), "user-1", "conv-1", &usage(30_000, None, Some(1_048_576))).await;
+        let event = measured_usage(None, 1_759_185);
+        persist_side_effects(repo.as_ref(), "user-1", "conv-1", &event).await;
+        let stored = stored_usage(repo.as_ref()).await;
+        assert_eq!(stored["used"], 30_000);
+        assert_eq!(stored["_meta"]["input_tokens"], 1_759_185);
+        let AgentStreamEvent::AcpContextUsage(frame) = &translate_event(event, "conv-1", false)[0] else {
+            panic!("usage frame expected");
+        };
+        assert!(frame.get("used").is_none());
+    }
+
+    #[test]
+    fn no_op_usage_is_dropped_by_the_relay_as_well_as_the_pump() {
+        assert!(translate_event(usage(0, None, None), "conv-1", false).is_empty());
     }
 
     /// Defect 1: claude reports usage on the `result` frame, which lands AFTER the
@@ -6260,7 +6377,13 @@ mod persist_tests {
         }
 
         let bus = Recorder::default();
-        broadcast_usage_frame(&bus, "conv-1", "user-1", &usage(26_420, Some(0.117), Some(1_000_000)));
+        broadcast_usage_frame(
+            &bus,
+            "conv-1",
+            "user-1",
+            &usage(26_420, Some(0.117), Some(1_000_000)),
+            true,
+        );
         let sent = bus.0.lock().unwrap();
         let msg = sent.first().expect("one frame broadcast");
         assert_eq!(msg.name, "message.stream");
@@ -6271,6 +6394,26 @@ mod persist_tests {
         assert_eq!(msg.data["data"]["used"], 26_420);
         assert_eq!(msg.data["data"]["size"], 1_000_000, "drives context_limit");
         assert_eq!(msg.data["conversation_id"], "conv-1");
+    }
+
+    #[test]
+    fn billed_reports_have_one_delivery_path_before_and_after_the_terminal() {
+        #[derive(Default)]
+        struct Recorder(std::sync::Mutex<Vec<aionui_api_types::WebSocketMessage<serde_json::Value>>>);
+        impl EventBroadcaster for Recorder {
+            fn broadcast(&self, event: aionui_api_types::WebSocketMessage<serde_json::Value>) {
+                self.0.lock().unwrap().push(event);
+            }
+        }
+        let bus = Recorder::default();
+        let event = measured_usage(Some(30_000), 37_550);
+        broadcast_usage_frame(&bus, "conv-1", "user-1", &event, false);
+        assert!(bus.0.lock().unwrap().is_empty(), "an open relay owns billed reports");
+        assert_eq!(translate_event(event.clone(), "conv-1", false).len(), 1);
+        broadcast_usage_frame(&bus, "conv-1", "user-1", &event, true);
+        let sent = bus.0.lock().unwrap();
+        assert_eq!(sent.len(), 1, "a late report bypasses the closed relay");
+        assert_eq!(sent[0].data["data"]["_meta"]["input_tokens"], 37_550);
     }
 
     /// The gate is shared by the snapshot and the live broadcast, so a report can

@@ -809,6 +809,14 @@ impl AntigravitySessionBackend {
 
             // A cancelled or crashed run exits without emitting `result`; the
             // FSM still needs a terminal, so synthesize one from the exit.
+            // Keep spend from completed calls even when result was interrupted.
+            if let Some(usage) = translator.take_turn_usage() {
+                let _ = event_tx.send(SessionEnvelope {
+                    session_id: session_id.clone(),
+                    turn_gen,
+                    event: usage,
+                });
+            }
             if !saw_terminal {
                 let exit = proc.wait_for_exit().await;
                 let ok = exit.map(|s| s.success()).unwrap_or(false);

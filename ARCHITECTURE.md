@@ -260,6 +260,50 @@ or three-level naming (e.g., `team.agent.status`). These are historical artifact
 New events must follow the two-level camelCase convention above.
 Existing inconsistencies will be unified incrementally during related module iterations.
 
+### Context Occupancy and Billed Usage
+
+`SessionEvent::UsageDelta.context_tokens` is the current window measurement;
+`None` means unavailable and `Some(0)` is an explicit empty window. Billed
+`input_tokens`, `output_tokens`, `total_tokens` and cache/thinking breakdowns
+never substitute for it. `context_usage.used` is replaced by each measurement,
+including decreases, while absent measurements preserve the last reading.
+No database schema or public ACP field changes are needed: `used`/`size` remain
+the context contract and `_meta` carries billed counters for the spend ledger.
+
+Verified source: agy 1.3.5 live captures
+`/tmp/aion-context-usage.DZEJKK/{turn1,turn2,compact,post_compact}.ndjson`.
+On two resumed turns the completed steps report inputs 15,717 and 16,026;
+the second result reports 31,743 (= their sum), not current occupancy.
+The `/compact` result repeats that cumulative usage without a step measurement.
+The next completed step reports 16,323 while its result has reached 48,066.
+These captures prove different step/result scopes; this short session did not
+demonstrate a token decrease caused by compaction. The ACP definition of `used`
+is independently verified in
+`agent-client-protocol-schema-1.5.0/src/v1/client.rs` (`UsageUpdate`).
+
+An additional real two-call tool turn (`tool_turn.ndjson` in the same capture
+directory) reports last-call input 3,569, cache read 16,891, output 82, and
+`total_tokens: 3651`. Thus cache reads are separate from input and raw total;
+occupancy is 20,460 and the turn's billed volume includes each call's cache.
+
+The Antigravity translator takes the latest completed step's input plus cache
+read for occupancy. It deduplicates step counters by index and publishes their
+turn aggregate once, before the terminal event, for billing. Result aggregates
+never supply occupancy or new spend. A result without step measurements keeps
+the old reading; it does not fabricate a post-compaction size. Claude and Codex
+keep their existing occupancy calculations, now in the explicit field.
+Completed calls are also flushed on EOF so interruption does not discard them.
+Billed frames use the open relay, or the direct pump broadcast after terminal;
+they never use both paths for the same report.
+
+Scope: translator, persistence/broadcast, and renderer hydration/zero readings.
+No changes to model windows, agent launch/authentication, or live database rows.
+Delivery is one bounded repair. Verify captured resumed turns, simulated
+compaction decreases with rising spend, cache reads, duplicate steps, missing
+measurements, explicit zero, persistence/reload, and delayed HTTP hydration.
+Existing persistence warnings and typed usage tests provide observability;
+additional high-frequency production logs are unnecessary.
+
 ### ACP Tool Output Sanitization
 
 ACP agent tool-call events enter the unified `AgentStreamEvent` stream through

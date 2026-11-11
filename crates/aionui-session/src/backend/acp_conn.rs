@@ -1776,23 +1776,25 @@ async fn map_update(
         }
         "usage_update" => {
             // Two ACP shapes, both handled (do not assume cost-free / split-free):
-            //  - hermes: {used, size} (cumulative token count, no split, no cost).
+            //  - hermes: {used, size} (context occupancy, no split, no cost).
+            //    Canonical `used`: agent-client-protocol-schema-1.5.0/src/v1/client.rs.
             //  - claude-agent-acp: richer {inputTokens, outputTokens, totalTokens,
             //    cost:{amount, currency}}. cost was previously DROPPED (hardcoded None)
             //    + the per-direction split ignored. cost_usd is consumed downstream
             //    (turn_finalizer). Read whichever fields are present.
             let input = update.get("inputTokens").and_then(Value::as_u64).unwrap_or(0);
             let output = update.get("outputTokens").and_then(Value::as_u64).unwrap_or(0);
-            let total = update
-                .get("totalTokens")
+            let context_tokens = update
+                .get("used")
                 .and_then(Value::as_u64)
-                .or_else(|| update.get("used").and_then(Value::as_u64))
-                .unwrap_or(input + output);
+                .or_else(|| update.get("totalTokens").and_then(Value::as_u64))
+                .or_else(|| (input + output > 0).then_some(input + output));
             let cost_usd = update.get("cost").and_then(|c| c.get("amount")).and_then(Value::as_f64);
             vec![SessionEvent::UsageDelta {
                 input_tokens: input,
                 output_tokens: output,
-                total_tokens: total,
+                total_tokens: input + output,
+                context_tokens,
                 cost_usd,
                 // ACP spells the context window `size` (the UsageUpdate shape the
                 // frontend indicator reads back as its denominator).
@@ -1977,6 +1979,7 @@ fn parse_acp_result_usage(frame: &Value) -> Option<SessionEvent> {
         input_tokens: input,
         output_tokens: output,
         total_tokens: total,
+        context_tokens: (total > 0).then_some(total),
         cost_usd,
         // ACP spells the context window `size` (see the notification path above).
         context_window: usage.get("size").and_then(Value::as_u64),
@@ -3682,12 +3685,12 @@ mod tests {
 
     /// Field-value gap: `UsageDelta` with `input_tokens==0 && output_tokens==0`.
     /// The ACP `usage_update` wire (hermes: `{used, size}`) carries only a
-    /// cumulative `used`, so map_update emits input=0/output=0/total=used — a real
+    /// context `used`, so map_update emits input=0/output=0 with separate occupancy — a real
     /// production zero-token edge no test pinned (every other UsageDelta test uses
     /// nonzero input/output). A regression that started defaulting input/output to
     /// `used` (double-counting) would be caught here.
     #[tokio::test]
-    async fn acp_usage_update_emits_zero_input_output_with_cumulative_total() {
+    async fn acp_usage_update_carries_context_without_inventing_billed_tokens() {
         let current_model = Arc::new(Mutex::new(None));
         let discovered = Arc::new(std::sync::Mutex::new(Discovered::default()));
         let params = serde_json::json!({
@@ -3700,6 +3703,7 @@ mod tests {
                 input_tokens,
                 output_tokens,
                 total_tokens,
+                context_tokens,
                 cost_usd,
                 ..
             } => {
@@ -3708,10 +3712,29 @@ mod tests {
                     "hermes {{used,size}} shape carries no split → input==0"
                 );
                 assert_eq!(*output_tokens, 0, "hermes shape carries no split → output==0");
-                assert_eq!(*total_tokens, 4096, "cumulative `used` rides total_tokens");
+                assert_eq!(*total_tokens, 0, "context `used` is not billed volume");
+                assert_eq!(*context_tokens, Some(4096));
                 assert_eq!(*cost_usd, None, "the hermes shape carries no cost");
             }
             other => panic!("expected UsageDelta, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn acp_usage_update_distinguishes_an_explicit_zero_from_missing_context() {
+        let current_model = Arc::new(Mutex::new(None));
+        let discovered = Arc::new(std::sync::Mutex::new(Discovered::default()));
+        for (update, expected) in [
+            (
+                serde_json::json!({"sessionUpdate":"usage_update", "used":0, "size":200000}),
+                Some(0),
+            ),
+            (serde_json::json!({"sessionUpdate":"usage_update"}), None),
+        ] {
+            let events = map_update(&serde_json::json!({"update": update}), &current_model, &discovered).await;
+            assert!(
+                matches!(&events[0], SessionEvent::UsageDelta { context_tokens, .. } if *context_tokens == expected)
+            );
         }
     }
 

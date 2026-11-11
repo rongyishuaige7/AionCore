@@ -660,7 +660,7 @@ impl ClaudeAdapter {
             // streamed no `message_delta` at all (no `--include-partial-messages`,
             // or a resumed/consolidated frame); it is exact for a single-call turn
             // and only overstates once tool rounds appear.
-            let total_tokens = self.last_call_tokens.unwrap_or_else(|| {
+            let context_tokens = self.last_call_tokens.unwrap_or_else(|| {
                 usage
                     .get("total_tokens")
                     .and_then(Value::as_u64)
@@ -669,11 +669,13 @@ impl ClaudeAdapter {
             out.push(SessionEvent::UsageDelta {
                 input_tokens,
                 output_tokens,
-                total_tokens,
+                total_tokens: input_tokens + output_tokens + cache_creation + cache_read,
+                // A zero aggregate on a no-op result does not measure context.
+                context_tokens: (context_tokens > 0).then_some(context_tokens),
                 cost_usd: v.get("total_cost_usd").and_then(Value::as_f64),
                 context_window: self.result_context_window(v),
                 // Per-turn detail line. These stay on the AGGREGATE `result.usage`
-                // (unlike `total_tokens`, which must be the last call's occupancy):
+                // (unlike `context_tokens`, which is the last call's occupancy):
                 // the breakdown answers "what did this turn cost", so counting every
                 // API call is the correct reading.
                 breakdown: crate::event::UsageBreakdown {
@@ -2744,7 +2746,7 @@ mod tests {
             .parse_chunk(result.as_bytes())
             .into_iter()
             .find_map(|e| match e {
-                SessionEvent::UsageDelta { total_tokens, .. } => Some(total_tokens),
+                SessionEvent::UsageDelta { context_tokens, .. } => context_tokens,
                 _ => None,
             })
             .expect("result emits a UsageDelta");
@@ -2755,7 +2757,7 @@ mod tests {
     }
 
     /// The detail line's counters are PER-TURN, so they ride the aggregate
-    /// `result.usage` even though `total_tokens` must not. Thinking tokens are the
+    /// `result.usage` even though `context_tokens` must not. Thinking tokens are the
     /// exception: `result.usage.output_tokens_details` is null (live-captured), so
     /// they are summed off each `message_delta` — 60 + 12 across two calls here.
     #[test]
@@ -2813,7 +2815,7 @@ mod tests {
             .parse_chunk(line.as_bytes())
             .into_iter()
             .find_map(|e| match e {
-                SessionEvent::UsageDelta { total_tokens, .. } => Some(total_tokens),
+                SessionEvent::UsageDelta { context_tokens, .. } => context_tokens,
                 _ => None,
             })
             .expect("result emits a UsageDelta");
@@ -2833,7 +2835,7 @@ mod tests {
         let mut a = ClaudeAdapter::new();
         let occupancy_of = |evs: Vec<SessionEvent>| {
             evs.into_iter().find_map(|e| match e {
-                SessionEvent::UsageDelta { total_tokens, .. } => Some(total_tokens),
+                SessionEvent::UsageDelta { context_tokens, .. } => context_tokens,
                 _ => None,
             })
         };
@@ -2861,8 +2863,8 @@ mod tests {
         let zero_result = r#"{"type":"result","subtype":"success","is_error":false,"result":"","usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0}}"#;
         assert_eq!(
             occupancy_of(a.parse_chunk(format!("{zero_result}\n").as_bytes())),
-            Some(0),
-            "the compaction must report zero (dropped downstream), NOT the stale 27_349"
+            None,
+            "the compaction has no context measurement, NOT the stale 27_349"
         );
 
         // The next real turn measures the compacted context.

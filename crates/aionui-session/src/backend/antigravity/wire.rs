@@ -54,7 +54,7 @@ pub(crate) enum AgyStepType {
 #[derive(Debug, Clone, Default, Deserialize)]
 pub(crate) struct AgyUsage {
     #[serde(default)]
-    pub input_tokens: u64,
+    pub input_tokens: Option<u64>,
     #[serde(default)]
     pub output_tokens: u64,
     /// agy reports a thinking-token COUNT but never emits thinking TEXT.
