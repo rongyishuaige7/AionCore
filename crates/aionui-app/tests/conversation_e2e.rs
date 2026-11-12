@@ -35,6 +35,54 @@ fn create_body_with_extra(name: &str, extra: serde_json::Value) -> serde_json::V
     })
 }
 
+#[tokio::test]
+async fn project_move_requires_auth_even_with_valid_csrf() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let mut req = json_with_token(
+        "POST",
+        "/api/conversations/not-owned/move-to-project",
+        json!({"project_id":"target","expected_workspace":"/old"}),
+        &token,
+        &csrf,
+    );
+    req.headers_mut().remove("authorization");
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn project_move_requires_csrf_even_with_valid_auth() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let mut req = json_with_token(
+        "POST",
+        "/api/conversations/not-owned/move-to-project",
+        json!({"project_id":"target","expected_workspace":"/old"}),
+        &token,
+        &csrf,
+    );
+    req.headers_mut().remove("x-csrf-token");
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn project_move_rejects_missing_source_workspace() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let req = json_with_token(
+        "POST",
+        "/api/conversations/not-owned/move-to-project",
+        json!({"project_id":"target"}),
+        &token,
+        &csrf,
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body_json(resp).await["code"], "BAD_REQUEST");
+}
+
 // ── T1: Create ────────────────────────────────────────────────────────
 
 #[tokio::test]

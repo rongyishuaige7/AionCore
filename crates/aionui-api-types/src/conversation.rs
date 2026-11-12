@@ -150,6 +150,14 @@ pub struct UpdateConversationRequest {
     pub extra: Option<serde_json::Value>,
 }
 
+/// Move an idle conversation into an owned project's workspace.
+#[derive(Debug, Deserialize)]
+pub struct MoveConversationToProjectRequest {
+    pub project_id: String,
+    /// Reject a stale drag rather than overwriting another client's move.
+    pub expected_workspace: String,
+}
+
 /// Body for `POST /api/conversations/clone`.
 ///
 /// Despite the name, this endpoint no longer supports cloning from an

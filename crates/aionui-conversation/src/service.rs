@@ -1,4 +1,7 @@
 use std::future::Future;
+
+#[path = "project_move.rs"]
+mod project_move;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -2279,6 +2282,11 @@ impl ConversationService {
         req: UpdateConversationRequest,
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<ConversationResponse, ConversationError> {
+        if self.runtime_state.is_restarting(id) {
+            return Err(ConversationError::RuntimeRestarting {
+                conversation_id: id.to_owned(),
+            });
+        }
         let existing = self
             .conversation_repo
             .get(user_id, id)
@@ -4509,6 +4517,11 @@ impl ConversationService {
         conversation_id: &str,
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<(), ConversationError> {
+        if self.runtime_state.is_restarting(conversation_id) {
+            return Err(ConversationError::RuntimeRestarting {
+                conversation_id: conversation_id.to_owned(),
+            });
+        }
         let _ = self
             .ensure_runtime_agent(user_id, conversation_id, task_manager, "warmup")
             .await?;
@@ -4523,6 +4536,11 @@ impl ConversationService {
         conversation_id: &str,
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<EnsureConversationRuntimeResponse, ConversationError> {
+        if self.runtime_state.is_restarting(conversation_id) {
+            return Err(ConversationError::RuntimeRestarting {
+                conversation_id: conversation_id.to_owned(),
+            });
+        }
         let row = self
             .conversation_repo
             .get(user_id, conversation_id)

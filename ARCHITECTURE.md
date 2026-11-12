@@ -260,6 +260,39 @@ or three-level naming (e.g., `team.agent.status`). These are historical artifact
 New events must follow the two-level camelCase convention above.
 Existing inconsistencies will be unified incrementally during related module iterations.
 
+### Moving Conversations into Projects
+
+The sidebar accepts standalone idle conversations on a project header or its
+expanded contents. Pointer activation is 8px, hover expansion is 450ms, and the
+drag overlay settles in 200ms. Empty registered projects are valid targets.
+Pinned shortcuts remain pinned. The chat id, messages, draft and file references
+survive; files are not relocated on disk. Future execution uses the target root.
+
+`POST /api/conversations/{id}/move-to-project` takes an owned `project_id` and
+the drag's `expected_workspace`. The runtime restart gate excludes sends,
+configuration changes and another move. Active turns, confirmations, background
+tasks and stale drags are rejected before stopping a runtime. The replacement
+is prepared from a candidate row with the existing native resume anchor, then
+the binding is persisted in one row update. A startup failure leaves the old
+binding intact and evicts the failed replacement. An owned task completes the
+operation even when its HTTP requester disconnects. Low-volume structured
+start/success/failure logs contain ids only, never prompts or auth payloads.
+
+Renderer updates are optimistic and preserve a pending override through list
+notifications. Confirmed snapshots replace that override; failed moves restore
+the original row. Request generations reject stale hydration responses. The
+active chat's cache changes without route navigation or remounting. Target
+identity comes from the existing sidebar project read model, including empty
+projects, rather than accepting arbitrary client filesystem paths.
+
+Scope: desktop sidebar single-conversation moves, including between projects.
+No batch migration, folder/file relocation, mobile dragging, or changes to
+provider authentication, model selection, skills/MCP snapshots or agent policy.
+Validation covers real in-memory persistence, HTTP ownership boundaries,
+startup failure, stale drags, send/move exclusion, preserved history, actual
+pointer cancellation/drop behavior and native cross-workspace continuation.
+Native behavior requires captured proof; a new process cwd alone is insufficient.
+
 ### Context Occupancy and Billed Usage
 
 `SessionEvent::UsageDelta.context_tokens` is the current window measurement;

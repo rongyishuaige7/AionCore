@@ -135,6 +135,7 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
         )
         .route("/api/conversations/{id}/runtime/ensure", post(ensure_runtime))
         .route("/api/conversations/{id}/runtime/restart", post(restart_runtime))
+        .route("/api/conversations/{id}/move-to-project", post(move_to_project))
         .route("/api/conversations/{id}/active-lease", post(active_lease))
         // Confirmation system
         .route("/api/conversations/{id}/confirmations", get(list_confirmations))
@@ -148,6 +149,20 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
 }
 
 // ── Handlers ───────────────────────────────────────────────────────
+
+async fn move_to_project(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<aionui_api_types::MoveConversationToProjectRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<ConversationResponse>>, ApiError> {
+    let Json(request) = body.map_err(ApiError::from)?;
+    let conversation = state
+        .service
+        .move_to_project(&user.id, &id, request, &state.task_manager)
+        .await?;
+    Ok(Json(ApiResponse::ok(conversation)))
+}
 
 async fn create(
     State(state): State<ConversationRouterState>,

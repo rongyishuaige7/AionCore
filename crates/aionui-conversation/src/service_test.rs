@@ -60,6 +60,9 @@ mod acp_error_recovery_test;
 #[path = "service_test/runtime_create_test.rs"]
 mod runtime_create_test;
 
+#[path = "service_test/project_move_test.rs"]
+mod project_move_test;
+
 #[derive(Clone, Debug)]
 struct RecordedViewSync {
     user_id: String,
