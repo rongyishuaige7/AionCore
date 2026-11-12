@@ -863,6 +863,19 @@ impl AntigravitySessionBackend {
 
 #[async_trait::async_trait]
 impl SessionBackend for AntigravitySessionBackend {
+    fn title_generator(&self, model: Option<String>) -> Option<Arc<dyn crate::TitleGenerator>> {
+        Some(Arc::new(super::title::AgyTitleGenerator {
+            spawner: self.spawner.clone(),
+            command: aionui_common::CommandSpec {
+                command: self.config.cli_program.clone().unwrap_or_else(|| "agy".into()),
+                args: Vec::new(),
+                env: self.config.spawn_env.clone(),
+                cwd: self.config.cwd.clone(),
+            },
+            model: model.or_else(|| self.effective_model()),
+        }))
+    }
+
     async fn dispatch(&self, command: Command) -> Result<CommandReceipt, BackendError> {
         match command {
             Command::Send { content, .. } => {

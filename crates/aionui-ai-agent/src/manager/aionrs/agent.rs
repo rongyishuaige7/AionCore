@@ -104,6 +104,7 @@ fn build_aionrs_final_input_dump_value(
 }
 
 pub struct AionrsAgentManager {
+    title_generator: Arc<dyn aionui_session::TitleGenerator>,
     runtime: AgentRuntime,
     engine: Mutex<AgentEngine>,
     /// Static slash command metadata captured at bootstrap so UI lookups do
@@ -219,6 +220,7 @@ impl AionrsAgentManager {
         let is_resume = resume_session.is_some();
         let provider_label = config.provider_label.clone();
 
+        let title_generator = Arc::new(crate::title::ProviderTitleGenerator::new(&config));
         let mut bootstrap = AgentBootstrap::new(config, &workspace, sink).runtime_env(runtime_env);
         if let Some(session) = resume_session {
             info!(
@@ -275,6 +277,7 @@ impl AionrsAgentManager {
         runtime.transition_to(ConversationStatus::Pending);
 
         Ok(Self {
+            title_generator,
             runtime,
             engine: Mutex::new(engine),
             slash_commands,
@@ -285,6 +288,10 @@ impl AionrsAgentManager {
             cancel_notify: Arc::new(Notify::new()),
             turn_finished_notify: Arc::new(Notify::new()),
         })
+    }
+
+    pub(crate) fn title_generator(&self) -> Arc<dyn aionui_session::TitleGenerator> {
+        self.title_generator.clone()
     }
 
     fn request_stop(&self, reason: Option<AgentKillReason>, operation: &'static str) -> bool {

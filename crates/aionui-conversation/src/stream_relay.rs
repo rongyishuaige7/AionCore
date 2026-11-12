@@ -89,6 +89,8 @@ pub struct TurnAttemptSummary {
     pub saw_visible_output: bool,
     pub saw_tool_or_side_effect: bool,
     pub persisted_assistant_output: bool,
+    /// Captured before completion clears runtime cancellation/deletion flags.
+    pub was_cancelled: bool,
     pub saw_event_gap: bool,
     pub terminal_error: Option<ErrorEventData>,
     pub terminal_error_deferred: bool,
@@ -111,6 +113,7 @@ impl TurnAttemptSummary {
         self.saw_visible_output |= other.saw_visible_output;
         self.saw_tool_or_side_effect |= other.saw_tool_or_side_effect;
         self.persisted_assistant_output |= other.persisted_assistant_output;
+        self.was_cancelled |= other.was_cancelled;
         self.saw_event_gap |= other.saw_event_gap;
         self.needs_auth |= other.needs_auth;
         if other.terminal_error.is_some() {
@@ -178,6 +181,7 @@ pub struct StreamRelay {
     complete_turn: bool,
     defer_clean_terminal_errors: bool,
     superseding_tips: SupersedingTipTotals,
+    managed_titles: bool,
 }
 
 impl StreamRelay {
@@ -211,11 +215,17 @@ impl StreamRelay {
             complete_turn: true,
             defer_clean_terminal_errors: false,
             superseding_tips: SupersedingTipTotals::default(),
+            managed_titles: false,
         }
     }
 
     pub fn with_runtime_state(mut self, runtime_state: Arc<ConversationRuntimeStateService>) -> Self {
         self.runtime_state = Some(runtime_state);
+        self
+    }
+
+    pub(crate) fn with_managed_titles(mut self, enabled: bool) -> Self {
+        self.managed_titles = enabled;
         self
     }
 
@@ -489,6 +499,9 @@ impl StreamRelay {
                             }
                         }
                         AgentStreamEvent::Finish(_) | AgentStreamEvent::Error(_) => {
+                            attempt.was_cancelled |= self.runtime_state.as_ref().is_some_and(|state| {
+                                state.lifecycle_for(&self.conversation_id) != crate::runtime_state::RuntimeLifecycleState::Active
+                            });
                             let elapsed_ms = now_ms() - started_at;
                             let event_type = if matches!(event, AgentStreamEvent::Finish(_)) {
                                 "Finish"
@@ -690,6 +703,7 @@ impl StreamRelay {
                                 .and_then(serde_json::Value::as_str)
                                 .map(str::trim)
                                 .filter(|t| !t.is_empty())
+                                && !self.managed_titles
                                 && let Err(e) = crate::service::apply_agent_title(
                                     &self.repo,
                                     &self.broadcaster,
@@ -3206,6 +3220,40 @@ mod tests {
 
     #[async_trait::async_trait]
     impl IConversationRepository for RecordingRepo {
+        async fn update_agent_title(
+            &self,
+            user_id: &str,
+            expected: &aionui_db::models::ConversationRow,
+            title: &str,
+        ) -> Result<bool, aionui_db::DbError> {
+            let mut slot = self.conversation.lock().unwrap();
+            let Some(row) = slot
+                .as_mut()
+                .filter(|row| row.user_id == user_id && row.id == expected.id)
+            else {
+                return Ok(false);
+            };
+            if row.name_source.as_deref() == Some("user")
+                || row.name != expected.name
+                || row.name_source != expected.name_source
+                || row.updated_at != expected.updated_at
+                || row.name == title
+            {
+                return Ok(false);
+            }
+            row.name = title.into();
+            row.name_source = Some("agent".into());
+            self.conversation_updates.lock().unwrap().push((
+                expected.id.clone(),
+                aionui_db::ConversationRowUpdate {
+                    name: Some(title.into()),
+                    name_source: Some("agent".into()),
+                    ..Default::default()
+                },
+            ));
+            Ok(true)
+        }
+
         async fn get(&self, _user_id: &str, _id: &str) -> Result<Option<aionui_db::models::ConversationRow>, DbError> {
             Ok(self.conversation.lock().unwrap().clone())
         }

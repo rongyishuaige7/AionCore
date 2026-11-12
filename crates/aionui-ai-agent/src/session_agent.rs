@@ -84,6 +84,8 @@ struct SessionRuntime {
     /// that background work outlives the turn (status=Finished + no frames
     /// otherwise reads as idle and gets the agent killed mid-flight).
     live_background_tasks: std::sync::atomic::AtomicUsize,
+    /// Preserve the typed terminal outcome across the legacy Finish projection.
+    title_reply_succeeded: std::sync::atomic::AtomicBool,
     /// Coarse status derived from the FSM edge the translator observes.
     status: std::sync::Mutex<Option<ConversationStatus>>,
     /// The CLI-assigned backend session id, learned from `BackendBound`. The ACP
@@ -214,6 +216,7 @@ impl SessionRuntime {
     /// It is emitted for a `UserCancelTimeout` kill BEFORE the process is torn
     /// down, so the relay returns clean (a "cancelled", not a red crash card).
     fn emit_finish_once(&self) {
+        self.title_reply_succeeded.store(false, Ordering::SeqCst);
         let already = {
             let mut g = self.status.lock().unwrap_or_else(|e| e.into_inner());
             let was = matches!(*g, Some(ConversationStatus::Finished));
@@ -408,6 +411,18 @@ pub struct SessionAgentTask {
 }
 
 impl SessionAgentTask {
+    /// Snapshot the model before a subsequent turn or config switch can change it.
+    pub fn title_generator(&self) -> Option<Arc<dyn aionui_session::TitleGenerator>> {
+        if !self.runtime.title_reply_succeeded.load(Ordering::SeqCst) {
+            return None;
+        }
+        let model = self
+            .runtime
+            .model_override()
+            .or_else(|| self.backend.capabilities().current_model);
+        self.backend.title_generator(model)
+    }
+
     /// Build a task around an already-opened `SessionBackend` and start the
     /// event-translation pump. `agent_type` is `AgentType::Acp` for claude/codex
     /// (they present as the ACP family to the rest of the app).
@@ -488,6 +503,7 @@ impl SessionAgentTask {
             tx,
             last_activity_ms: AtomicI64::new(now_ms()),
             live_background_tasks: std::sync::atomic::AtomicUsize::new(0),
+            title_reply_succeeded: std::sync::atomic::AtomicBool::new(false),
             status: std::sync::Mutex::new(None),
             session_id: std::sync::Mutex::new(None),
             mode_override: std::sync::Mutex::new(None),
@@ -1824,6 +1840,7 @@ pub async fn build_antigravity_instance(
     };
 
     let mut session_config = SessionConfig {
+        managed_titles: true,
         cwd: Some(workspace.clone()),
         model,
         mode,
@@ -1960,6 +1977,7 @@ pub async fn build_session_instance(
     };
 
     let mut session_config = SessionConfig {
+        managed_titles: true,
         cwd: Some(workspace.clone()),
         model,
         mode,
@@ -3199,8 +3217,19 @@ fn spawn_event_pump(
 
             // Drive the coarse status off the turn-boundary events so `status()`
             // reflects running/finished (the app gates the sidebar spinner on it).
+            if let SessionEvent::TurnResult { is_error, outcome, .. } = &env.event {
+                runtime.title_reply_succeeded.store(
+                    !*is_error
+                        && !matches!(
+                            outcome,
+                            aionui_session::TurnOutcome::Cancelled { .. } | aionui_session::TurnOutcome::Failed
+                        ),
+                    Ordering::SeqCst,
+                );
+            }
             match &env.event {
                 SessionEvent::TurnStarted { .. } => {
+                    runtime.title_reply_succeeded.store(false, Ordering::SeqCst);
                     runtime.set_status(ConversationStatus::Running);
                     // New turn: the prior turn's terminal no longer applies.
                     terminal_result_seen = false;
@@ -3230,6 +3259,9 @@ fn spawn_event_pump(
                     open_tools.remove(tool_use_id);
                 }
                 SessionEvent::TurnResult { .. } | SessionEvent::Detached { .. } if !suppress_intermediate_finish => {
+                    if matches!(env.event, SessionEvent::Detached { .. }) {
+                        runtime.title_reply_succeeded.store(false, Ordering::SeqCst);
+                    }
                     // A real (unsuppressed) terminal settles any owed launch Finish —
                     // its own Finish/Error closes the turn.
                     finish_suppressed_pending = false;
@@ -7513,6 +7545,55 @@ mod pump_tests {
             AgentStreamEvent::AcpContextUsage(_) => "usage",
             AgentStreamEvent::SegmentBreak => "SegmentBreak",
             _ => "other",
+        }
+    }
+
+    #[tokio::test]
+    async fn native_cancelled_finish_is_ineligible_for_title_generation() {
+        for (outcome, expected) in [
+            (aionui_session::TurnOutcome::EndTurn, true),
+            (
+                aionui_session::TurnOutcome::Cancelled {
+                    reason: aionui_session::CancelReason::UserCancel,
+                },
+                false,
+            ),
+        ] {
+            let gate = Arc::new(tokio::sync::Notify::new());
+            let backend = Arc::new(GatedScriptBackend {
+                script: vec![
+                    env(SessionEvent::TurnStarted { epoch: 1 }),
+                    env(SessionEvent::TurnResult {
+                        is_error: false,
+                        api_error_status: None,
+                        result_text: "Response".into(),
+                        epoch: 1,
+                        outcome,
+                    }),
+                ],
+                gate: gate.clone(),
+                caps: Capabilities::default(),
+            });
+            let task = SessionAgentTask::new(
+                AgentType::Acp,
+                "conv-1".into(),
+                "user-1".into(),
+                "/w".into(),
+                backend,
+                None,
+            );
+            let mut rx = crate::agent_task::IAgentTask::subscribe(task.as_ref());
+            gate.notify_one();
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while let Ok(event) = rx.recv().await {
+                    if matches!(event, AgentStreamEvent::Finish(_)) {
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(task.runtime.title_reply_succeeded.load(Ordering::SeqCst), expected);
         }
     }
 

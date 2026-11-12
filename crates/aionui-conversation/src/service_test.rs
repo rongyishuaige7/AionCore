@@ -271,6 +271,29 @@ async fn repo_messages_asc(repo: &Arc<MockRepo>, conv_id: &str, limit: u32) -> V
 
 #[async_trait::async_trait]
 impl IConversationRepository for MockRepo {
+    async fn update_agent_title(
+        &self,
+        user_id: &str,
+        expected: &ConversationRow,
+        title: &str,
+    ) -> Result<bool, aionui_db::DbError> {
+        let mut rows = self.rows.lock().unwrap();
+        let Some(row) = rows.iter_mut().find(|r| r.user_id == user_id && r.id == expected.id) else {
+            return Ok(false);
+        };
+        if row.name_source.as_deref() == Some("user")
+            || row.name != expected.name
+            || row.updated_at != expected.updated_at
+            || row.name_source != expected.name_source
+            || row.name == title
+        {
+            return Ok(false);
+        }
+        row.name = title.into();
+        row.name_source = Some("agent".into());
+        Ok(true)
+    }
+
     async fn get(&self, user_id: &str, id: &str) -> Result<Option<ConversationRow>, aionui_db::DbError> {
         let rows = self.rows.lock().unwrap();
         Ok(rows.iter().find(|r| r.user_id == user_id && r.id == id).cloned())
@@ -3872,12 +3895,16 @@ impl IWorkerTaskManager for MockTaskManagerWithWorkspace {
 
 struct ScriptedAgent {
     conversation_id: String,
+    workspace_override: Option<String>,
     agent_type: AgentType,
     status: Option<ConversationStatus>,
     event_tx: broadcast::Sender<AgentStreamEvent>,
     scripts: Mutex<VecDeque<Vec<AgentStreamEvent>>>,
     sent_contents: Mutex<Vec<String>>,
     send_error: Option<AgentSendError>,
+    title_generator: Option<Arc<dyn aionui_session::TitleGenerator>>,
+    title_generator_requests: AtomicUsize,
+    cancel_runtime: Option<Arc<crate::runtime_state::ConversationRuntimeStateService>>,
 }
 
 impl ScriptedAgent {
@@ -3885,12 +3912,16 @@ impl ScriptedAgent {
         let (event_tx, _) = broadcast::channel(64);
         Self {
             conversation_id: conversation_id.to_owned(),
+            workspace_override: None,
             agent_type: AgentType::Acp,
             status: Some(ConversationStatus::Finished),
             event_tx,
             scripts: Mutex::new(VecDeque::from(scripts)),
             sent_contents: Mutex::new(vec![]),
             send_error: None,
+            title_generator: None,
+            title_generator_requests: AtomicUsize::new(0),
+            cancel_runtime: None,
         }
     }
 
@@ -3925,7 +3956,7 @@ impl IAgentTask for ScriptedAgent {
     }
 
     fn workspace(&self) -> &str {
-        "/tmp/test"
+        self.workspace_override.as_deref().unwrap_or("/tmp/test")
     }
 
     fn status(&self) -> Option<ConversationStatus> {
@@ -3941,6 +3972,9 @@ impl IAgentTask for ScriptedAgent {
     }
 
     async fn send_message(&self, data: SendMessageData) -> Result<(), AgentSendError> {
+        if let Some(state) = &self.cancel_runtime {
+            state.mark_cancelling(&self.conversation_id);
+        }
         self.sent_contents.lock().unwrap().push(data.content);
         let script = self
             .scripts
@@ -3966,7 +4000,150 @@ impl IAgentTask for ScriptedAgent {
     }
 }
 
-impl IMockAgent for ScriptedAgent {}
+impl IMockAgent for ScriptedAgent {
+    fn title_generator(&self) -> Option<Arc<dyn aionui_session::TitleGenerator>> {
+        self.title_generator_requests.fetch_add(1, Ordering::SeqCst);
+        self.title_generator.clone()
+    }
+}
+
+#[derive(Default)]
+struct TitleSpy(Mutex<Vec<String>>);
+#[async_trait::async_trait]
+impl aionui_session::TitleGenerator for TitleSpy {
+    async fn generate(&self, description: &str) -> Result<String, aionui_session::BackendError> {
+        let count = {
+            let mut prompts = self.0.lock().unwrap();
+            prompts.push(description.into());
+            prompts.len()
+        };
+        // A real model returns after completion has changed updated_at.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        Ok(format!("登录修复进展 {count}"))
+    }
+}
+
+#[tokio::test]
+async fn orchestrator_summarizes_each_reply_in_an_existing_conversation() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _, repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let spy = Arc::new(TitleSpy::default());
+    let mut agent = ScriptedAgent::new(
+        &conv.id,
+        vec![
+            vec![
+                AgentStreamEvent::Text(TextEventData {
+                    content: "OAuth 回调已修复".into(),
+                }),
+                AgentStreamEvent::Finish(FinishEventData::default()),
+            ],
+            vec![
+                AgentStreamEvent::Text(TextEventData {
+                    content: "单点登录回归完成".into(),
+                }),
+                AgentStreamEvent::Finish(FinishEventData::default()),
+            ],
+        ],
+    );
+    agent.title_generator = Some(spy.clone());
+    agent.workspace_override = Some(ensure_test_workspace_path());
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(Arc::new(agent)));
+    for turn in 1..=2 {
+        let outcome = svc
+            .run_agent_turn(ConversationAgentTurnRequest {
+                user_id: "user_1".into(),
+                conversation_id: conv.id.clone(),
+                content: "继续验证登录".into(),
+                files: vec![],
+                inject_skills: vec![],
+                required_runtime_mode: None,
+                persist_user_message: true,
+                user_message_hidden: false,
+                on_started: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.status,
+            ConversationAgentTurnStatus::Completed,
+            "reply {turn} failed: {:?}",
+            outcome.error_message
+        );
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if repo.get("user_1", &conv.id).await.unwrap().unwrap().name == format!("登录修复进展 {turn}") {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    let prompts = spy.0.lock().unwrap();
+    assert_eq!(prompts.len(), 2);
+    assert!(prompts[0].contains("OAuth 回调已修复"));
+    assert!(prompts[1].contains("单点登录回归完成"));
+}
+
+#[tokio::test]
+async fn orchestrator_does_not_summarize_error_empty_or_cancelled_replies() {
+    for scenario in ["error", "empty", "cancelled"] {
+        let task_mgr = Arc::new(MockTaskManager::new());
+        let (svc, _, _) = make_service_with_mock_task_manager(task_mgr.clone());
+        let conv = svc.create("user_1", make_create_req()).await.unwrap();
+        let spy = Arc::new(TitleSpy::default());
+        let mut script = vec![];
+        if scenario != "empty" {
+            script.push(AgentStreamEvent::Text(TextEventData {
+                content: "Partial answer".into(),
+            }));
+        }
+        if scenario == "error" {
+            script.push(AgentStreamEvent::Error(ErrorEventData::legacy("test failure", None)));
+        } else {
+            script.push(AgentStreamEvent::Finish(FinishEventData::default()));
+        }
+        let mut agent = ScriptedAgent::new(&conv.id, vec![script]);
+        agent.title_generator = Some(spy.clone());
+        agent.workspace_override = Some(ensure_test_workspace_path());
+        if scenario == "cancelled" {
+            agent.cancel_runtime = Some(svc.runtime_state());
+        }
+        let agent = Arc::new(agent);
+        task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent.clone()));
+        let outcome = svc
+            .run_agent_turn(ConversationAgentTurnRequest {
+                user_id: "user_1".into(),
+                conversation_id: conv.id.clone(),
+                content: "test".into(),
+                files: vec![],
+                inject_skills: vec![],
+                required_runtime_mode: None,
+                persist_user_message: true,
+                user_message_hidden: false,
+                on_started: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(agent.sent_contents().len(), 1, "{scenario} must reach the agent");
+        assert_eq!(
+            outcome.status,
+            if scenario == "error" {
+                ConversationAgentTurnStatus::Failed
+            } else {
+                ConversationAgentTurnStatus::Completed
+            }
+        );
+        assert_eq!(
+            agent.title_generator_requests.load(Ordering::SeqCst),
+            0,
+            "{scenario} must not schedule title generation"
+        );
+        assert!(spy.0.lock().unwrap().is_empty(), "{scenario} must not generate a title");
+    }
+}
 
 // ── send_message tests ──────────────────────────────────────────
 

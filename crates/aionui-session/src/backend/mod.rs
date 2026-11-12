@@ -11,6 +11,7 @@
 mod acp_conn;
 mod antigravity;
 mod claude_conn;
+mod claude_title;
 mod cli_version;
 mod codex_conn;
 mod codex_title;
@@ -79,6 +80,11 @@ pub(crate) fn handshake_budget() -> std::time::Duration {
 /// frame writer (a microsecond byte-frame lock, not a per-turn lock).
 #[async_trait::async_trait]
 pub trait SessionBackend: Send + Sync {
+    /// Freeze an isolated title runner on the just-completed turn's model.
+    fn title_generator(&self, _model: Option<String>) -> Option<std::sync::Arc<dyn crate::TitleGenerator>> {
+        None
+    }
+
     /// Dispatch a command. FAST: returns a receipt the instant the adapter has
     /// accepted+queued it on the wire — does NOT block on turn completion (the
     /// turn flows up `events()`). Capability-gated: an unsupported command
@@ -260,6 +266,9 @@ pub struct SessionInit {
 /// `SessionConfig: Eq` (verified — no `HashSet`/`BTreeSet`/`==` use).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SessionConfig {
+    /// The conversation domain schedules titles after complete persisted turns.
+    /// Disable the library's legacy one-shot naming in that mode.
+    pub managed_titles: bool,
     pub cwd: Option<String>,
     pub model: Option<String>,
     pub mode: Option<String>,

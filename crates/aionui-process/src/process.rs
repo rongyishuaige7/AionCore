@@ -162,6 +162,14 @@ impl ManagedProcess {
     /// stderr-drain + exit-monitor tasks. `extra_env` is applied per-child via
     /// the Builder (IC-5: never mutates global env).
     pub async fn spawn(spec: CommandSpec, extra_env: &[(String, String)]) -> Result<Self, ProcessError> {
+        Self::spawn_with_stderr_logging(spec, extra_env, true).await
+    }
+
+    pub(crate) async fn spawn_with_stderr_logging(
+        spec: CommandSpec,
+        extra_env: &[(String, String)],
+        log_stderr: bool,
+    ) -> Result<Self, ProcessError> {
         let cwd = match spec.cwd.as_deref() {
             Some(c) => Some(prepare_command_cwd(c)?),
             None => None,
@@ -234,7 +242,7 @@ impl ManagedProcess {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 let trimmed = line.trim();
-                if !trimmed.is_empty() {
+                if log_stderr && !trimmed.is_empty() {
                     warn!(pid, stderr = trimmed, "subprocess stderr");
                 }
                 let mut buf = buf_clone.lock().await;
@@ -648,6 +656,49 @@ pub(crate) mod job_windows {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn quiet_registered_spawn_retains_diagnostics_and_process_lifecycle() {
+        use crate::{FileRegistryStore, RealSpawner, Spawner};
+        let temp = tempfile::tempdir().unwrap();
+        let spawner = RealSpawner::new(
+            Arc::new(FileRegistryStore::new(temp.path())),
+            uuid::Uuid::new_v4(),
+            "quiet-test",
+        );
+        let process = spawner
+            .spawn_quiet(
+                CommandSpec {
+                    command: "/bin/sh".into(),
+                    // Keep stderr open until the assertion; the exit monitor
+                    // intentionally aborts the drain when the process exits.
+                    args: vec!["-c".into(), "printf 'test diagnostic\\n' >&2; read -r reply".into()],
+                    env: vec![],
+                    cwd: Some(temp.path().to_string_lossy().into()),
+                },
+                &[],
+                "test-owner",
+            )
+            .await
+            .unwrap();
+        let diagnostic = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let tail = process.peek_stderr_tail(1).await;
+                if !tail.is_empty() {
+                    break tail;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(diagnostic.trim(), "test diagnostic");
+        process.kill(std::time::Duration::from_millis(50)).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), process.wait_for_exit())
+            .await
+            .unwrap();
+    }
 
     /// Regression pin for Sentry ELECTRON-3PP / upstream #410: a workspace with
     /// whitespace in ANY path segment (iCloud Drive lives under

@@ -796,6 +796,13 @@ impl AcpAgentManager {
         self.session.read().await.model_info().cloned()
     }
 
+    pub(crate) async fn title_generator(&self) -> Arc<dyn aionui_session::TitleGenerator> {
+        Arc::new(crate::title::AcpTitleGenerator {
+            command: self.params.command_spec.clone(),
+            model: self.model().await.map(|m| m.current_model_id).filter(|m| !m.is_empty()),
+        })
+    }
+
     /// Cached context usage info from the ACP backend.
     pub(crate) async fn usage(&self) -> Option<UsageUpdate> {
         self.session.read().await.context_usage().cloned()

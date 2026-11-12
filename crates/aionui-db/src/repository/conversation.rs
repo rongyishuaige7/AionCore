@@ -30,6 +30,19 @@ pub trait IConversationRepository: Send + Sync {
     /// Partially updates a conversation. Returns `DbError::NotFound` if ID is missing for the user.
     async fn update(&self, user_id: &str, id: &str, updates: &ConversationRowUpdate) -> Result<(), DbError>;
 
+    /// Atomically rename only an unchanged, automatically named conversation.
+    /// A manual rename or newly persisted activity invalidates the snapshot.
+    async fn update_agent_title(
+        &self,
+        _user_id: &str,
+        _expected: &ConversationRow,
+        _title: &str,
+    ) -> Result<bool, DbError> {
+        Err(DbError::Init(
+            "Atomic agent titles are not implemented by this repository".into(),
+        ))
+    }
+
     /// Deletes a conversation (messages cascade via FK).
     /// Returns `DbError::NotFound` if ID is missing for the user.
     async fn delete(&self, user_id: &str, id: &str) -> Result<(), DbError>;

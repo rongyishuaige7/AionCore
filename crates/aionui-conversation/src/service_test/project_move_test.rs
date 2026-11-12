@@ -185,7 +185,7 @@ async fn moves_the_runtime_and_binding_while_preserving_history_pin_and_skills()
     assert_eq!(moved.project_id.as_deref(), Some(f.target.as_str()));
     assert_eq!(
         f.manager.built_workspaces.lock().unwrap().as_slice(),
-        [f.destination.clone()]
+        std::slice::from_ref(&f.destination)
     );
     let row = f.repo.get("user_1", "moving").await.unwrap().unwrap();
     assert!(row.pinned);

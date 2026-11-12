@@ -341,6 +341,29 @@ impl IConversationRepository for SqliteConversationRepository {
         Ok(())
     }
 
+    async fn update_agent_title(
+        &self,
+        user_id: &str,
+        expected: &ConversationRow,
+        title: &str,
+    ) -> Result<bool, DbError> {
+        let result = sqlx::query(
+            "UPDATE conversations SET name = ?, name_source = 'agent' \
+             WHERE id = ? AND user_id = ? AND name = ? AND updated_at = ? \
+             AND name_source IS ? AND COALESCE(name_source, '') != 'user' AND name != ?",
+        )
+        .bind(title)
+        .bind(&expected.id)
+        .bind(user_id)
+        .bind(&expected.name)
+        .bind(expected.updated_at)
+        .bind(&expected.name_source)
+        .bind(title)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     async fn update(&self, user_id: &str, id: &str, updates: &ConversationRowUpdate) -> Result<(), DbError> {
         // Build dynamic SET clause
         let mut set_parts: Vec<String> = Vec::new();
@@ -1745,6 +1768,68 @@ mod tests {
         let found = repo.get(&conv.user_id, &conv.id).await.unwrap().unwrap();
         assert_eq!(found.name, "Updated Name");
         assert!(found.updated_at >= conv.updated_at);
+    }
+
+    #[tokio::test]
+    async fn agent_title_is_atomic_scoped_and_does_not_reorder_activity() {
+        let (repo, _db) = setup().await;
+        let conv = sample_conversation(SYSTEM_USER_ID);
+        repo.create(&conv).await.unwrap();
+        assert!(!repo.update_agent_title("another-user", &conv, "Denied").await.unwrap());
+        assert!(
+            repo.update_agent_title(SYSTEM_USER_ID, &conv, "First summary")
+                .await
+                .unwrap()
+        );
+        let first = repo.get(SYSTEM_USER_ID, &conv.id).await.unwrap().unwrap();
+        assert_eq!(first.updated_at, conv.updated_at);
+        assert_eq!(first.name_source.as_deref(), Some("agent"));
+        assert!(
+            !repo
+                .update_agent_title(SYSTEM_USER_ID, &conv, "Stale summary")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !repo
+                .update_agent_title(SYSTEM_USER_ID, &first, "First summary")
+                .await
+                .unwrap()
+        );
+        assert!(
+            repo.update_agent_title(SYSTEM_USER_ID, &first, "Second summary")
+                .await
+                .unwrap()
+        );
+        let second = repo.get(SYSTEM_USER_ID, &conv.id).await.unwrap().unwrap();
+        repo.update(
+            SYSTEM_USER_ID,
+            &conv.id,
+            &ConversationRowUpdate {
+                name: Some("Manual title".into()),
+                name_source: Some("user".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            !repo
+                .update_agent_title(SYSTEM_USER_ID, &second, "Must not overwrite")
+                .await
+                .unwrap()
+        );
+        let manual = repo.get(SYSTEM_USER_ID, &conv.id).await.unwrap().unwrap();
+        assert!(
+            !repo
+                .update_agent_title(SYSTEM_USER_ID, &manual, "Still denied")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            repo.get(SYSTEM_USER_ID, &conv.id).await.unwrap().unwrap().name,
+            "Manual title"
+        );
     }
 
     #[tokio::test]

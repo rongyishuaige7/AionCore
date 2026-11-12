@@ -920,7 +920,7 @@ impl ClaudeSessionBackend {
         // first-turn title generation (completed by a non-empty title reply,
         // retried otherwise — see TitleGenState).
         let title_gen = Arc::new(TitleGenState {
-            pending: std::sync::atomic::AtomicBool::new(fresh),
+            pending: std::sync::atomic::AtomicBool::new(fresh && !config.managed_titles),
             attempts: std::sync::atomic::AtomicU32::new(0),
             inflight: std::sync::Mutex::new(None),
             description: std::sync::Mutex::new(None),
@@ -3051,6 +3051,21 @@ fn sniff_task(
 
 #[async_trait::async_trait]
 impl SessionBackend for ClaudeSessionBackend {
+    fn title_generator(&self, model: Option<String>) -> Option<Arc<dyn crate::TitleGenerator>> {
+        Some(Arc::new(super::claude_title::ClaudeTitleGenerator {
+            spawner: self.wake.spawner.clone(),
+            command: super::claude_title::command(
+                &SessionConfig {
+                    cwd: self.wake.cwd.clone(),
+                    spawn_env: self.wake.env.clone(),
+                    cli_program: self.wake.cli_program.clone(),
+                    ..Default::default()
+                },
+                model,
+            ),
+        }))
+    }
+
     /// Force-kill path (`UserCancelTimeout`): delegate to the suspend
     /// controller's unconditional teardown (abort reader → group-kill the
     /// claude CLI process tree), so the process dies even while an orchestrator

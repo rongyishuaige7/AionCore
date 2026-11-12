@@ -39,6 +39,9 @@ mod error;
 mod event;
 mod reducer;
 mod state;
+mod title;
+
+pub use title::{TITLE_INSTRUCTIONS, TitleGenerator};
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing;

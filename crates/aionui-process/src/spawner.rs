@@ -28,6 +28,17 @@ pub trait Spawner: Send + Sync {
         extra_env: &[(String, String)],
         opaque_owner_tag: &str,
     ) -> Result<Arc<ManagedProcess>, ProcessError>;
+
+    /// Spawn without logging stderr payloads. Production implementations that
+    /// log stderr must override this; in-memory test spawners may delegate.
+    async fn spawn_quiet(
+        &self,
+        spec: CommandSpec,
+        extra_env: &[(String, String)],
+        opaque_owner_tag: &str,
+    ) -> Result<Arc<ManagedProcess>, ProcessError> {
+        self.spawn(spec, extra_env, opaque_owner_tag).await
+    }
 }
 
 /// Production spawner backed by the file registry. Holds this run's identity
@@ -56,9 +67,30 @@ impl<S: RegistryStore + 'static> Spawner for RealSpawner<S> {
         extra_env: &[(String, String)],
         opaque_owner_tag: &str,
     ) -> Result<Arc<ManagedProcess>, ProcessError> {
+        self.spawn_registered(spec, extra_env, opaque_owner_tag, true).await
+    }
+
+    async fn spawn_quiet(
+        &self,
+        spec: CommandSpec,
+        extra_env: &[(String, String)],
+        opaque_owner_tag: &str,
+    ) -> Result<Arc<ManagedProcess>, ProcessError> {
+        self.spawn_registered(spec, extra_env, opaque_owner_tag, false).await
+    }
+}
+
+impl<S: RegistryStore + 'static> RealSpawner<S> {
+    async fn spawn_registered(
+        &self,
+        spec: CommandSpec,
+        extra_env: &[(String, String)],
+        opaque_owner_tag: &str,
+        log_stderr: bool,
+    ) -> Result<Arc<ManagedProcess>, ProcessError> {
         // Spawn first — the child is already its own process-group leader
         // (Builder process_group(0)), so it is contained from birth.
-        let proc = ManagedProcess::spawn(spec, extra_env).await?;
+        let proc = ManagedProcess::spawn_with_stderr_logging(spec, extra_env, log_stderr).await?;
         let pid = proc.pid();
         let pgid = proc.process_group_id();
 

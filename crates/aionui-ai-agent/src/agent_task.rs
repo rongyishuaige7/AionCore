@@ -111,6 +111,9 @@ pub trait IAgentTask: Send + Sync {
 #[cfg(any(test, feature = "test-support"))]
 #[async_trait::async_trait]
 pub trait IMockAgent: IAgentTask {
+    fn title_generator(&self) -> Option<Arc<dyn aionui_session::TitleGenerator>> {
+        None
+    }
     fn get_confirmations(&self) -> Vec<Confirmation> {
         Vec::new()
     }
@@ -212,6 +215,16 @@ pub enum AgentInstance {
 }
 
 impl AgentInstance {
+    /// Snapshot an isolated title runner on the currently selected model.
+    pub async fn title_generator(&self) -> Option<Arc<dyn aionui_session::TitleGenerator>> {
+        match self {
+            Self::Acp(m) => Some(m.title_generator().await),
+            Self::Aionrs(m) => Some(m.title_generator()),
+            Self::Session(m) => m.title_generator(),
+            #[cfg(any(test, feature = "test-support"))]
+            Self::Mock(m) => m.title_generator(),
+        }
+    }
     /// Common `IAgentTask` view, regardless of variant.
     pub fn as_task(&self) -> &dyn IAgentTask {
         match self {

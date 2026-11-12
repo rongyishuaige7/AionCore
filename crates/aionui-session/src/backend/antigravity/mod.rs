@@ -18,6 +18,7 @@ pub(crate) const CODE_STEPS_FAILED: &str = "ANTIGRAVITY_STEPS_FAILED";
 mod conn;
 mod models;
 mod skills;
+mod title;
 mod translate;
 mod wire;
 

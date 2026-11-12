@@ -353,6 +353,8 @@ pub struct ConversationService {
     background_watchers:
         Arc<std::sync::Mutex<std::collections::HashMap<String, crate::background_stream::BackgroundWatcherHandle>>>,
 
+    pub(crate) titles: crate::title_service::ConversationTitles,
+
     // Repos for conversation, acp_session and agent_metadata access.
     conversation_repo: Arc<dyn IConversationRepository>,
     agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
@@ -411,7 +413,9 @@ impl ConversationService {
         agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
         acp_session_repo: Arc<dyn IAcpSessionRepository>,
     ) -> Self {
+        let titles = crate::title_service::ConversationTitles::new(conversation_repo.clone(), broadcaster.clone());
         Self {
+            titles,
             workspace_root,
             broadcaster,
             skill_resolver,
@@ -721,6 +725,11 @@ impl ConversationService {
             runtime_state: Arc::clone(&self.runtime_state),
             title_only,
             pending_started_ttl: crate::background_stream::PENDING_STARTED_TTL,
+            titles: match agent {
+                AgentInstance::Session(task) => Some((self.titles.clone(), Arc::downgrade(task))),
+                _ => None,
+            },
+            managed_titles: true,
         };
         let rx = agent.subscribe();
         let join = tokio::spawn(watcher.run(rx));
@@ -6004,6 +6013,18 @@ pub(crate) async fn apply_agent_title(
         debug!(conversation_id, consumer, "agent title dropped: conversation not found");
         return Ok(false);
     };
+    persist_agent_title(repo, broadcaster, user_id, &existing, title, consumer).await
+}
+
+pub(crate) async fn persist_agent_title(
+    repo: &Arc<dyn IConversationRepository>,
+    broadcaster: &Arc<dyn EventBroadcaster>,
+    user_id: &str,
+    existing: &ConversationRow,
+    title: &str,
+    consumer: &str,
+) -> Result<bool, ConversationError> {
+    let conversation_id = existing.id.as_str();
     if existing.name_source.as_deref() == Some("user") {
         debug!(conversation_id, consumer, "agent title dropped: name is user-owned");
         return Ok(false);
@@ -6012,17 +6033,9 @@ pub(crate) async fn apply_agent_title(
         return Ok(false);
     }
 
-    repo.update(
-        user_id,
-        conversation_id,
-        &ConversationRowUpdate {
-            name: Some(title.to_string()),
-            name_source: Some("agent".to_string()),
-            updated_at: Some(now_ms()),
-            ..Default::default()
-        },
-    )
-    .await?;
+    if !repo.update_agent_title(user_id, existing, title).await? {
+        return Ok(false);
+    }
 
     let payload = ConversationNameUpdatedPayload {
         conversation_id: conversation_id.to_string(),

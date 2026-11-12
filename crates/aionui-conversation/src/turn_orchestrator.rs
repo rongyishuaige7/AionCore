@@ -79,6 +79,7 @@ struct TurnAttemptInput {
 }
 
 struct TurnAttemptResult {
+    agent: aionui_ai_agent::AgentInstance,
     outcome: RelayOutcome,
     summary: TurnAttemptSummary,
     agent_type: AgentType,
@@ -292,6 +293,7 @@ impl ConversationTurnOrchestrator {
                 self.service.conversation_repo().clone(),
                 self.service.broadcaster().clone(),
             )
+            .with_managed_titles(true)
             .with_skill_resolver(self.service.skill_resolver())
             .with_allowed_skill_names(input.allowed_skill_names.clone())
             .with_runtime_state(Arc::clone(&runtime_state))
@@ -460,6 +462,7 @@ impl ConversationTurnOrchestrator {
             summary: aggregate_summary,
             agent_type: agent.agent_type(),
             backend,
+            agent,
         })
     }
 
@@ -483,6 +486,7 @@ impl ConversationTurnOrchestrator {
         let mut final_error_message;
         let mut auto_retry_allowed = false;
         let mut auth_failure = false;
+        let mut title_generator = None;
 
         info!(conversation_id = %conv_id, turn_id = %turn_id, "conversation turn orchestrator started");
 
@@ -522,6 +526,16 @@ impl ConversationTurnOrchestrator {
             let lifecycle = runtime_state.lifecycle_for(&conv_id);
             if !attempt_result.outcome.terminal.is_error() {
                 final_error_message = None;
+                if matches!(
+                    attempt_result.outcome.terminal,
+                    crate::stream_relay::RelayTerminal::Finish
+                ) && attempt_result.summary.persisted_assistant_output
+                    && !attempt_result.summary.was_cancelled
+                    && !attempt_result.summary.needs_auth
+                    && lifecycle == RuntimeLifecycleState::Active
+                {
+                    title_generator = attempt_result.agent.title_generator().await;
+                }
                 if replayed {
                     info!(
                         conversation_id = %conv_id,
@@ -655,6 +669,15 @@ impl ConversationTurnOrchestrator {
         self.service
             .complete_released_turn(&input.user_id, &conv_id, &turn_id, was_deleting)
             .await;
+
+        // Completion updates activity recency. Snapshot only after that write,
+        // otherwise our own completion would invalidate every slow summary.
+        if !was_deleting && let Some(generator) = title_generator {
+            self.service
+                .titles
+                .schedule(&input.user_id, &conv_id, &turn_id, generator)
+                .await;
+        }
 
         ConversationTurnResult {
             status: if final_failed {

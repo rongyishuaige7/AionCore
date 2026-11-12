@@ -815,3 +815,52 @@ to keep ANSI codes out of captured output.
 Do NOT manually re-implement these behaviours with raw
 `tokio::process::Command` — the centralised builder is the one place to
 update policies (e.g. future `CARGO_*` cleanup, sandbox flags).
+
+### Continuous Conversation Titles
+
+After a successful reply has been persisted, the conversation orchestrator (or
+the direct-CLI background watcher) schedules an isolated title summary. This
+also applies to resumed conversations and later replies. Error, cancelled,
+disconnected and empty replies do not schedule summaries. Legacy native title
+events are ignored on these managed paths, so they cannot overwrite a summary.
+
+The agent exposes a frozen `TitleGenerator`: Claude and Codex reuse the resolved
+binary/environment and selected model in a separate subprocess; ACP uses a
+separate session and selects the advertised model; Aionrs reuses its resolved
+provider transport and model. Antigravity uses an independent plan/sandbox call.
+No title prompt/result enters the user's message stream or resume anchor.
+Claude's non-persistent print flags are verified by local `claude --help`
+(2026-11-11). Codex's ephemeral/read-only/approval policy fields are verified by
+`codex app-server generate-json-schema` output at
+`/tmp/aion-title-codex-schema/v2/ThreadStartParams.json`. ACP framing is based on
+`agent-client-protocol-schema-1.5.0/src/v1/{agent,client}.rs`; client filesystem
+and terminal capabilities are disabled, MCP is empty, and reverse requests or
+tool notifications abort the title call. Antigravity flags are verified by local
+`agy --help` (2026-11-11). ACP and Antigravity may keep their private title session
+in native CLI history; their protocols offer no verified ephemeral equivalent.
+
+Input is bounded recent visible user/assistant text plus the current title;
+thinking, tools, hidden prompts and incomplete/error messages are excluded.
+The task is asynchronous, with two active runs and at most 64 queued runs across
+the process, a 75-second deadline, per-conversation revision/deduplication, and a
+bounded recent-turn cache. Superseded queued jobs are skipped. Failures retain
+the current title and allow a later reply to retry. Logs record identifiers,
+lengths and outcome categories, never context or provider response bodies.
+Title subprocesses use the quiet spawn path: stderr remains bounded and
+available for diagnostics but is not copied into production logs. The normal
+spawn path retains its existing logging and containment/registry semantics.
+
+Saving uses a user-scoped SQL compare-and-set against the original name,
+name source and activity timestamp. Manual names (`name_source = user`) are
+locked; newer activity invalidates an in-flight summary. Unchanged titles emit
+no events and renames do not alter activity recency. Successful changes emit the
+existing `conversation.nameUpdated` and `conversation.listChanged` events used
+by the desktop sidebar and active conversation.
+
+Scope excludes settings/UI additions, model/provider changes, history migration,
+and changing existing manual-name ownership. Verification covers multi-reply
+updates, persisted assistant context, manual/stale-result races, duplicate/invalid
+results, provider failure, tool refusal, model/config forwarding and DB ownership.
+Ignored live title tests exercise installed agents separately; `claude-pro` and
+`claude-pro2` are deliberately excluded. No service restart or deployment is
+required to review the change; it becomes active when the new backend is run.

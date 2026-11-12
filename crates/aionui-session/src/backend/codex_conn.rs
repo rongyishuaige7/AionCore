@@ -151,7 +151,7 @@ impl BackendConnection for CodexConnection {
         // CommandSpec — same codex install, env and cwd, hence the same
         // credentials — but never onto this session's connection.
         let title_gen = Arc::new(TitleGen::new(
-            matches!(&spec, SessionSpec::Fresh { .. }),
+            matches!(&spec, SessionSpec::Fresh { .. }) && !config.managed_titles,
             Arc::new(SpawnedTitleIo::new(self.spawner.clone(), title_cmd)),
         ));
         title_gen.set_model(config.model.clone());
@@ -3880,6 +3880,10 @@ fn extract_http_status_from_message(message: &str) -> Option<u64> {
 
 #[async_trait::async_trait]
 impl SessionBackend for CodexSessionBackend {
+    fn title_generator(&self, model: Option<String>) -> Option<Arc<dyn crate::TitleGenerator>> {
+        Some(self.reader_state.title_gen.generator(model))
+    }
+
     /// Force-kill path (`UserCancelTimeout`): delegate to the suspend
     /// controller's unconditional teardown (abort reader → group-kill the codex
     /// CLI process tree), so the process dies even while an orchestrator still

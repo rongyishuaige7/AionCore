@@ -45,9 +45,7 @@ pub(crate) struct TitleRequest {
 /// ~12.7k without — the remainder is tool definitions and environment context,
 /// a fixed cost of starting any codex thread), but it does keep the model on
 /// task instead of behaving like a coding agent.
-const TITLE_INSTRUCTIONS: &str = "You generate short titles for chat conversations. \
-Reply with ONLY the title: at most 6 words, no quotes, no trailing punctuation, \
-in the same language as the conversation.";
+const TITLE_INSTRUCTIONS: &str = crate::TITLE_INSTRUCTIONS;
 
 /// Hard deadline for the whole exchange. Measured end-to-end (spawn +
 /// initialize + one ephemeral turn): 4.5–6.5s, so this is generous headroom for
@@ -101,6 +99,10 @@ async fn run_exchange(io: &dyn AgentIo, req: &TitleRequest) -> Option<String> {
         // session_index entry, so this never pollutes `codex resume`.
         "ephemeral": true,
         "baseInstructions": TITLE_INSTRUCTIONS,
+        // Verified: generated v2/ThreadStartParams.json and its SandboxMode /
+        // AskForApproval definitions (codex app-server generate-json-schema).
+        "sandbox": "read-only",
+        "approvalPolicy": "never",
     });
     if let Some(model) = &req.model {
         params["model"] = json!(model);
@@ -163,15 +165,29 @@ async fn read_agent_message<R>(lines: &mut tokio::io::Lines<R>) -> Option<String
 where
     R: tokio::io::AsyncBufRead + Unpin,
 {
+    let mut title = None;
     while let Ok(Some(line)) = lines.next_line().await {
         let Ok(frame) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
-        if frame.get("method").and_then(Value::as_str) != Some("item/completed") {
+        let method = frame.get("method").and_then(Value::as_str).unwrap_or_default();
+        if frame.get("id").is_some() && (frame.get("method").is_some() || frame.get("error").is_some()) {
+            return None;
+        }
+        if method == "turn/completed" {
+            return (frame["params"]["turn"]["status"] == "completed")
+                .then_some(title)
+                .flatten();
+        }
+        if method != "item/completed" {
             continue;
         }
         let item = frame.get("params").and_then(|p| p.get("item"));
-        if item.and_then(|i| i.get("type")).and_then(Value::as_str) != Some("agentMessage") {
+        let kind = item.and_then(|i| i.get("type")).and_then(Value::as_str);
+        if !matches!(kind, Some("agentMessage" | "reasoning" | "userMessage")) {
+            return None;
+        }
+        if kind != Some("agentMessage") {
             continue;
         }
         let text = item
@@ -180,7 +196,7 @@ where
             .map(str::trim)
             .unwrap_or("");
         if !text.is_empty() {
-            return Some(text.to_string());
+            title = Some(text.to_string());
         }
     }
     None
@@ -231,12 +247,12 @@ impl TitleIoSource for SpawnedTitleIo {
     async fn open(&self) -> Option<Box<dyn AgentIo>> {
         match self
             .spawner
-            .spawn(self.command.clone(), &[], "aionui-session-title")
+            .spawn_quiet(self.command.clone(), &[], "aionui-session-title")
             .await
         {
             Ok(proc) => Some(Box::new(crate::adapter::ManagedProcessIo::new(proc))),
-            Err(e) => {
-                tracing::warn!(error = %e, "codex title process spawn failed");
+            Err(_) => {
+                tracing::warn!("codex title process spawn failed");
                 None
             }
         }
@@ -281,6 +297,13 @@ pub(crate) struct TitleGen {
 }
 
 impl TitleGen {
+    pub(crate) fn generator(&self, model: Option<String>) -> Arc<dyn crate::TitleGenerator> {
+        Arc::new(CodexTitleGenerator {
+            source: self.source.clone(),
+            model,
+        })
+    }
+
     pub(crate) fn new(fresh: bool, source: Arc<dyn TitleIoSource>) -> Self {
         Self {
             pending: AtomicBool::new(fresh),
@@ -412,10 +435,87 @@ impl TitleGen {
     }
 }
 
+struct CodexTitleGenerator {
+    source: Arc<dyn TitleIoSource>,
+    model: Option<String>,
+}
+
+#[async_trait::async_trait]
+impl crate::TitleGenerator for CodexTitleGenerator {
+    async fn generate(&self, description: &str) -> Result<String, crate::BackendError> {
+        let io = self
+            .source
+            .open()
+            .await
+            .ok_or_else(|| crate::BackendError::Transport("Codex title process could not start".into()))?;
+        generate_title(
+            io,
+            &TitleRequest {
+                description: description.to_owned(),
+                model: self.model.clone(),
+            },
+        )
+        .await
+        .ok_or_else(|| crate::BackendError::Transport("Codex title generation failed".into()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::testing::FakeAgentIo;
+
+    #[tokio::test]
+    #[ignore = "LIVE: real Codex title call"]
+    async fn title_live_codex() {
+        use crate::TitleGenerator;
+        let tmp = tempfile::tempdir().unwrap();
+        let spawner = Arc::new(aionui_process::RealSpawner::new(
+            Arc::new(aionui_process::FileRegistryStore::new(tmp.path())),
+            uuid::Uuid::now_v7(),
+            "title-live",
+        ));
+        let source = Arc::new(SpawnedTitleIo::new(
+            spawner,
+            aionui_common::CommandSpec {
+                command: "codex".into(),
+                args: vec!["app-server".into()],
+                env: Vec::new(),
+                cwd: Some(tmp.path().to_string_lossy().into()),
+            },
+        ));
+        let runner = CodexTitleGenerator {
+            source,
+            model: std::env::var("AION_TITLE_LIVE_MODEL").ok(),
+        };
+        let result = runner.generate("{\"current_title\":\"登录问题\",\"messages\":[{\"role\":\"user\",\"text\":\"修复登录跳转\"},{\"role\":\"assistant\",\"text\":\"已修复 OAuth 回调并完成回归测试\"}]}").await;
+        assert!(
+            result
+                .as_ref()
+                .is_ok_and(|title| !title.trim().is_empty() && title.chars().count() <= 80),
+            "live Codex title call failed: {result:?}"
+        );
+        println!("Codex title live: success");
+    }
+
+    #[tokio::test]
+    async fn cancelled_turn_discards_completed_agent_message() {
+        let frames = scripted_codex();
+        let frames = String::from_utf8(frames)
+            .unwrap()
+            .replace("\"status\":\"completed\"", "\"status\":\"interrupted\"");
+        assert!(
+            generate_title(
+                Box::new(FakeAgentIo::never_exits(frames.into_bytes())),
+                &TitleRequest {
+                    description: "test".into(),
+                    model: None
+                }
+            )
+            .await
+            .is_none()
+        );
+    }
 
     /// A source that replays scripted codex frames instead of spawning.
     struct ScriptedSource(std::sync::Mutex<Vec<Vec<u8>>>);
@@ -527,7 +627,7 @@ mod tests {
             "\n",
             r#"{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg_1","text":"Fix login bug","phase":"final_answer"},"threadId":"th-1","turnId":"t-1"}}"#,
             "\n",
-            r#"{"method":"turn/completed","params":{"threadId":"th-1"}}"#,
+            r#"{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"t-1","status":"completed"}}}"#,
             "\n",
         )
         .as_bytes()

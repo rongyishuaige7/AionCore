@@ -74,6 +74,11 @@ pub(crate) struct BackgroundStreamWatcher {
     /// Expiry for a pending `MessageLifecycle{Started}` (see
     /// [`PENDING_STARTED_TTL`]); injectable so tests can use a short bound.
     pub pending_started_ttl: std::time::Duration,
+    pub titles: Option<(
+        crate::title_service::ConversationTitles,
+        std::sync::Weak<aionui_ai_agent::session_agent::SessionAgentTask>,
+    )>,
+    pub managed_titles: bool,
 }
 
 impl BackgroundStreamWatcher {
@@ -148,15 +153,16 @@ impl BackgroundStreamWatcher {
                     .map(str::trim)
                     .filter(|t| !t.is_empty())
                 {
-                    if let Err(e) = crate::service::apply_agent_title(
-                        &self.repo,
-                        &self.broadcaster,
-                        &self.user_id,
-                        &self.conversation_id,
-                        title,
-                        "watcher",
-                    )
-                    .await
+                    if !self.managed_titles
+                        && let Err(e) = crate::service::apply_agent_title(
+                            &self.repo,
+                            &self.broadcaster,
+                            &self.user_id,
+                            &self.conversation_id,
+                            title,
+                            "watcher",
+                        )
+                        .await
                     {
                         warn!(
                             conversation_id = %self.conversation_id,
@@ -419,6 +425,7 @@ impl BackgroundStreamWatcher {
             self.repo.clone(),
             self.broadcaster.clone(),
         )
+        .with_managed_titles(self.managed_titles)
         .with_runtime_state(Arc::clone(&self.runtime_state))
         .with_persistence(self.persistence.clone());
 
@@ -464,6 +471,21 @@ impl BackgroundStreamWatcher {
                 },
             }
         };
+        if let Ok(ref outcome) = outcome
+            && matches!(outcome.terminal, crate::stream_relay::RelayTerminal::Finish)
+            && outcome.attempt.persisted_assistant_output
+            && !outcome.attempt.was_cancelled
+            && !outcome.attempt.needs_auth
+            && self.runtime_state.lifecycle_for(&self.conversation_id)
+                == crate::runtime_state::RuntimeLifecycleState::Active
+            && let Some((titles, agent)) = &self.titles
+            && let Some(agent) = agent.upgrade()
+            && let Some(generator) = agent.title_generator()
+        {
+            titles
+                .schedule(&self.user_id, &self.conversation_id, &turn_id, generator)
+                .await;
+        }
         match outcome {
             Ok(outcome) => info!(
                 conversation_id = %self.conversation_id,
@@ -572,6 +594,8 @@ mod tests {
             runtime_state: Arc::clone(&runtime_state),
             title_only,
             pending_started_ttl,
+            titles: None,
+            managed_titles: false,
         };
         let handle = tokio::spawn(watcher.run(tx.subscribe()));
         Rig {

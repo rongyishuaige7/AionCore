@@ -33,6 +33,7 @@ pub mod shared_kernel;
 pub mod skill_delivery_plan;
 pub mod task_manager;
 pub mod terminal;
+pub mod title;
 pub mod types;
 mod workflow_progress;
 

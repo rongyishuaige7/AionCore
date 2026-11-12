@@ -23,6 +23,15 @@ impl CliAgentProcess {
     /// - stderr buffering
     /// - Process exit monitoring
     pub async fn spawn_for_sdk(config: CommandSpec) -> Result<Self, AgentError> {
+        Self::spawn_sdk(config, false).await
+    }
+
+    /// Title subprocesses must not put provider response bodies into logs.
+    pub(crate) async fn spawn_for_title(config: CommandSpec) -> Result<Self, AgentError> {
+        Self::spawn_sdk(config, true).await
+    }
+
+    async fn spawn_sdk(config: CommandSpec, quiet_stderr: bool) -> Result<Self, AgentError> {
         let mut cmd = CmdBuilder::new(&config.command);
         let agent_env = aionui_runtime::agent_process_env().await;
         cmd.args(&config.args)
@@ -73,7 +82,7 @@ impl CliAgentProcess {
 
             while let Ok(Some(line)) = lines.next_line().await {
                 let trimmed = line.trim();
-                if !trimmed.is_empty() {
+                if !quiet_stderr && !trimmed.is_empty() {
                     warn!(pid, stderr = trimmed, "CLI process stderr");
                 }
                 let mut buf = stderr_buf_clone.lock().await;
