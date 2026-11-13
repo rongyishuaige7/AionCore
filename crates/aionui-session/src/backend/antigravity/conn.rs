@@ -53,33 +53,39 @@ const UI_PLACEHOLDER_MODEL: &str = "default";
 /// large enough that a slow subscriber does not lose a turn's worth of frames.
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
 
-/// Model list shared by every Antigravity session in this process.
+/// Model lists shared by the Antigravity sessions in this process, one per
+/// launcher.
 ///
-/// The list belongs to the signed-in agy account, not to a conversation, and
-/// discovering it costs a process launch. Caching it keeps the second and later
-/// sessions from opening with an empty model picker.
+/// The list belongs to the account behind a launcher, not to a conversation,
+/// and discovering it costs a process launch. Caching it keeps the second and
+/// later sessions from opening with an empty model picker. It is keyed by the
+/// program that was probed because agents can name their own launcher (one
+/// wrapper per account or endpoint), and those offer different models.
 ///
 /// Only non-empty lists are stored: an empty result means "not signed in" or
 /// "probe failed", which must not be cached as though it were the answer.
-static MODEL_CACHE: std::sync::OnceLock<std::sync::RwLock<Vec<ModelInfo>>> = std::sync::OnceLock::new();
+static MODEL_CACHE: std::sync::OnceLock<ModelCache> = std::sync::OnceLock::new();
 
-fn model_cache() -> &'static std::sync::RwLock<Vec<ModelInfo>> {
-    MODEL_CACHE.get_or_init(|| std::sync::RwLock::new(Vec::new()))
+type ModelCache = std::sync::RwLock<HashMap<std::path::PathBuf, Vec<ModelInfo>>>;
+
+fn model_cache() -> &'static ModelCache {
+    MODEL_CACHE.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
 }
 
-fn cached_models() -> Option<Vec<ModelInfo>> {
+fn cached_models(program: &std::path::Path) -> Option<Vec<ModelInfo>> {
     let guard = model_cache().read().ok()?;
-    (!guard.is_empty()).then(|| guard.clone())
+    let list = guard.get(program)?;
+    (!list.is_empty()).then(|| list.clone())
 }
 
-fn store_models(models: &[ModelInfo]) {
+fn store_models(program: &std::path::Path, models: &[ModelInfo]) {
     // Guard here rather than at the call site: caching "not signed in" would
     // pin an empty picker for the rest of the process.
     if models.is_empty() {
         return;
     }
     if let Ok(mut guard) = model_cache().write() {
-        *guard = models.to_vec();
+        guard.insert(program.to_path_buf(), models.to_vec());
     }
 }
 
@@ -272,6 +278,7 @@ impl BackendConnection for AntigravityConnection {
             slash_commands,
             models: Arc::new(std::sync::RwLock::new(Vec::new())),
             mode_override: Arc::new(std::sync::RwLock::new(None)),
+            model_override: Arc::new(std::sync::RwLock::new(None)),
             config,
             spawner: Arc::clone(&self.spawner),
             event_tx,
@@ -316,6 +323,8 @@ pub struct AntigravitySessionBackend {
     models: Arc<std::sync::RwLock<Vec<ModelInfo>>>,
     /// Mode chosen at runtime, overriding the create-time seed.
     mode_override: Arc<std::sync::RwLock<Option<String>>>,
+    /// Model chosen at runtime, overriding the create-time seed.
+    model_override: Arc<std::sync::RwLock<Option<String>>>,
     config: SessionConfig,
     spawner: Arc<dyn Spawner>,
     event_tx: broadcast::Sender<SessionEnvelope>,
@@ -412,7 +421,7 @@ impl AntigravitySessionBackend {
         // which `get_config_options` reports no models at all — and the frontend
         // fetches those options once, so an empty first answer leaves the picker
         // stuck on its loading state for the whole session.
-        if let Some(cached) = cached_models()
+        if let Some(cached) = cached_models(&program)
             && let Ok(mut guard) = slot.write()
         {
             *guard = cached;
@@ -422,7 +431,7 @@ impl AntigravitySessionBackend {
         tokio::spawn(async move {
             let found = probe_models(&spawner, &program, &session_id, &spawn_env).await;
             if !found.is_empty() {
-                store_models(&found);
+                store_models(&program, &found);
             }
             if found.is_empty() {
                 tracing::info!(
@@ -611,6 +620,15 @@ impl AntigravitySessionBackend {
             .is_some_and(|m| m.eq_ignore_ascii_case(super::argv::FULL_AUTO_SENTINEL))
     }
 
+    /// The model this session is on right now, honouring a runtime switch.
+    fn requested_model(&self) -> Option<String> {
+        self.model_override
+            .read()
+            .ok()
+            .and_then(|g| g.clone())
+            .or_else(|| self.config.model.clone())
+    }
+
     /// The model to actually pass to agy, dropping one it cannot accept.
     ///
     /// A model id can reach us that agy rejects outright ("invalid model
@@ -626,7 +644,7 @@ impl AntigravitySessionBackend {
     /// artifact, never a real agy id, so it is dropped even while the list is
     /// empty — this heals member sessions persisted before the AionUi fix.
     fn effective_model(&self) -> Option<String> {
-        let requested = self.config.model.clone()?;
+        let requested = self.requested_model()?;
         let known = self.models.read().ok()?;
         if known.is_empty() {
             if requested == UI_PLACEHOLDER_MODEL {
@@ -947,7 +965,7 @@ impl SessionBackend for AntigravitySessionBackend {
                 turn_gen: self.turn_gen.load(Ordering::SeqCst),
             }),
             // Mode/model are spawn-time flags for agy: there is no live process
-            // to reconfigure, so the next turn simply picks up the new value.
+            // to reconfigure, so the next turn picks up the recorded value.
             Command::SetMode { ref mode } => {
                 // Recording this is what makes a mid-conversation switch mean
                 // anything: the next turn's argv reads it, and so does the
@@ -1000,11 +1018,33 @@ impl SessionBackend for AntigravitySessionBackend {
                     turn_gen,
                 })
             }
-            Command::SetModel { .. } => Ok(CommandReceipt {
-                accepted: true,
-                admission: Admission::Started,
-                turn_gen: self.turn_gen.load(Ordering::SeqCst),
-            }),
+            Command::SetModel { ref model } => {
+                // Same shape as SetMode: `--model` is read when a turn's process
+                // spawns, so recording it is what makes the next turn run on it.
+                // Accepting the switch without recording it left the picker
+                // showing the new model while every turn kept the old one.
+                if let Ok(mut guard) = self.model_override.write() {
+                    *guard = Some(model.clone());
+                }
+                let turn_gen = self.turn_gen.load(Ordering::SeqCst);
+                // Confirmed at once, even mid-turn. Unlike a mode change there is
+                // nothing to over-promise here: a running turn finishes on the model
+                // it started with and the next one uses the new model. The confirmation is
+                // also what persists `current_model_id` (session_agent's
+                // `persist_side_effects`), so a rebuilt session keeps the switch.
+                self.emit(
+                    turn_gen,
+                    SessionEvent::ConfigChanged {
+                        mode: None,
+                        model: Some(model.clone()),
+                    },
+                );
+                Ok(CommandReceipt {
+                    accepted: true,
+                    admission: Admission::NoTurn,
+                    turn_gen,
+                })
+            }
             Command::Steer { .. } => Err(BackendError::CommandNotSupported { command: "steer" }),
             Command::Rewind { .. } => Err(BackendError::CommandNotSupported { command: "rewind" }),
             Command::AnswerAuth { .. } => Err(BackendError::CommandNotSupported { command: "answer_auth" }),
@@ -1029,7 +1069,7 @@ impl SessionBackend for AntigravitySessionBackend {
         Capabilities {
             available_models: self.models.read().map(|m| m.clone()).unwrap_or_default(),
             available_modes: antigravity_modes(),
-            current_model: self.config.model.clone(),
+            current_model: self.requested_model(),
             current_mode: self.config.mode.clone(),
             slash_commands: self.slash_commands.clone(),
             // agy runs one process per turn and `--mode` is a spawn flag, so a turn
@@ -1277,6 +1317,7 @@ mod tests {
             models: Arc::new(std::sync::RwLock::new(Vec::new())),
             slash_commands: Vec::new(),
             mode_override: Arc::new(std::sync::RwLock::new(None)),
+            model_override: Arc::new(std::sync::RwLock::new(None)),
             config: config("/w"),
             spawner: Arc::new(FakeSpawner::new()),
             event_tx,
@@ -1411,6 +1452,7 @@ mod tests {
             session_id: "s1".into(),
             slash_commands: Vec::new(),
             mode_override: Arc::new(std::sync::RwLock::new(None)),
+            model_override: Arc::new(std::sync::RwLock::new(None)),
             models: Arc::new(std::sync::RwLock::new(Vec::new())),
             config: cfg,
             spawner: Arc::new(crate::testing::FakeSpawner::new()),
@@ -1700,6 +1742,7 @@ mod tests {
             session_id: "s1".into(),
             slash_commands: Vec::new(),
             mode_override: Arc::new(std::sync::RwLock::new(None)),
+            model_override: Arc::new(std::sync::RwLock::new(None)),
             models: Arc::new(std::sync::RwLock::new(Vec::new())),
             config: cfg,
             spawner: Arc::new(crate::testing::FakeSpawner::new()),
@@ -1771,6 +1814,7 @@ mod tests {
             }])),
             slash_commands: Vec::new(),
             mode_override: Arc::new(std::sync::RwLock::new(None)),
+            model_override: Arc::new(std::sync::RwLock::new(None)),
             config: SessionConfig {
                 cwd: Some("/w".into()),
                 model: Some("gemini-3.1-pro-high".into()),
@@ -1907,6 +1951,7 @@ mod tests {
             session_id: "s1".into(),
             slash_commands: Vec::new(),
             mode_override: Arc::new(std::sync::RwLock::new(None)),
+            model_override: Arc::new(std::sync::RwLock::new(None)),
             models: Arc::new(std::sync::RwLock::new(
                 models
                     .iter()
@@ -1951,6 +1996,46 @@ mod tests {
     fn a_model_agy_reported_is_passed_through() {
         let b = backend_with_models(&["gemini-3.1-pro-low"], Some("gemini-3.1-pro-low"));
         assert_eq!(b.effective_model().as_deref(), Some("gemini-3.1-pro-low"));
+    }
+
+    #[tokio::test]
+    async fn a_model_switch_reaches_the_next_turn_and_is_confirmed() {
+        // agy reads `--model` when a turn spawns, so the switch only means
+        // something if it is recorded for the next turn's argv. The confirmation
+        // is what persists `current_model_id`, so it has to go out as well.
+        let b = backend_with_models(&["gemini-3.1-pro-low", "claude-sonnet-4-6"], Some("gemini-3.1-pro-low"));
+        let mut events = b.events();
+
+        let receipt = b
+            .dispatch(Command::SetModel {
+                model: "claude-sonnet-4-6".to_owned(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(receipt.admission, Admission::NoTurn, "a model switch starts no turn");
+        assert_eq!(b.effective_model().as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(b.capabilities().current_model.as_deref(), Some("claude-sonnet-4-6"));
+
+        let confirmed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            use futures_util::StreamExt as _;
+            while let Some(env) = events.next().await {
+                if let SessionEvent::ConfigChanged { model, .. } = env.event {
+                    return model;
+                }
+            }
+            None
+        })
+        .await
+        .expect("a model switch must emit ConfigChanged within 2s");
+        assert_eq!(confirmed.as_deref(), Some("claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn a_switched_model_agy_never_reported_still_falls_back() {
+        // The runtime pick goes through the same filter as the create-time one.
+        let b = backend_with_models(&["gemini-3.1-pro-low"], Some("gemini-3.1-pro-low"));
+        *b.model_override.write().unwrap() = Some("gpt-5".to_owned());
+        assert_eq!(b.effective_model(), None);
     }
 
     #[test]
@@ -2045,21 +2130,48 @@ mod tests {
     fn an_empty_probe_result_is_never_cached() {
         // "not signed in" must not be pinned as the answer for the rest of the
         // process — the next session has to be free to probe again.
-        store_models(&[]);
-        assert!(cached_models().is_none() || !cached_models().unwrap().is_empty());
+        let program = std::path::Path::new("agy-test-empty");
+        store_models(program, &[]);
+        assert!(cached_models(program).is_none());
     }
 
     #[test]
     fn a_discovered_list_is_shared_with_later_sessions() {
         // agy's models belong to the signed-in account, so re-probing per
         // session only delays the picker.
-        store_models(&[ModelInfo {
-            id: "gemini-3.1-pro-low".into(),
-            name: "gemini-3.1-pro-low".into(),
+        let program = std::path::Path::new("agy-test-shared");
+        store_models(
+            program,
+            &[ModelInfo {
+                id: "gemini-3.1-pro-low".into(),
+                name: "gemini-3.1-pro-low".into(),
+                description: None,
+                reasoning_efforts: Vec::new(),
+            }],
+        );
+        let cached = cached_models(program).expect("a non-empty list must be cached");
+        assert!(cached.iter().any(|m| m.id == "gemini-3.1-pro-low"));
+    }
+
+    #[test]
+    fn each_launcher_keeps_its_own_model_list() {
+        // A wrapper can point agy at another account or endpoint with different
+        // models; serving one launcher's list to another hides the models it
+        // actually has.
+        let model = |id: &str| ModelInfo {
+            id: id.into(),
+            name: id.into(),
             description: None,
             reasoning_efforts: Vec::new(),
-        }]);
-        let cached = cached_models().expect("a non-empty list must be cached");
-        assert!(cached.iter().any(|m| m.id == "gemini-3.1-pro-low"));
+        };
+        let plain = std::path::Path::new("agy-test-plain");
+        let wrapper = std::path::Path::new("/test/bin/agy-test-wrapper");
+        store_models(plain, &[model("gemini-3.1-pro-low")]);
+        store_models(wrapper, &[model("hydrogen")]);
+        let plain_ids: Vec<_> = cached_models(plain).unwrap().into_iter().map(|m| m.id).collect();
+        let wrapper_ids: Vec<_> = cached_models(wrapper).unwrap().into_iter().map(|m| m.id).collect();
+        assert_eq!(plain_ids, ["gemini-3.1-pro-low"]);
+        assert_eq!(wrapper_ids, ["hydrogen"]);
+        assert!(cached_models(std::path::Path::new("agy-test-never-probed")).is_none());
     }
 }

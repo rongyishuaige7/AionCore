@@ -1846,10 +1846,13 @@ pub async fn build_antigravity_instance(
         mode,
         init,
         permission_hook_body,
-        // agy is NOT shipped with the app: it is a large native binary the user
-        // installs themselves, so there is no bundled path to resolve and the
-        // backend always spawns the `agy` on PATH.
-        cli_program: None,
+        // agy is NOT shipped with the app, so there is no bundled path: the `agy`
+        // on PATH runs unless the agent names its own launcher. That launcher
+        // has to win, the same way it does for claude/codex: a wrapper is how
+        // one agy install serves several accounts (`--gemini_dir` per account)
+        // or a different endpoint, and ignoring it silently ran every such
+        // agent on the default account.
+        cli_program: resolve_session_cli_program("agy", metadata),
         // agy is layer 2, so this carries only the allow-list entries (one
         // `--add-dir` per enabled skill) and never a plugin flag.
         extra_args: skill_delivery.plan.extra_args.clone(),
@@ -5151,6 +5154,21 @@ mod build_mapping_tests {
         assert_eq!(
             resolve_session_cli_program("claude", &metadata),
             Some(std::path::PathBuf::from("/custom/claude"))
+        );
+    }
+
+    #[test]
+    fn antigravity_runs_the_agents_own_launcher() {
+        // One agy install serving several accounts: each agent points at a
+        // wrapper that selects its account. The wrapper must be what runs.
+        let mut metadata = test_metadata(Some("antigravity"), None);
+        metadata.has_command_override = true;
+        metadata.command = Some("/home/u/.local/bin/agy-pro2".into());
+        metadata.resolved_command = None;
+
+        assert_eq!(
+            resolve_session_cli_program("agy", &metadata),
+            Some(std::path::PathBuf::from("/home/u/.local/bin/agy-pro2"))
         );
     }
 
