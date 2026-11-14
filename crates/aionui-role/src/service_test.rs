@@ -156,7 +156,13 @@ async fn a_bare_agent_assistant_can_be_a_role() {
     service.set_memory("bare:8e1acf31", "- runs the tests").await.unwrap();
 
     assert_eq!(role.id, "bare:8e1acf31");
-    assert!(root.path().join("roles").join("bare@8e1acf31").join("role.json").is_file());
+    assert!(
+        root.path()
+            .join("roles")
+            .join("bare@8e1acf31")
+            .join("role.json")
+            .is_file()
+    );
     assert!(!role.memory_dir.contains(':'));
 
     let listed = service.list().await.unwrap();
