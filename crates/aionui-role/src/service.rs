@@ -2,9 +2,11 @@
 //! between the on-disk definition and the wire shape.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use aionui_api_types::{RoleResponse, TeamToolName, UpsertRoleRequest};
 use aionui_common::now_ms;
+use tokio::sync::Mutex;
 
 use crate::error::RoleError;
 use crate::store::{RoleDefinition, RoleStore};
@@ -13,11 +15,25 @@ use crate::store::{RoleDefinition, RoleStore};
 pub const MAX_CHARTER_CHARS: usize = 4_000;
 /// Cap on `MEMORY.md`, in bytes.
 pub const MAX_MEMORY_BYTES: usize = 64 * 1024;
+/// Cap on one note added through [`RoleService::remember`], in characters.
+pub const MAX_NOTE_CHARS: usize = 600;
 const MAX_ROLE_ID_LEN: usize = 128;
+
+/// What [`RoleService::remember`] did with a note.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RememberedNote {
+    /// The line as it stands in `MEMORY.md`.
+    pub line: String,
+    /// `true` when the memory already held this note and nothing was written.
+    pub already_recorded: bool,
+}
 
 #[derive(Debug, Clone)]
 pub struct RoleService {
     store: RoleStore,
+    /// Serializes memory writes: members of one role can run in several teams
+    /// at once, and the user can save the memory from the roles page meanwhile.
+    memory_lock: Arc<Mutex<()>>,
 }
 
 impl RoleService {
@@ -26,6 +42,7 @@ impl RoleService {
     pub fn new(root: PathBuf) -> Self {
         Self {
             store: RoleStore::new(root),
+            memory_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -100,8 +117,54 @@ impl RoleService {
         let Some(definition) = self.store.read_definition(id).await? else {
             return Err(RoleError::NotFound(id.to_owned()));
         };
+        let _guard = self.memory_lock.lock().await;
         self.store.write_memory(id, memory).await?;
         self.to_response(id, definition).await
+    }
+
+    /// Append one note to the role's `MEMORY.md` as `- <day> <note>`. The note
+    /// is flattened to a single line, and a note the memory already holds is
+    /// not written twice. `day` is the caller's local date (`YYYY-MM-DD`).
+    pub async fn remember(&self, id: &str, note: &str, day: &str) -> Result<RememberedNote, RoleError> {
+        validate_role_id(id)?;
+        let note = note.split_whitespace().collect::<Vec<_>>().join(" ");
+        if note.is_empty() {
+            return Err(RoleError::InvalidRequest("a note cannot be empty".to_owned()));
+        }
+        if note.chars().count() > MAX_NOTE_CHARS {
+            return Err(RoleError::InvalidRequest(format!(
+                "a note exceeds {MAX_NOTE_CHARS} characters"
+            )));
+        }
+        if self.store.read_definition(id).await?.is_none() {
+            return Err(RoleError::NotFound(id.to_owned()));
+        }
+
+        let _guard = self.memory_lock.lock().await;
+        let memory = self.store.read_memory(id).await?;
+        if let Some(line) = memory.lines().find(|line| note_text(line) == note) {
+            return Ok(RememberedNote {
+                line: line.trim().to_owned(),
+                already_recorded: true,
+            });
+        }
+        let line = format!("- {day} {note}");
+        let kept = memory.trim_end();
+        let updated = if kept.is_empty() {
+            format!("{line}\n")
+        } else {
+            format!("{kept}\n{line}\n")
+        };
+        if updated.len() > MAX_MEMORY_BYTES {
+            return Err(RoleError::InvalidRequest(format!(
+                "memory is full ({MAX_MEMORY_BYTES} bytes), the user has to prune it first"
+            )));
+        }
+        self.store.write_memory(id, &updated).await?;
+        Ok(RememberedNote {
+            line,
+            already_recorded: false,
+        })
     }
 
     /// Dismiss the role. Its memory directory stays on disk and is picked up
@@ -140,6 +203,26 @@ fn validate_role_id(id: &str) -> Result<(), RoleError> {
         return Err(RoleError::InvalidId(id.chars().take(MAX_ROLE_ID_LEN).collect()));
     }
     Ok(())
+}
+
+/// The text of a memory line without its bullet and its day, so the same note
+/// is recognized whenever it was written and whoever wrote it.
+fn note_text(line: &str) -> &str {
+    let line = line.trim();
+    let text = line.strip_prefix("- ").unwrap_or(line).trim_start();
+    match text.split_once(' ') {
+        Some((first, rest)) if is_day(first) => rest.trim_start(),
+        _ => text,
+    }
+}
+
+/// `YYYY-MM-DD`.
+fn is_day(text: &str) -> bool {
+    text.len() == 10
+        && text.bytes().enumerate().all(|(index, byte)| match index {
+            4 | 7 => byte == b'-',
+            _ => byte.is_ascii_digit(),
+        })
 }
 
 /// Trim, reject anything that is not a real team tool, then sort and dedupe so

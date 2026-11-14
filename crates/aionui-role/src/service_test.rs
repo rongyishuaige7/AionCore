@@ -172,6 +172,73 @@ async fn a_bare_agent_assistant_can_be_a_role() {
 }
 
 #[tokio::test]
+async fn remember_appends_one_dated_line_after_what_is_already_there() {
+    let root = tempfile::tempdir().unwrap();
+    let service = service(&root);
+    service.upsert("reviewer", request("", &[])).await.unwrap();
+    service.set_memory("reviewer", "- written by the user\n\n").await.unwrap();
+
+    let noted = service
+        .remember("reviewer", "  the user wants tests run,\n  not described ", "2026-11-14")
+        .await
+        .unwrap();
+
+    assert_eq!(noted.line, "- 2026-11-14 the user wants tests run, not described");
+    assert!(!noted.already_recorded);
+    assert_eq!(
+        service.get("reviewer").await.unwrap().memory,
+        "- written by the user\n- 2026-11-14 the user wants tests run, not described\n"
+    );
+}
+
+#[tokio::test]
+async fn remember_does_not_write_the_same_note_twice() {
+    let root = tempfile::tempdir().unwrap();
+    let service = service(&root);
+    service.upsert("reviewer", request("", &[])).await.unwrap();
+    service.set_memory("reviewer", "- run the tests\n").await.unwrap();
+
+    // Already there without a day, then again on a later day.
+    let first = service.remember("reviewer", "run the tests", "2026-11-14").await.unwrap();
+    service.remember("reviewer", "ask before pushing", "2026-11-14").await.unwrap();
+    let again = service.remember("reviewer", "ask before pushing", "2026-11-20").await.unwrap();
+
+    assert!(first.already_recorded);
+    assert_eq!(first.line, "- run the tests");
+    assert!(again.already_recorded);
+    assert_eq!(again.line, "- 2026-11-14 ask before pushing");
+    assert_eq!(
+        service.get("reviewer").await.unwrap().memory,
+        "- run the tests\n- 2026-11-14 ask before pushing\n"
+    );
+}
+
+#[tokio::test]
+async fn remember_refuses_bad_notes_a_full_memory_and_an_assistant_that_is_no_role() {
+    let root = tempfile::tempdir().unwrap();
+    let service = service(&root);
+    service.upsert("reviewer", request("", &[])).await.unwrap();
+
+    let too_long = "记".repeat(MAX_NOTE_CHARS + 1);
+    for note in ["", " \n ", too_long.as_str()] {
+        let result = service.remember("reviewer", note, "2026-11-14").await;
+        assert!(matches!(result, Err(RoleError::InvalidRequest(_))), "note {note:?}");
+    }
+    assert!(matches!(
+        service.remember("stranger", "a note", "2026-11-14").await,
+        Err(RoleError::NotFound(_))
+    ));
+
+    service
+        .set_memory("reviewer", &"x".repeat(MAX_MEMORY_BYTES - 5))
+        .await
+        .unwrap();
+    let full = service.remember("reviewer", "one more", "2026-11-14").await;
+    assert!(matches!(full, Err(RoleError::InvalidRequest(_))));
+    assert_eq!(service.get("reviewer").await.unwrap().memory.len(), MAX_MEMORY_BYTES - 5);
+}
+
+#[tokio::test]
 async fn list_skips_a_corrupt_definition_and_upsert_can_repair_it() {
     let root = tempfile::tempdir().unwrap();
     let service = service(&root);

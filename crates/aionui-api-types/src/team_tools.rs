@@ -72,6 +72,7 @@ pub enum TeamToolName {
     TeamTaskCreate,
     TeamTaskUpdate,
     TeamTaskList,
+    TeamRemember,
     TeamListAssistants,
     TeamDescribeAssistant,
     TeamSpawnAgent,
@@ -90,6 +91,7 @@ impl TeamToolName {
             Self::TeamTaskCreate => "team_task_create",
             Self::TeamTaskUpdate => "team_task_update",
             Self::TeamTaskList => "team_task_list",
+            Self::TeamRemember => "team_remember",
             Self::TeamListAssistants => "team_list_assistants",
             Self::TeamDescribeAssistant => "team_describe_assistant",
             Self::TeamSpawnAgent => "team_spawn_agent",
@@ -108,6 +110,7 @@ impl TeamToolName {
             "team_task_create" => Self::TeamTaskCreate,
             "team_task_update" => Self::TeamTaskUpdate,
             "team_task_list" => Self::TeamTaskList,
+            "team_remember" => Self::TeamRemember,
             "team_list_assistants" => Self::TeamListAssistants,
             "team_describe_assistant" => Self::TeamDescribeAssistant,
             "team_spawn_agent" => Self::TeamSpawnAgent,
@@ -471,6 +474,22 @@ fn tool_specs() -> Vec<TeamToolSpec> {
             input_summary: "owner, status, include_deleted, limit",
         },
         TeamToolSpec {
+            name: TeamToolName::TeamRemember,
+            permission: TeamToolPermission::AnyTeamAgent,
+            description: "Add one note to your resident role's memory. The memory is handed back to you in every team you join, so keep what should outlast this team: a preference of the user, a mistake not to repeat, a decision and its reason. One fact per call. Only members spawned from a resident role can use this.",
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "note": { "type": "string", "description": "One fact to keep, in a sentence or two" }
+                },
+                "required": ["note"]
+            }),
+            cli_command: &["remember"],
+            when: "Keep a lesson in role memory",
+            input_summary: "note",
+        },
+        TeamToolSpec {
             name: TeamToolName::TeamListAssistants,
             permission: TeamToolPermission::AnyTeamAgent,
             description: TEAM_LIST_ASSISTANTS_DESCRIPTION,
@@ -578,7 +597,7 @@ mod tests {
     #[test]
     fn descriptor_count_and_names_are_unique() {
         let descriptors = team_tool_descriptors();
-        assert_eq!(descriptors.len(), 13);
+        assert_eq!(descriptors.len(), 14);
         let names = descriptors
             .iter()
             .map(|descriptor| descriptor.name.as_str())
@@ -608,6 +627,7 @@ mod tests {
             ("team_task_create", vec!["task", "create"]),
             ("team_task_update", vec!["task", "update"]),
             ("team_task_list", vec!["task", "list"]),
+            ("team_remember", vec!["remember"]),
             ("team_list_assistants", vec!["list-assistants"]),
             ("team_describe_assistant", vec!["describe-assistant"]),
             ("team_spawn_agent", vec!["spawn-agent"]),
@@ -664,6 +684,16 @@ mod tests {
             descriptor.description.contains("redelivered in full"),
             "truncated messages must be documented as previews that stay unread"
         );
+    }
+
+    #[test]
+    fn remember_is_open_to_any_member_and_takes_one_required_note() {
+        let descriptor = team_tool_descriptor("team_remember").expect("remember descriptor");
+        assert_eq!(descriptor.permission, TeamToolPermission::AnyTeamAgent);
+        assert_eq!(descriptor.input_schema["additionalProperties"], json!(false));
+        assert_eq!(descriptor.input_schema["required"], json!(["note"]));
+        let properties = descriptor.input_schema["properties"].as_object().unwrap();
+        assert_eq!(properties.keys().collect::<Vec<_>>(), vec!["note"]);
     }
 
     #[test]

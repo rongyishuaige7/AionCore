@@ -25,5 +25,5 @@ pub mod routes;
 
 pub use error::RoleError;
 pub use routes::role_routes;
-pub use service::{MAX_CHARTER_CHARS, MAX_MEMORY_BYTES, RoleService};
+pub use service::{MAX_CHARTER_CHARS, MAX_MEMORY_BYTES, MAX_NOTE_CHARS, RememberedNote, RoleService};
 pub use state::RoleRouterState;

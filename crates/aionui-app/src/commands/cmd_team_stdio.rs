@@ -255,6 +255,13 @@ struct RenameAgentParams {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct RememberParams {
+    /// One fact to keep, in a sentence or two.
+    note: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ClearAgentContextParams {
     /// Agent slot_id whose context should be cleared.
     slot_id: String,
@@ -384,6 +391,15 @@ impl TeamStdioServer {
     )]
     async fn task_list(&self, Parameters(params): Parameters<TaskListParams>) -> CallToolResult {
         self.forward_to_tcp("team_task_list", &params.into_json()).await
+    }
+
+    #[tool(
+        name = "team_remember",
+        description = "Add one note to your resident role's memory. The memory is handed back to you in every team you join, so keep what should outlast this team: a preference of the user, a mistake not to repeat, a decision and its reason. One fact per call. Only members spawned from a resident role can use this."
+    )]
+    async fn remember(&self, Parameters(params): Parameters<RememberParams>) -> CallToolResult {
+        self.forward_to_tcp("team_remember", &serde_json::json!({ "note": params.note }))
+            .await
     }
 
     #[tool(
@@ -871,7 +887,7 @@ mod tests {
     fn team_stdio_descriptions_match_prompt_registry() {
         let router = TeamStdioServer::tool_router();
         let tools = router.list_all();
-        assert_eq!(tools.len(), 13, "stdio must expose the complete shared registry");
+        assert_eq!(tools.len(), 14, "stdio must expose the complete shared registry");
         let mut actual_names: Vec<_> = tools.iter().map(|tool| tool.name.as_ref()).collect();
         actual_names.sort_unstable();
         let mut expected_names: Vec<_> = aionui_team_prompts::tools::team_tool_specs()

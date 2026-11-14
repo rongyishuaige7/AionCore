@@ -9,6 +9,9 @@ use crate::ports::TeamRoleBrief;
 /// the member is pointed at it for the rest.
 const MAX_INJECTED_MEMORY_CHARS: usize = 8_000;
 
+/// The team tool a role member writes its memory with.
+const REMEMBER_TOOL: &str = "team_remember";
+
 /// Render the standing-role section. No trailing newline.
 pub fn render_standing_role(brief: &TeamRoleBrief) -> String {
     let mut out = String::from(
@@ -35,12 +38,20 @@ pub fn render_standing_role(brief: &TeamRoleBrief) -> String {
         out.push_str("\n\n");
     }
     let memory_file = Path::new(&brief.memory_dir).join("MEMORY.md");
-    out.push_str(&format!(
-        "Your memory file is `{}`. When you learn something that should outlast this team (a preference of the \
-         user, a mistake not to repeat, a decision and its reason), add it there. If you cannot write to that \
-         path, say in your reply what should be remembered.",
-        memory_file.display()
-    ));
+    if brief.denied_tools.iter().any(|tool| tool == REMEMBER_TOOL) {
+        out.push_str(&format!(
+            "The user keeps this memory (`{}`). When you learn something that should outlast this team, say in \
+             your reply what should be remembered.",
+            memory_file.display()
+        ));
+    } else {
+        out.push_str(&format!(
+            "When you learn something that should outlast this team (a preference of the user, a mistake not to \
+             repeat, a decision and its reason), call `{REMEMBER_TOOL}` with one note. The whole memory is kept \
+             in `{}`.",
+            memory_file.display()
+        ));
+    }
 
     if !brief.denied_tools.is_empty() {
         out.push_str("\n\n### Team tools you may not call\n\n");
@@ -73,6 +84,7 @@ mod tests {
         assert!(section.contains("### Charter\n\nChecks work before it is called done."));
         assert!(section.contains("### Memory\n\n- the user wants tests run, not described"));
         assert!(section.contains("MEMORY.md"));
+        assert!(section.contains("call `team_remember` with one note"));
         assert!(section.contains("- `team_task_create`"));
         assert!(!section.ends_with('\n'));
     }
@@ -88,6 +100,18 @@ mod tests {
         assert!(section.contains("Nothing recorded yet."));
         assert!(section.contains("MEMORY.md"));
         assert!(!section.contains("may not call"));
+    }
+
+    #[test]
+    fn a_role_denied_the_remember_tool_is_not_told_to_call_it() {
+        let section = render_standing_role(&TeamRoleBrief {
+            denied_tools: vec!["team_remember".into()],
+            ..brief()
+        });
+
+        assert!(!section.contains("call `team_remember`"));
+        assert!(section.contains("say in your reply what should be remembered"));
+        assert!(section.contains("- `team_remember`"));
     }
 
     #[test]

@@ -149,6 +149,15 @@ pub struct TeamRoleBrief {
     pub denied_tools: Vec<String>,
 }
 
+/// What became of a note a member asked its role to remember.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TeamRoleMemoryNote {
+    /// The line as it stands in the role's memory file.
+    pub line: String,
+    /// `true` when the memory already held this note and nothing was written.
+    pub already_recorded: bool,
+}
+
 /// Looks up the resident role a member was spawned from, keyed by the member's
 /// `assistant_id`. `Ok(None)` means the assistant is not a role. An `Err` means
 /// the role could not be read: the wake path then goes on without the brief,
@@ -156,6 +165,14 @@ pub struct TeamRoleBrief {
 #[async_trait]
 pub trait TeamRolePort: Send + Sync {
     async fn role_brief(&self, assistant_id: &str) -> Result<Option<TeamRoleBrief>, String>;
+
+    /// Add one note to the memory of the role built on `assistant_id`.
+    /// `Ok(None)` means the assistant is not a role, so there is no memory to
+    /// write to. An `Err` is a reason the note was not kept (the memory is
+    /// full, the role cannot be read).
+    async fn remember(&self, _assistant_id: &str, _note: &str) -> Result<Option<TeamRoleMemoryNote>, String> {
+        Ok(None)
+    }
 }
 
 /// Default when no role service is wired: no member is a resident role, so team
