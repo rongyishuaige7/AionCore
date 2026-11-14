@@ -416,6 +416,7 @@ dependencies = [
  "aionui-process",
  "aionui-project",
  "aionui-realtime",
+ "aionui-role",
  "aionui-runtime",
  "aionui-session",
  "aionui-session-message",
@@ -829,6 +830,23 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-tungstenite 0.26.2",
+ "tracing",
+]
+
+[[package]]
+name = "aionui-role"
+version = "0.2.2"
+dependencies = [
+ "aionui-api-types",
+ "aionui-common",
+ "axum",
+ "http-body-util",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
  "tracing",
 ]
 

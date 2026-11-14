@@ -83,7 +83,12 @@ fn to_api_error(err: RoleError) -> ApiError {
         RoleError::NotFound(_) => ApiError::coded(StatusCode::NOT_FOUND, "role_not_found", "role not found", None),
         RoleError::Corrupt(_) | RoleError::Io(_) => {
             tracing::error!(error = %err, "role: internal error");
-            ApiError::coded(StatusCode::INTERNAL_SERVER_ERROR, "role_internal", "internal error", None)
+            ApiError::coded(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "role_internal",
+                "internal error",
+                None,
+            )
         }
     }
 }

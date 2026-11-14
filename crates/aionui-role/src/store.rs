@@ -75,8 +75,8 @@ impl RoleStore {
     }
 
     pub(crate) async fn write_definition(&self, id: &str, definition: &RoleDefinition) -> Result<(), RoleError> {
-        let raw = serde_json::to_vec_pretty(definition)
-            .map_err(|error| RoleError::Corrupt(format!("{id}: {error}")))?;
+        let raw =
+            serde_json::to_vec_pretty(definition).map_err(|error| RoleError::Corrupt(format!("{id}: {error}")))?;
         write_atomic(&self.role_dir(id).join(DEFINITION_FILE), &raw).await?;
         tokio::fs::create_dir_all(self.memory_dir(id)).await?;
         Ok(())
