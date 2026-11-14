@@ -122,9 +122,22 @@ async fn ids_that_could_escape_the_root_are_rejected() {
     let service = service(&root);
     let too_long = "a".repeat(MAX_ROLE_ID_LEN + 1);
 
-    for id in ["", ".", "..", "../outside", "a/b", "a\\b", ".hidden", "空", too_long.as_str()] {
+    for id in [
+        "",
+        ".",
+        "..",
+        "../outside",
+        "a/b",
+        "a\\b",
+        ".hidden",
+        "空",
+        too_long.as_str(),
+    ] {
         let result = service.upsert(id, request("", &[])).await;
-        assert!(matches!(result, Err(RoleError::InvalidId(_))), "id {id:?} must be rejected");
+        assert!(
+            matches!(result, Err(RoleError::InvalidId(_))),
+            "id {id:?} must be rejected"
+        );
         assert!(matches!(service.find(id).await, Err(RoleError::InvalidId(_))));
     }
     assert!(!root.path().join("outside").exists());
