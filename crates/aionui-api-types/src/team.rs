@@ -1953,7 +1953,10 @@ mod tests {
             updated_at: 2,
         };
         let value = serde_json::to_value(&resp).unwrap();
-        assert!(value.get("review").is_none(), "an unreviewed task carries no review field");
+        assert!(
+            value.get("review").is_none(),
+            "an unreviewed task carries no review field"
+        );
         assert_eq!(value["status"], json!("in_progress"));
         assert_eq!(value["blocked_by"], json!(["tk0"]));
         assert_eq!(value["blocks"], json!(["tk2"]));

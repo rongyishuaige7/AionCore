@@ -128,7 +128,10 @@ pub(crate) fn rule_on_update(
 
 /// The members among `agents` that were spawned from a reviewing role. A role
 /// that cannot be read is an error, so a broken role file never opens the gate.
-pub(crate) async fn reviewers_among(agents: Vec<TeamAgent>, roles: &dyn TeamRolePort) -> Result<Vec<TeamAgent>, String> {
+pub(crate) async fn reviewers_among(
+    agents: Vec<TeamAgent>,
+    roles: &dyn TeamRolePort,
+) -> Result<Vec<TeamAgent>, String> {
     let mut reviewers = Vec::new();
     for agent in agents {
         let Some(assistant_id) = agent.assistant_id.as_deref() else {
@@ -256,7 +259,10 @@ mod tests {
             42,
         );
         assert_eq!(marked["priority"], "high");
-        assert_eq!(marked["review"], json!({ "state": "waiting", "by": "worker-1", "at": 42 }));
+        assert_eq!(
+            marked["review"],
+            json!({ "state": "waiting", "by": "worker-1", "at": 42 })
+        );
         assert_eq!(
             review_state(&task(TaskStatus::InProgress, Some(marked.clone()))),
             Some(ReviewState::Waiting)
@@ -300,11 +306,26 @@ mod tests {
     #[test]
     fn a_reviewer_passes_or_returns_a_waiting_task_and_completes_its_own_directly() {
         let waiting = Some(ReviewState::Waiting);
-        assert_eq!(rule_on_update(TaskStatus::Completed, waiting, true, false), ReviewRuling::Pass);
-        assert_eq!(rule_on_update(TaskStatus::InProgress, waiting, true, false), ReviewRuling::Return);
-        assert_eq!(rule_on_update(TaskStatus::Pending, waiting, true, true), ReviewRuling::Return);
-        assert_eq!(rule_on_update(TaskStatus::Deleted, waiting, true, false), ReviewRuling::Withdraw);
-        assert_eq!(rule_on_update(TaskStatus::Completed, None, true, true), ReviewRuling::Untouched);
+        assert_eq!(
+            rule_on_update(TaskStatus::Completed, waiting, true, false),
+            ReviewRuling::Pass
+        );
+        assert_eq!(
+            rule_on_update(TaskStatus::InProgress, waiting, true, false),
+            ReviewRuling::Return
+        );
+        assert_eq!(
+            rule_on_update(TaskStatus::Pending, waiting, true, true),
+            ReviewRuling::Return
+        );
+        assert_eq!(
+            rule_on_update(TaskStatus::Deleted, waiting, true, false),
+            ReviewRuling::Withdraw
+        );
+        assert_eq!(
+            rule_on_update(TaskStatus::Completed, None, true, true),
+            ReviewRuling::Untouched
+        );
     }
 
     #[test]

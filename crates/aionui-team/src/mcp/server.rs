@@ -1443,7 +1443,7 @@ async fn review_decision(
         return Ok(ReviewDecision::untouched());
     }
 
-    let caller_reviews =reviewers.iter().any(|agent| agent.slot_id == caller_slot_id);
+    let caller_reviews = reviewers.iter().any(|agent| agent.slot_id == caller_slot_id);
     let others: Vec<TeamAgent> = reviewers
         .into_iter()
         .filter(|agent| agent.slot_id != caller_slot_id)
