@@ -128,13 +128,14 @@ impl RoleService {
     }
 }
 
-/// A role id becomes a directory name, so it is restricted to one plain path
-/// component: `[A-Za-z0-9._-]`, not starting with a dot. Assistant ids
-/// (`word-creator`, `custom-<ms>-<hex>`) all fit.
+/// A role id is an assistant id and becomes a directory name, so it is
+/// restricted to `[A-Za-z0-9._:-]`, not starting with a dot. That covers every
+/// assistant id the backend issues: `builtin-office`, `custom-<ms>-<hex>` and
+/// `bare:<agent id>`. The store maps `:` to a filename-safe character.
 fn validate_role_id(id: &str) -> Result<(), RoleError> {
     let plain = id
         .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'));
     if id.is_empty() || id.len() > MAX_ROLE_ID_LEN || !plain || id.starts_with('.') {
         return Err(RoleError::InvalidId(id.chars().take(MAX_ROLE_ID_LEN).collect()));
     }
