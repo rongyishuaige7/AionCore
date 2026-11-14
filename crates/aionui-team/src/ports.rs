@@ -134,6 +134,41 @@ impl NativeSlashCommandPort for NoopNativeSlashCommandPort {
     }
 }
 
+/// What the team runtime needs to know about a resident role: an assistant
+/// promoted to a standing member with its own charter, memory and team-tool
+/// permission table. Owned by the composition layer's role service.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TeamRoleBrief {
+    /// What the role owns and what it refuses.
+    pub charter: String,
+    /// Contents of the role's memory file.
+    pub memory: String,
+    /// Absolute path of the role's memory directory.
+    pub memory_dir: String,
+    /// Team tools this role may not call.
+    pub denied_tools: Vec<String>,
+}
+
+/// Looks up the resident role a member was spawned from, keyed by the member's
+/// `assistant_id`. `Ok(None)` means the assistant is not a role. An `Err` means
+/// the role could not be read: the wake path then goes on without the brief,
+/// while tool execution refuses the call rather than skip the permission table.
+#[async_trait]
+pub trait TeamRolePort: Send + Sync {
+    async fn role_brief(&self, assistant_id: &str) -> Result<Option<TeamRoleBrief>, String>;
+}
+
+/// Default when no role service is wired: no member is a resident role, so team
+/// behaviour is identical to a build without roles.
+pub struct NoopTeamRolePort;
+
+#[async_trait]
+impl TeamRolePort for NoopTeamRolePort {
+    async fn role_brief(&self, _assistant_id: &str) -> Result<Option<TeamRoleBrief>, String> {
+        Ok(None)
+    }
+}
+
 #[async_trait]
 pub trait TeamAssistantCatalogPort: Send + Sync {
     async fn list_team_selectable_assistants(&self, user_id: &str)

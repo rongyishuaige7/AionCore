@@ -2,7 +2,10 @@ use std::collections::{HashMap, HashSet};
 
 use aionui_api_types::TeamToolTransport;
 
+mod standing_role;
 mod wake_summary;
+
+pub use standing_role::render_standing_role;
 
 pub use aionui_team_prompts::AvailableAssistant;
 
