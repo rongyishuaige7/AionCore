@@ -760,6 +760,10 @@ pub struct TeamTaskResponse {
     pub owner: Option<String>,
     pub blocked_by: Vec<String>,
     pub blocks: Vec<String>,
+    /// Where the task stands with the team's reviewer: `waiting`, `passed` or
+    /// `returned`. Absent when the task was never handed in for review.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<String>,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
 }
@@ -1944,10 +1948,12 @@ mod tests {
             owner: Some("a1".into()),
             blocked_by: vec!["tk0".into()],
             blocks: vec!["tk2".into()],
+            review: None,
             created_at: 1,
             updated_at: 2,
         };
         let value = serde_json::to_value(&resp).unwrap();
+        assert!(value.get("review").is_none(), "an unreviewed task carries no review field");
         assert_eq!(value["status"], json!("in_progress"));
         assert_eq!(value["blocked_by"], json!(["tk0"]));
         assert_eq!(value["blocks"], json!(["tk2"]));
@@ -1988,6 +1994,7 @@ mod tests {
                 owner: None,
                 blocked_by: vec![],
                 blocks: vec![],
+                review: None,
                 created_at: 1,
                 updated_at: 1,
             },

@@ -628,6 +628,7 @@ impl aionui_team::TeamRolePort for RoleServiceTeamPort {
                 memory: role.memory,
                 memory_dir: role.memory_dir,
                 denied_tools: role.denied_tools,
+                verifies: role.verifies,
             })),
             // An assistant id that cannot name a role directory is not a role.
             Err(RoleError::InvalidId(_)) => Ok(None),

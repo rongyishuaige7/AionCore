@@ -520,6 +520,7 @@ mod tests {
                 owner: None,
                 blocked_by: vec![],
                 blocks: vec![],
+                review: None,
                 created_at: 1,
                 updated_at: 1,
             },

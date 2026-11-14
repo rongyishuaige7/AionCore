@@ -147,6 +147,8 @@ pub struct TeamRoleBrief {
     pub memory_dir: String,
     /// Team tools this role may not call.
     pub denied_tools: Vec<String>,
+    /// Whether this role reviews work other members hand in.
+    pub verifies: bool,
 }
 
 /// What became of a note a member asked its role to remember.

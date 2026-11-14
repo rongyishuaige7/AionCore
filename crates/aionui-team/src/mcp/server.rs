@@ -13,6 +13,7 @@ use crate::prompt_dump::{TeamPromptDumpConfig, TeamToolsListDump, dump_team_tool
 use crate::scheduler::TeammateManager;
 use crate::service::TeamSessionService;
 use crate::session::{AgentMessageQueueResult, SpawnAgentRequest};
+use crate::task_review::{self, ReviewRuling, ReviewState};
 use crate::tool_executor::{TeamToolContext, TeamToolExecutor, team_tool_call_from_name};
 use crate::types::{MailboxMessage, TaskStatus, TeamAgent, TeamTask, TeammateRole, TeammateStatus};
 use crate::work_source::WorkSource;
@@ -1031,13 +1032,17 @@ fn agent_json(agent: &TeamAgent) -> Value {
 }
 
 fn task_json(task: &TeamTask) -> Value {
-    json!({
+    let mut value = json!({
         "task_id": task.id,
         "subject": task.subject,
         "status": task.status,
         "owner": task.owner,
         "blocked_by": task.blocked_by,
-    })
+    });
+    if let Some(state) = task_review::review_state(task) {
+        value["review"] = json!(state.as_str());
+    }
+    value
 }
 
 const MAX_TASK_LIST_LIMIT: usize = 200;
@@ -1288,18 +1293,72 @@ async fn exec_task_update(
         .map_err(|e| ToolCallError::from_message(format!("Invalid params: {e}")))?;
 
     let reassigned = input.owner.is_some();
-    let completed = input.status.as_deref() == Some("completed");
+    let requested = input.status.as_deref().and_then(TaskStatus::parse);
+    let review = review_decision(scheduler, service, &input.task_id, requested, caller_slot_id).await?;
 
-    let task = scheduler
-        .update_task(
-            &input.task_id,
-            input.status.as_deref(),
-            input.description,
-            input.owner,
-            input.blocked_by,
-        )
-        .await
-        .map_err(|e| ToolCallError::from_message(e.to_string()))?;
+    let task = match review.ruling {
+        ReviewRuling::Untouched => {
+            scheduler
+                .update_task(
+                    &input.task_id,
+                    input.status.as_deref(),
+                    input.description,
+                    input.owner,
+                    input.blocked_by,
+                )
+                .await
+        }
+        ruling => {
+            // A held task stays in progress; every other ruling keeps the
+            // status that was asked for.
+            let (status, mark) = match ruling {
+                ReviewRuling::Hold { .. } => (Some(TaskStatus::InProgress), Some(ReviewState::Waiting)),
+                ReviewRuling::Pass => (requested, Some(ReviewState::Passed)),
+                ReviewRuling::Return => (requested, Some(ReviewState::Returned)),
+                ReviewRuling::Withdraw | ReviewRuling::Untouched => (requested, None),
+            };
+            let metadata =
+                task_review::with_review_mark(review.metadata.as_ref(), mark, caller_slot_id, aionui_common::now_ms());
+            scheduler
+                .update_task_with_metadata(
+                    &input.task_id,
+                    status,
+                    input.description,
+                    input.owner,
+                    input.blocked_by,
+                    metadata,
+                )
+                .await
+        }
+    }
+    .map_err(|e| ToolCallError::from_message(e.to_string()))?;
+    let completed = task.status == TaskStatus::Completed && requested == Some(TaskStatus::Completed);
+
+    let caller_name = match scheduler.get_agent(caller_slot_id).await {
+        Ok(agent) => agent.name,
+        Err(_) => caller_slot_id.to_owned(),
+    };
+    match review.ruling {
+        ReviewRuling::Hold { already_waiting: false } => {
+            let notice = task_review::review_request_notice(&task, &caller_name);
+            for reviewer in &review.reviewers {
+                send_review_notice(scheduler, service, team_id, caller_slot_id, &reviewer.slot_id, &notice).await;
+            }
+        }
+        ReviewRuling::Pass => {
+            if let Some(lead) = scheduler.find_lead_slot_id().await {
+                let notice = task_review::review_passed_notice(&task, &caller_name);
+                send_review_notice(scheduler, service, team_id, caller_slot_id, &lead, &notice).await;
+            }
+        }
+        ReviewRuling::Return => {
+            if let Some(owner) = task.owner.as_deref() {
+                let notice = task_review::review_returned_notice(&task, &caller_name);
+                send_review_notice(scheduler, service, team_id, caller_slot_id, owner, &notice).await;
+            }
+        }
+        ReviewRuling::Hold { already_waiting: true } | ReviewRuling::Withdraw | ReviewRuling::Untouched => {}
+    }
 
     // A (re)assignment to a teammate notifies the new owner.
     if reassigned {
@@ -1317,7 +1376,114 @@ async fn exec_task_update(
         }
     }
 
-    json_text(&json!({ "status": "ok", "task": task_json(&task) }))
+    let mut result = json!({ "status": "ok", "task": task_json(&task) });
+    if matches!(review.ruling, ReviewRuling::Hold { .. }) {
+        let reviewers: Vec<&str> = review.reviewers.iter().map(|agent| agent.name.as_str()).collect();
+        result["held_for_review"] = json!(true);
+        result["reviewers"] = json!(reviewers);
+        result["note"] = json!(task_review::HELD_NOTE);
+    }
+    json_text(&result)
+}
+
+/// How the review gate rules on one `team_task_update` call.
+struct ReviewDecision {
+    ruling: ReviewRuling,
+    /// The task's metadata before the update, so its other keys are kept.
+    metadata: Option<Value>,
+    /// The team's reviewers other than the caller.
+    reviewers: Vec<TeamAgent>,
+}
+
+impl ReviewDecision {
+    fn untouched() -> Self {
+        Self {
+            ruling: ReviewRuling::Untouched,
+            metadata: None,
+            reviewers: Vec::new(),
+        }
+    }
+}
+
+/// Applies the review gate (see [`task_review`]) to a task update. Only a
+/// status change can open, close or drop a review, and a team with no
+/// reviewing role among its members is never gated. When a member's role
+/// cannot be read the update is refused, like any other role policy.
+async fn review_decision(
+    scheduler: &TeammateManager,
+    service: &Weak<TeamSessionService>,
+    task_id: &str,
+    requested: Option<TaskStatus>,
+    caller_slot_id: &str,
+) -> Result<ReviewDecision, ToolCallError> {
+    let Some(requested) = requested else {
+        return Ok(ReviewDecision::untouched());
+    };
+    let Some(service) = service.upgrade() else {
+        return Ok(ReviewDecision::untouched());
+    };
+    let roles = service.role_port();
+    let reviewers = task_review::reviewers_among(scheduler.list_agents().await, &*roles)
+        .await
+        .map_err(|error| {
+            warn!(task_id, slot_id = caller_slot_id, error = %error, "team review gate unavailable");
+            ToolCallError::from_message(format!("Role policy unavailable, team_task_update refused: {error}"))
+        })?;
+    // An unknown task is reported by the update itself.
+    let Some(task) = scheduler
+        .list_tasks()
+        .await
+        .ok()
+        .and_then(|tasks| tasks.into_iter().find(|task| task.id == task_id))
+    else {
+        return Ok(ReviewDecision::untouched());
+    };
+    // Completing a task that is already completed hands nothing in.
+    if task.status == TaskStatus::Completed && requested == TaskStatus::Completed {
+        return Ok(ReviewDecision::untouched());
+    }
+
+    let caller_reviews =reviewers.iter().any(|agent| agent.slot_id == caller_slot_id);
+    let others: Vec<TeamAgent> = reviewers
+        .into_iter()
+        .filter(|agent| agent.slot_id != caller_slot_id)
+        .collect();
+    let ruling = task_review::rule_on_update(
+        requested,
+        task_review::review_state(&task),
+        caller_reviews,
+        !others.is_empty(),
+    );
+    Ok(ReviewDecision {
+        ruling,
+        metadata: task.metadata,
+        reviewers: others,
+    })
+}
+
+/// Review notices travel like any member-to-member message: into the
+/// recipient's mailbox, waking it. Best-effort, like the task owner notice:
+/// the task write has already committed.
+async fn send_review_notice(
+    scheduler: &TeammateManager,
+    service: &Weak<TeamSessionService>,
+    team_id: &str,
+    from_slot_id: &str,
+    to_slot_id: &str,
+    notice: &str,
+) {
+    if to_slot_id == from_slot_id || scheduler.get_agent(to_slot_id).await.is_err() {
+        return;
+    }
+    let Some(service) = service.upgrade() else {
+        return;
+    };
+    if let Err(error) = service
+        .send_agent_message_from_agent(team_id, from_slot_id, to_slot_id, notice, None)
+        .await
+    {
+        warn!(team_id, to_slot = to_slot_id, error = %error, "failed to send review notice");
+    }
 }
 
 async fn exec_task_list(args: &Value, scheduler: &TeammateManager) -> Result<String, ToolCallError> {
@@ -1338,7 +1504,7 @@ async fn exec_task_list(args: &Value, scheduler: &TeammateManager) -> Result<Str
             None => true,
         })
         .map(|t| {
-            json!({
+            let mut value = json!({
                 "id": t.id,
                 "subject": t.subject,
                 "description": t.description,
@@ -1346,7 +1512,11 @@ async fn exec_task_list(args: &Value, scheduler: &TeammateManager) -> Result<Str
                 "owner": t.owner,
                 "blocked_by": t.blocked_by,
                 "blocks": t.blocks,
-            })
+            });
+            if let Some(state) = task_review::review_state(t) {
+                value["review"] = json!(state.as_str());
+            }
+            value
         })
         .collect();
     if let Some(limit) = filters.limit {

@@ -15,6 +15,10 @@ pub struct RoleResponse {
     pub charter: String,
     /// Team tools this role may not call, enforced where team tools execute.
     pub denied_tools: Vec<String>,
+    /// Whether this role reviews work: in a team it has joined, a task another
+    /// member marks completed is held until this role passes it.
+    #[serde(default)]
+    pub verifies: bool,
     /// Contents of the role's `MEMORY.md`.
     pub memory: String,
     /// Absolute path of the role's memory directory on the backend host.
@@ -37,6 +41,8 @@ pub struct UpsertRoleRequest {
     pub charter: String,
     #[serde(default)]
     pub denied_tools: Vec<String>,
+    #[serde(default)]
+    pub verifies: bool,
 }
 
 /// Body of `PUT /api/roles/{id}/memory` — replace the role's `MEMORY.md`.

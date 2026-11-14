@@ -36,6 +36,26 @@ impl TeammateManager {
         self.task_board.update_task(&self.team_id, task_id, &update).await
     }
 
+    /// [`update_task`](Self::update_task) that also replaces the task's metadata.
+    pub async fn update_task_with_metadata(
+        &self,
+        task_id: &str,
+        status: Option<crate::types::TaskStatus>,
+        description: Option<String>,
+        owner: Option<String>,
+        blocked_by: Option<Vec<String>>,
+        metadata: serde_json::Value,
+    ) -> Result<crate::types::TeamTask, TeamError> {
+        let update = crate::task_board::TaskUpdate {
+            status,
+            description,
+            owner,
+            blocked_by,
+            metadata: Some(metadata),
+        };
+        self.task_board.update_task(&self.team_id, task_id, &update).await
+    }
+
     /// Finalizes an agent turn by marking the slot idle. The leader re-wake and
     /// idle-notification bookkeeping live in [`mark_idle`](Self::mark_idle).
     pub async fn finalize_turn(&self, slot_id: &str) -> Result<Option<String>, TeamError> {

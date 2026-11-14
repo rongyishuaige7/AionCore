@@ -55,7 +55,7 @@ pub(super) fn render_task_board_summary(
             "| {} | {} | {} | {} | {} |\n",
             short_task_id(&task.id),
             truncate_subject(&task.subject),
-            task.status,
+            crate::task_review::status_label(task),
             render_owner(task, current_slot_ids),
             render_blocked_by(&task.blocked_by),
         ));

@@ -53,6 +53,16 @@ pub fn render_standing_role(brief: &TeamRoleBrief) -> String {
         ));
     }
 
+    if brief.verifies {
+        out.push_str(
+            "\n\n### Reviewing\n\n\
+             You review work in every team you join. When another member marks a task completed, the backend holds \
+             it and hands it to you. Check the work itself (run it, read it), not the account of it. To pass a \
+             task, call `team_task_update` with status `completed`. To return it, call `team_task_update` with \
+             status `in_progress` and tell the owner what is missing with `team_send_message`.",
+        );
+    }
+
     if !brief.denied_tools.is_empty() {
         out.push_str("\n\n### Team tools you may not call\n\n");
         for tool in &brief.denied_tools {
@@ -73,6 +83,7 @@ mod tests {
             memory: "- the user wants tests run, not described".into(),
             memory_dir: "/data/roles/reviewer/memory".into(),
             denied_tools: vec!["team_task_create".into()],
+            verifies: false,
         }
     }
 
@@ -86,6 +97,7 @@ mod tests {
         assert!(section.contains("MEMORY.md"));
         assert!(section.contains("call `team_remember` with one note"));
         assert!(section.contains("- `team_task_create`"));
+        assert!(!section.contains("### Reviewing"));
         assert!(!section.ends_with('\n'));
     }
 
@@ -112,6 +124,20 @@ mod tests {
         assert!(!section.contains("call `team_remember`"));
         assert!(section.contains("say in your reply what should be remembered"));
         assert!(section.contains("- `team_remember`"));
+    }
+
+    #[test]
+    fn a_reviewing_role_is_told_how_to_pass_and_return_a_task() {
+        let section = render_standing_role(&TeamRoleBrief {
+            verifies: true,
+            ..brief()
+        });
+
+        assert!(section.contains("### Reviewing"));
+        assert!(section.contains("status `completed`"));
+        assert!(section.contains("status `in_progress`"));
+        // The permission table still comes last.
+        assert!(section.find("### Reviewing").unwrap() < section.find("### Team tools you may not call").unwrap());
     }
 
     #[test]

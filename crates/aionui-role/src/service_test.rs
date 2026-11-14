@@ -12,6 +12,7 @@ fn request(charter: &str, denied: &[&str]) -> UpsertRoleRequest {
     UpsertRoleRequest {
         charter: charter.to_owned(),
         denied_tools: denied.iter().map(|tool| (*tool).to_owned()).collect(),
+        verifies: false,
     }
 }
 
@@ -169,6 +170,35 @@ async fn a_bare_agent_assistant_can_be_a_role() {
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].id, "bare:8e1acf31");
     assert_eq!(listed[0].memory, "- runs the tests");
+}
+
+#[tokio::test]
+async fn the_reviewer_flag_is_saved_and_a_role_file_without_it_reads_as_not_reviewing() {
+    let root = tempfile::tempdir().unwrap();
+    let service = service(&root);
+
+    let saved = service
+        .upsert(
+            "checker",
+            UpsertRoleRequest {
+                verifies: true,
+                ..request("Checks work.", &[])
+            },
+        )
+        .await
+        .unwrap();
+    assert!(saved.verifies);
+    assert!(service.get("checker").await.unwrap().verifies);
+
+    // A role file written before the flag existed.
+    let old_dir = root.path().join("roles").join("old");
+    std::fs::create_dir_all(&old_dir).unwrap();
+    std::fs::write(
+        old_dir.join("role.json"),
+        r#"{"charter":"c","denied_tools":[],"created_at":1,"updated_at":1}"#,
+    )
+    .unwrap();
+    assert!(!service.get("old").await.unwrap().verifies);
 }
 
 #[tokio::test]

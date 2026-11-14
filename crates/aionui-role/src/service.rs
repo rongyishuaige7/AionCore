@@ -99,6 +99,7 @@ impl RoleService {
         let definition = RoleDefinition {
             charter,
             denied_tools,
+            verifies: request.verifies,
             created_at: existing.map_or(now, |existing| existing.created_at),
             updated_at: now,
         };
@@ -183,6 +184,7 @@ impl RoleService {
             id: id.to_owned(),
             charter: definition.charter,
             denied_tools: definition.denied_tools,
+            verifies: definition.verifies,
             memory: self.store.read_memory(id).await?,
             memory_dir: self.store.memory_dir(id).to_string_lossy().into_owned(),
             created_at: definition.created_at,

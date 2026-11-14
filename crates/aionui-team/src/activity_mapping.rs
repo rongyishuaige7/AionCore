@@ -43,7 +43,8 @@ pub fn mailbox_row_to_response(row: &MailboxMessageRow) -> TeamMailboxMessageRes
 
 /// Maps a parsed domain `TeamTask` to its read-only response DTO.
 ///
-/// `metadata` is intentionally dropped (not exposed by the v1 activity view).
+/// `metadata` is not exposed as such; the one thing read out of it is the
+/// task's review mark.
 pub fn task_to_response(task: &TeamTask) -> TeamTaskResponse {
     TeamTaskResponse {
         id: task.id.clone(),
@@ -54,6 +55,7 @@ pub fn task_to_response(task: &TeamTask) -> TeamTaskResponse {
         owner: task.owner.clone(),
         blocked_by: task.blocked_by.clone(),
         blocks: task.blocks.clone(),
+        review: crate::task_review::review_state(task).map(|state| state.as_str().to_owned()),
         created_at: task.created_at,
         updated_at: task.updated_at,
     }
@@ -143,6 +145,24 @@ mod tests {
     }
 
     #[test]
+    fn task_review_mark_is_read_out_of_the_metadata() {
+        let task = TeamTask {
+            id: "tk1".into(),
+            team_id: "t1".into(),
+            subject: "Build".into(),
+            description: None,
+            status: TaskStatus::InProgress,
+            owner: Some("a1".into()),
+            blocked_by: vec![],
+            blocks: vec![],
+            metadata: Some(serde_json::json!({ "review": { "state": "waiting", "by": "a1", "at": 3 } })),
+            created_at: 1,
+            updated_at: 3,
+        };
+        assert_eq!(task_to_response(&task).review.as_deref(), Some("waiting"));
+    }
+
+    #[test]
     fn task_maps_all_fields_without_metadata() {
         let task = TeamTask {
             id: "tk1".into(),
@@ -163,6 +183,7 @@ mod tests {
         assert_eq!(resp.owner.as_deref(), Some("a1"));
         assert_eq!(resp.blocked_by, vec!["tk0"]);
         assert_eq!(resp.blocks, vec!["tk2"]);
+        assert_eq!(resp.review, None);
         assert_eq!(resp.created_at, 1);
         assert_eq!(resp.updated_at, 2);
     }

@@ -21,6 +21,7 @@ pub mod scheduler;
 pub mod service;
 pub mod session;
 pub mod task_board;
+mod task_review;
 pub mod team_run;
 #[cfg(test)]
 pub(crate) mod test_utils;

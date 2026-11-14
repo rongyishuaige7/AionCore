@@ -25,6 +25,10 @@ pub(crate) struct RoleDefinition {
     pub charter: String,
     #[serde(default)]
     pub denied_tools: Vec<String>,
+    /// Whether the role reviews work other members hand in. Absent in role
+    /// files written before the flag existed.
+    #[serde(default)]
+    pub verifies: bool,
     pub created_at: i64,
     pub updated_at: i64,
 }
