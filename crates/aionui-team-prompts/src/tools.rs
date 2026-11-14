@@ -83,6 +83,7 @@ mod tests {
                 ("team_task_create".to_owned(), TeamToolPermission::AnyTeamAgent),
                 ("team_task_update".to_owned(), TeamToolPermission::AnyTeamAgent),
                 ("team_task_list".to_owned(), TeamToolPermission::AnyTeamAgent),
+                ("team_remember".to_owned(), TeamToolPermission::AnyTeamAgent),
                 ("team_list_assistants".to_owned(), TeamToolPermission::AnyTeamAgent),
                 ("team_describe_assistant".to_owned(), TeamToolPermission::AnyTeamAgent),
                 ("team_spawn_agent".to_owned(), TeamToolPermission::LeadOnly),

@@ -634,6 +634,23 @@ impl aionui_team::TeamRolePort for RoleServiceTeamPort {
             Err(error) => Err(error.to_string()),
         }
     }
+
+    async fn remember(
+        &self,
+        assistant_id: &str,
+        note: &str,
+    ) -> Result<Option<aionui_team::TeamRoleMemoryNote>, String> {
+        // Notes carry the day they were written, in the user's own time zone.
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        match self.service.remember(assistant_id, note, &today).await {
+            Ok(noted) => Ok(Some(aionui_team::TeamRoleMemoryNote {
+                line: noted.line,
+                already_recorded: noted.already_recorded,
+            })),
+            Err(RoleError::InvalidId(_) | RoleError::NotFound(_)) => Ok(None),
+            Err(error) => Err(error.to_string()),
+        }
+    }
 }
 
 /// Adapts the concrete conversation / team / project services to the sidebar's

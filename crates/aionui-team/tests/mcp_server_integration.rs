@@ -248,7 +248,7 @@ async fn mc1_correct_token_connects() {
     send_request(&mut stream, &req).await;
     let resp = read_response(&mut stream).await;
     let tools = resp["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 13);
+    assert_eq!(tools.len(), 14);
     let names: Vec<&str> = tools.iter().filter_map(|tool| tool["name"].as_str()).collect();
     assert!(!names.contains(&"team_list_models"));
 
@@ -310,13 +310,14 @@ async fn mc3_no_token_rejected() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn tools_list_returns_all_13_tools() {
+async fn tools_list_returns_all_14_tools() {
     let env = setup().await;
     let mut stream = connect_and_init(env.server.port(), "test-token-123", "lead-1").await;
 
     let names = list_tools(&mut stream, 10).await;
-    assert_eq!(names.len(), 13);
+    assert_eq!(names.len(), 14);
 
+    assert!(names.contains(&"team_remember".to_owned()));
     assert!(names.contains(&"team_read_messages".to_owned()));
     assert!(names.contains(&"team_send_message".to_owned()));
     assert!(names.contains(&"team_spawn_agent".to_owned()));
@@ -363,6 +364,36 @@ async fn mcp_tools_list_filters_lead_only_tools() {
     assert!(names.contains(&"team_list_assistants".to_owned()));
     assert!(names.contains(&"team_describe_assistant".to_owned()));
     assert!(!names.contains(&"team_list_models".to_owned()));
+
+    env.server.stop();
+}
+
+// ---------------------------------------------------------------------------
+// Tests: team_remember
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn remember_checks_its_note_before_reaching_the_role_memory() {
+    let env = setup().await;
+    let mut stream = connect_and_init(env.server.port(), "test-token-123", "worker-1").await;
+
+    let missing = call_tool(&mut stream, 2, "team_remember", json!({})).await;
+    assert!(is_error_response(&missing));
+    assert!(extract_text(&missing).contains("Invalid params"));
+
+    let blank = call_tool(&mut stream, 3, "team_remember", json!({ "note": "  " })).await;
+    assert!(is_error_response(&blank));
+    assert!(extract_text(&blank).contains("note is empty"));
+
+    let too_long = call_tool(&mut stream, 4, "team_remember", json!({ "note": "x".repeat(601) })).await;
+    assert!(is_error_response(&too_long));
+    assert!(extract_text(&too_long).contains("note exceeds 600 characters"));
+
+    // This harness runs without a team service, so a good note stops there
+    // instead of being reported as kept.
+    let good = call_tool(&mut stream, 5, "team_remember", json!({ "note": "run the tests" })).await;
+    assert!(is_error_response(&good));
+    assert!(extract_text(&good).contains("Team service not available"));
 
     env.server.stop();
 }

@@ -128,6 +128,16 @@ pub struct TaskListInput {
     pub limit: Option<i64>,
 }
 
+/// Cap on one `team_remember` note, in characters.
+pub const MAX_REMEMBER_NOTE_CHARS: usize = 600;
+
+/// Arguments for the `team_remember` MCP tool call.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RememberInput {
+    pub note: String,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct RenameAgentInput {
     pub slot_id: String,
@@ -181,8 +191,21 @@ mod tests {
     }
 
     #[test]
+    fn remember_is_listed_for_teammates_and_rejects_unknown_arguments() {
+        assert!(authorize_tool(TeammateRole::Teammate, "team_remember").is_ok());
+        assert!(
+            all_tool_descriptors_for_role(TeammateRole::Teammate)
+                .iter()
+                .any(|descriptor| descriptor.name == "team_remember")
+        );
+        assert!(serde_json::from_value::<RememberInput>(json!({ "note": "x" })).is_ok());
+        assert!(serde_json::from_value::<RememberInput>(json!({ "note": "x", "role": "y" })).is_err());
+        assert!(serde_json::from_value::<RememberInput>(json!({})).is_err());
+    }
+
+    #[test]
     fn all_descriptors_count() {
-        assert_eq!(all_tool_descriptors().len(), 13);
+        assert_eq!(all_tool_descriptors().len(), 14);
     }
 
     #[test]
@@ -191,7 +214,7 @@ mod tests {
         let mut names: Vec<&str> = descs.iter().map(|d| d.name.as_str()).collect();
         names.sort();
         names.dedup();
-        assert_eq!(names.len(), 13);
+        assert_eq!(names.len(), 14);
     }
 
     #[test]

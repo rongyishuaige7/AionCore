@@ -22,8 +22,9 @@ use super::protocol::{
     read_request, write_response,
 };
 use super::tools::{
-    ClearAgentContextInput, InterruptAgentInput, ReadMessagesInput, RenameAgentInput, SendMessageInput,
-    ShutdownAgentInput, SpawnAgentInput, TaskCreateInput, TaskListInput, TaskListStatusInput, TaskUpdateInput,
+    ClearAgentContextInput, InterruptAgentInput, MAX_REMEMBER_NOTE_CHARS, ReadMessagesInput, RememberInput,
+    RenameAgentInput, SendMessageInput, ShutdownAgentInput, SpawnAgentInput, TaskCreateInput, TaskListInput,
+    TaskListStatusInput, TaskUpdateInput,
 };
 
 // ---------------------------------------------------------------------------
@@ -533,6 +534,7 @@ pub(crate) async fn dispatch_tool(
         "team_task_create" => exec_task_create(arguments, scheduler, service, team_id, caller_slot_id).await,
         "team_task_update" => exec_task_update(arguments, scheduler, service, team_id, caller_slot_id).await,
         "team_task_list" => exec_task_list(arguments, scheduler).await,
+        "team_remember" => exec_remember(arguments, scheduler, service, caller_slot_id).await,
         "team_members" => exec_members(scheduler).await,
         "team_rename_agent" => exec_rename_agent(arguments, scheduler, service, team_id).await,
         "team_clear_agent_context" => exec_clear_agent_context(arguments, scheduler, service, team_id).await,
@@ -576,6 +578,59 @@ async fn enforce_role_policy(
             )))
         }
     }
+}
+
+/// `team_remember`: the caller adds one note to the memory of the resident
+/// role it was spawned from. The backend does the write, so it works whatever
+/// the member's own workspace lets it touch, and a member that is not a role
+/// has no memory to write to.
+async fn exec_remember(
+    args: &Value,
+    scheduler: &TeammateManager,
+    service: &Weak<TeamSessionService>,
+    caller_slot_id: &str,
+) -> Result<String, ToolCallError> {
+    let input: RememberInput = serde_json::from_value(args.clone())
+        .map_err(|e| ToolCallError::from_message(format!("Invalid params: {e}")))?;
+    let note = input.note.trim();
+    if note.is_empty() {
+        return Err(ToolCallError::from_message("Invalid params: note is empty"));
+    }
+    if note.chars().count() > MAX_REMEMBER_NOTE_CHARS {
+        return Err(ToolCallError::from_message(format!(
+            "Invalid params: note exceeds {MAX_REMEMBER_NOTE_CHARS} characters"
+        )));
+    }
+
+    let caller = scheduler
+        .get_agent(caller_slot_id)
+        .await
+        .map_err(|e| ToolCallError::from_message(e.to_string()))?;
+    let Some(assistant_id) = caller.assistant_id else {
+        return Err(remember_needs_a_role());
+    };
+    let service = service
+        .upgrade()
+        .ok_or_else(|| ToolCallError::from_message("Team service not available"))?;
+    let noted = service
+        .role_port()
+        .remember(&assistant_id, note)
+        .await
+        .map_err(|reason| ToolCallError::from_message(format!("team_remember failed: {reason}")))?
+        .ok_or_else(remember_needs_a_role)?;
+
+    let action = if noted.already_recorded {
+        "already_remembered"
+    } else {
+        "remembered"
+    };
+    json_text(&json!({ "status": "ok", "action": action, "line": noted.line }))
+}
+
+/// The "Role policy" prefix reports as `PermissionDenied` (see
+/// `tool_executor::map_tool_error`).
+fn remember_needs_a_role() -> ToolCallError {
+    ToolCallError::from_message("Role policy allows team_remember only to members spawned from a resident role")
 }
 
 async fn exec_list_assistants(

@@ -3,7 +3,7 @@
 #[derive(Debug, thiserror::Error)]
 pub enum RoleError {
     /// The id cannot name a role directory (empty, too long, or characters
-    /// outside `[A-Za-z0-9._-]`). Maps to 400.
+    /// outside `[A-Za-z0-9._:-]`). Maps to 400.
     #[error("invalid role id: {0}")]
     InvalidId(String),
     /// Malformed definition or memory (unknown tool, over the size cap). Maps to 400.
