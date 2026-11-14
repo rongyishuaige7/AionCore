@@ -1,5 +1,9 @@
 //! On-disk layout of resident roles. Callers pass ids that already went
 //! through `service::validate_role_id`; the store itself never validates.
+//!
+//! An id may contain `:` (`bare:<agent id>`), which is awkward in a file name,
+//! so a role's directory spells it `@`. Validation never lets `@` into an id,
+//! which keeps the mapping reversible.
 
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -11,6 +15,8 @@ use crate::error::RoleError;
 const DEFINITION_FILE: &str = "role.json";
 const MEMORY_DIR: &str = "memory";
 const MEMORY_FILE: &str = "MEMORY.md";
+const ID_SEPARATOR: &str = ":";
+const DIR_SEPARATOR: &str = "@";
 
 /// Contents of `role.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,14 +40,14 @@ impl RoleStore {
     }
 
     fn role_dir(&self, id: &str) -> PathBuf {
-        self.root.join(id)
+        self.root.join(id.replace(ID_SEPARATOR, DIR_SEPARATOR))
     }
 
     pub(crate) fn memory_dir(&self, id: &str) -> PathBuf {
         self.role_dir(id).join(MEMORY_DIR)
     }
 
-    /// Names of every directory under the root, sorted. A directory is only a
+    /// Ids of every directory under the root, sorted. A directory is only a
     /// role once it also holds a definition file.
     pub(crate) async fn list_ids(&self) -> Result<Vec<String>, RoleError> {
         let mut entries = match tokio::fs::read_dir(&self.root).await {
@@ -55,7 +61,7 @@ impl RoleStore {
                 continue;
             }
             if let Ok(name) = entry.file_name().into_string() {
-                ids.push(name);
+                ids.push(name.replace(DIR_SEPARATOR, ID_SEPARATOR));
             }
         }
         ids.sort();

@@ -76,6 +76,27 @@ async fn role_lifecycle_over_http() {
 }
 
 #[tokio::test]
+async fn a_percent_encoded_colon_in_the_id_reaches_the_role() {
+    let root = tempfile::tempdir().unwrap();
+    let app = app(&root);
+
+    // The frontend sends `encodeURIComponent("bare:8e1acf31")`.
+    let (status, body) = send(
+        &app,
+        Method::PUT,
+        "/api/roles/bare%3A8e1acf31",
+        Some(json!({ "charter": "Writes the code." })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["id"], "bare:8e1acf31");
+
+    let (status, body) = send(&app, Method::GET, "/api/roles/bare%3A8e1acf31", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["charter"], "Writes the code.");
+}
+
+#[tokio::test]
 async fn bad_input_maps_to_stable_codes() {
     let root = tempfile::tempdir().unwrap();
     let app = app(&root);

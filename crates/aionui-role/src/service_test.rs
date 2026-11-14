@@ -129,6 +129,7 @@ async fn ids_that_could_escape_the_root_are_rejected() {
         "../outside",
         "a/b",
         "a\\b",
+        "a@b",
         ".hidden",
         "空",
         too_long.as_str(),
@@ -141,6 +142,27 @@ async fn ids_that_could_escape_the_root_are_rejected() {
         assert!(matches!(service.find(id).await, Err(RoleError::InvalidId(_))));
     }
     assert!(!root.path().join("outside").exists());
+}
+
+#[tokio::test]
+async fn a_bare_agent_assistant_can_be_a_role() {
+    let root = tempfile::tempdir().unwrap();
+    let service = service(&root);
+
+    let role = service
+        .upsert("bare:8e1acf31", request("Writes the code.", &[]))
+        .await
+        .unwrap();
+    service.set_memory("bare:8e1acf31", "- runs the tests").await.unwrap();
+
+    assert_eq!(role.id, "bare:8e1acf31");
+    assert!(root.path().join("roles").join("bare@8e1acf31").join("role.json").is_file());
+    assert!(!role.memory_dir.contains(':'));
+
+    let listed = service.list().await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, "bare:8e1acf31");
+    assert_eq!(listed[0].memory, "- runs the tests");
 }
 
 #[tokio::test]
