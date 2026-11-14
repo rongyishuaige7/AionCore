@@ -37,6 +37,7 @@ use aionui_mcp::{
 use aionui_office::{ConversionService, OfficeRouterState, OfficecliWatchManager, ProxyService};
 use aionui_project::{ProjectRouterState, ProjectService};
 use aionui_realtime::{MessageRouter, TokenUserResolver, WsHandlerState};
+use aionui_role::{RoleError, RoleRouterState, RoleService};
 use aionui_session_message::drainer::Drainer;
 use aionui_session_message::state::SessionMessageRouterState;
 use aionui_session_message::targets::MentionableTargets;
@@ -137,6 +138,7 @@ pub struct ModuleStates {
     pub file: FileRouterState,
     pub project: ProjectRouterState,
     pub sidebar: SidebarRouterState,
+    pub role: RoleRouterState,
     pub mcp: McpRouterState,
     pub extension: ExtensionRouterState,
     pub hub: HubRouterState,
@@ -315,6 +317,7 @@ pub async fn build_module_states(
         file: build_module_state_phase(&boot, "file", || build_file_state(services))?,
         project: build_module_state_phase(&boot, "project", || build_project_state(services)),
         sidebar: build_module_state_phase(&boot, "sidebar", || build_sidebar_state(services)),
+        role: build_module_state_phase(&boot, "role", || build_role_state(services)),
         mcp: build_module_state_phase(&boot, "mcp", || build_mcp_state(services)),
         extension: ext_state,
         hub: hub_state,
@@ -592,6 +595,44 @@ pub fn build_sidebar_state(services: &AppServices) -> SidebarRouterState {
     );
     SidebarRouterState {
         service: Arc::new(service),
+    }
+}
+
+/// Resident roles live as plain files under `<data_dir>/roles`. The service is
+/// a stateless view over that directory, so the HTTP routes and the team
+/// runtime may each hold their own instance.
+fn role_service(services: &AppServices) -> Arc<RoleService> {
+    Arc::new(RoleService::new(services.data_dir.join("roles")))
+}
+
+/// Build the resident-role router state from application services.
+pub fn build_role_state(services: &AppServices) -> RoleRouterState {
+    RoleRouterState {
+        service: role_service(services),
+    }
+}
+
+/// Adapts the role service to the team runtime's [`aionui_team::TeamRolePort`],
+/// keyed by the assistant id a member was spawned from, without the team crate
+/// depending on the role crate.
+struct RoleServiceTeamPort {
+    service: Arc<RoleService>,
+}
+
+#[async_trait::async_trait]
+impl aionui_team::TeamRolePort for RoleServiceTeamPort {
+    async fn role_brief(&self, assistant_id: &str) -> Result<Option<aionui_team::TeamRoleBrief>, String> {
+        match self.service.find(assistant_id).await {
+            Ok(role) => Ok(role.map(|role| aionui_team::TeamRoleBrief {
+                charter: role.charter,
+                memory: role.memory,
+                memory_dir: role.memory_dir,
+                denied_tools: role.denied_tools,
+            })),
+            // An assistant id that cannot name a role directory is not a role.
+            Err(RoleError::InvalidId(_)) => Ok(None),
+            Err(error) => Err(error.to_string()),
+        }
     }
 }
 
@@ -997,6 +1038,11 @@ pub fn build_team_state(
     service.with_project_service(Arc::new(services.project_service.clone()));
     // Path-2 cascade: removing a team drops its `user_order` row (sidebar §4.3).
     service.with_user_order_store(services.user_order_store.clone());
+    // Members spawned from a resident role are woken with its charter and
+    // memory and held to its team-tool permission table.
+    service.with_role_port(Arc::new(RoleServiceTeamPort {
+        service: role_service(services),
+    }));
     TeamRouterState {
         service,
         active_leases: services.active_lease_registry.clone(),

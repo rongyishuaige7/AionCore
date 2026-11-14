@@ -27,6 +27,7 @@ mod project;
 mod provider;
 mod remote_agent;
 mod response;
+mod role;
 mod runtime;
 mod session_tools;
 mod shell;
@@ -160,6 +161,7 @@ pub use remote_agent::{
     TestRemoteAgentConnectionRequest, UpdateRemoteAgentRequest,
 };
 pub use response::{ApiResponse, ErrorResponse};
+pub use role::{RoleListResponse, RoleResponse, UpdateRoleMemoryRequest, UpsertRoleRequest};
 pub use runtime::{
     EnsureNodeRuntimeRequest, EnsureNodeRuntimeResponse, RuntimeFailureKind, RuntimeResourceKind, RuntimeStatusPayload,
     RuntimeStatusPhase, RuntimeStatusScope, RuntimeStatusScopeKind,

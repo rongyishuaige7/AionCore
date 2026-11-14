@@ -36,6 +36,16 @@ pub fn authorize_tool(caller_role: TeammateRole, tool_name: &str) -> Result<(), 
     Ok(())
 }
 
+/// Second gate after [`authorize_tool`]: a member spawned from a resident role
+/// may not call the team tools its role denies. The message prefix is matched
+/// by `tool_executor::map_tool_error` to report `PermissionDenied`.
+pub fn authorize_role_tool(denied_tools: &[String], tool_name: &str) -> Result<(), String> {
+    if denied_tools.iter().any(|denied| denied == tool_name) {
+        return Err(format!("Role policy denies {tool_name}"));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Tool call input types
 // ---------------------------------------------------------------------------
@@ -157,6 +167,17 @@ mod tests {
     fn interrupt_agent_is_lead_only() {
         assert!(authorize_tool(TeammateRole::Lead, "team_interrupt_agent").is_ok());
         assert!(authorize_tool(TeammateRole::Teammate, "team_interrupt_agent").is_err());
+    }
+
+    #[test]
+    fn role_policy_denies_only_listed_tools() {
+        let denied = vec!["team_task_create".to_owned()];
+        assert_eq!(
+            authorize_role_tool(&denied, "team_task_create"),
+            Err("Role policy denies team_task_create".to_owned())
+        );
+        assert!(authorize_role_tool(&denied, "team_task_update").is_ok());
+        assert!(authorize_role_tool(&[], "team_task_create").is_ok());
     }
 
     #[test]

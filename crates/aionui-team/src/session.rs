@@ -31,7 +31,9 @@ use crate::ports::{
     SlashCommandRecognition,
 };
 use crate::prompt_dump::{TeamPromptDumpConfig, TeamWakePromptDump, dump_team_wake_prompt};
-use crate::prompts::{build_lead_prompt_for_transport, build_teammate_prompt_for_transport, build_wake_payload};
+use crate::prompts::{
+    build_lead_prompt_for_transport, build_teammate_prompt_for_transport, build_wake_payload, render_standing_role,
+};
 use crate::provisioning::PersistSpawnedAgentRequest;
 use crate::scheduler::{TeammateManager, normalize_name};
 use crate::service::TeamSessionService;
@@ -457,7 +459,8 @@ impl TeamSession {
                                 build_teammate_prompt_for_transport(&agent, &self.team.name, &members, tool_transport)
                             }
                         };
-                        format!("{role_prompt}\n\n{wake_body}")
+                        let standing_role = self.standing_role_section(&agent).await;
+                        format!("{role_prompt}{standing_role}\n\n{wake_body}")
                     } else {
                         wake_body
                     };
@@ -505,6 +508,32 @@ impl TeamSession {
             ReconcileDecision::WaitingForCompletion => Ok(PrepareBatchResult::WaitingForCompletion),
             ReconcileDecision::Blocked(_) => Ok(PrepareBatchResult::Blocked),
             ReconcileDecision::Quiescent => Ok(PrepareBatchResult::Quiescent),
+        }
+    }
+
+    /// Standing-role section for a member spawned from a resident role, led by
+    /// a blank line so it can be appended to the role prompt; empty when the
+    /// member is not a role. A failed lookup costs the member its brief for
+    /// this context only and never blocks the wake.
+    async fn standing_role_section(&self, agent: &TeamAgent) -> String {
+        let Some(assistant_id) = agent.assistant_id.as_deref() else {
+            return String::new();
+        };
+        let Some(service) = self.service.upgrade() else {
+            return String::new();
+        };
+        match service.role_port().role_brief(assistant_id).await {
+            Ok(Some(brief)) => format!("\n\n{}", render_standing_role(&brief)),
+            Ok(None) => String::new(),
+            Err(error) => {
+                warn!(
+                    team_id = %self.team.id,
+                    slot_id = %agent.slot_id,
+                    error = %error,
+                    "team role brief unavailable"
+                );
+                String::new()
+            }
         }
     }
 

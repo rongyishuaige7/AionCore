@@ -521,6 +521,7 @@ pub(crate) async fn dispatch_tool(
     caller_role: TeammateRole,
 ) -> Result<String, ToolCallError> {
     super::tools::authorize_tool(caller_role, tool_name).map_err(ToolCallError::from_message)?;
+    enforce_role_policy(tool_name, scheduler, service, caller_slot_id).await?;
 
     match tool_name {
         "team_read_messages" => exec_read_messages(arguments, service, team_id, caller_slot_id).await,
@@ -541,6 +542,39 @@ pub(crate) async fn dispatch_tool(
         "team_list_assistants" => exec_list_assistants(arguments, service, team_id).await,
         "team_describe_assistant" => exec_describe_assistant(arguments, service, team_id).await,
         _ => Err(ToolCallError::from_message(format!("Unknown tool: {tool_name}"))),
+    }
+}
+
+/// Resident-role permission table. A caller spawned from a role may not use the
+/// team tools that role denies; a caller that is not a role passes untouched.
+/// When the role cannot be read the call is refused, so a broken role file
+/// never widens what its member may do.
+async fn enforce_role_policy(
+    tool_name: &str,
+    scheduler: &TeammateManager,
+    service: &Weak<TeamSessionService>,
+    caller_slot_id: &str,
+) -> Result<(), ToolCallError> {
+    let Ok(caller) = scheduler.get_agent(caller_slot_id).await else {
+        return Ok(());
+    };
+    let Some(assistant_id) = caller.assistant_id else {
+        return Ok(());
+    };
+    let Some(service) = service.upgrade() else {
+        return Ok(());
+    };
+    match service.role_port().role_brief(&assistant_id).await {
+        Ok(Some(brief)) => {
+            super::tools::authorize_role_tool(&brief.denied_tools, tool_name).map_err(ToolCallError::from_message)
+        }
+        Ok(None) => Ok(()),
+        Err(error) => {
+            warn!(tool = tool_name, slot_id = caller_slot_id, error = %error, "team role policy unavailable");
+            Err(ToolCallError::from_message(format!(
+                "Role policy unavailable, {tool_name} refused"
+            )))
+        }
     }
 }
 

@@ -44,7 +44,7 @@ use crate::member_runtime::{
 use crate::message_projection::TeamProjectionMessageStore;
 use crate::ports::{
     AgentTurnCancellationPort, AgentTurnExecutionPort, NativeSlashCommandPort, NoopNativeSlashCommandPort,
-    TeamAssistantCatalogPort, TeamToolCapabilityPort, UnknownTeamToolCapabilityPort,
+    NoopTeamRolePort, TeamAssistantCatalogPort, TeamRolePort, TeamToolCapabilityPort, UnknownTeamToolCapabilityPort,
 };
 use crate::prompt_dump::TeamPromptDumpConfig;
 use crate::provisioning::{TeamAgentProvisioner, TeamConversationProvisioningPort};
@@ -180,6 +180,11 @@ pub struct TeamSessionService {
     /// team's `user_order` rows (design §4.3, path 2). `None` → no-op, so team
     /// deletion behaves exactly as before.
     user_order: Arc<RwLock<Option<Arc<dyn IUserOrderStore>>>>,
+    /// Resident-role lookup (optional). Set → a member spawned from a role is
+    /// woken with the role's charter and memory and is held to its team-tool
+    /// permission table. `None` → no member is a role, so teams behave exactly
+    /// as before.
+    role_port: Arc<RwLock<Option<Arc<dyn TeamRolePort>>>>,
     /// Back-pointer used by [`TeamSession::spawn_agent`] to reach DB-facing
     /// orchestration without threading the service through every session method.
     /// Stored as `Weak` so the session map does not create a strong cycle with
@@ -305,6 +310,7 @@ impl TeamSessionService {
             ensure_session_locks: Arc::new(DashMap::new()),
             project_service: Arc::new(RwLock::new(None)),
             user_order: Arc::new(RwLock::new(None)),
+            role_port: Arc::new(RwLock::new(None)),
             self_ref: weak.clone(),
         })
     }
@@ -439,6 +445,22 @@ impl TeamSessionService {
         if let Ok(mut guard) = self.user_order.write() {
             *guard = Some(user_order);
         }
+    }
+
+    /// Inject the resident-role lookup. When unset, no member is treated as a
+    /// role (see [`NoopTeamRolePort`]).
+    pub fn with_role_port(&self, role_port: Arc<dyn TeamRolePort>) {
+        if let Ok(mut guard) = self.role_port.write() {
+            *guard = Some(role_port);
+        }
+    }
+
+    /// The injected role lookup, or the no-op one.
+    pub(crate) fn role_port(&self) -> Arc<dyn TeamRolePort> {
+        if let Some(port) = self.role_port.read().ok().and_then(|guard| guard.clone()) {
+            return port;
+        }
+        Arc::new(NoopTeamRolePort)
     }
 
     /// Best-effort cascade of a removed team's `user_order` row (design §4.3,

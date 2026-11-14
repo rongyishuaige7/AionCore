@@ -98,7 +98,7 @@ fn team_tool_role(role: TeammateRole) -> TeamToolRole {
 fn map_tool_error(error: ToolCallError) -> TeamToolErrorPayload {
     let code = if error.message.starts_with("Unknown tool:") {
         TeamToolErrorCode::UnknownTool
-    } else if error.message.starts_with("Only Lead") {
+    } else if error.message.starts_with("Only Lead") || error.message.starts_with("Role policy") {
         TeamToolErrorCode::PermissionDenied
     } else if error.message.starts_with("Invalid params")
         || error.message.starts_with("Missing required field")
@@ -133,5 +133,20 @@ mod tests {
         let err = team_tool_call_from_name("missing_tool", json!({})).unwrap_err();
         assert_eq!(err.code, TeamToolErrorCode::UnknownTool);
         assert!(err.message.contains("Unknown tool"));
+    }
+
+    #[test]
+    fn role_policy_refusals_map_to_permission_denied() {
+        for message in [
+            "Role policy denies team_task_create",
+            "Role policy unavailable, team_task_create refused",
+        ] {
+            let payload = map_tool_error(ToolCallError {
+                message: message.to_owned(),
+                domain_code: None,
+                details: None,
+            });
+            assert_eq!(payload.code, TeamToolErrorCode::PermissionDenied);
+        }
     }
 }
