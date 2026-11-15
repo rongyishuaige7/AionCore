@@ -1543,7 +1543,11 @@ mod tests {
 
         assert!(hook.exists(), "another conversation here may still need the gate");
         let decision = b.request_external_permission("run_command".into(), json!({})).await;
-        assert_eq!(decision, PermissionDecision::Approved, "full auto is answered by the host");
+        assert_eq!(
+            decision,
+            PermissionDecision::Approved,
+            "full auto is answered by the host"
+        );
     }
 
     #[tokio::test]
@@ -1559,7 +1563,11 @@ mod tests {
             // FakeSpawner cannot produce a process; the hook must be there by then.
             let _ = b.dispatch(send("hello")).await;
 
-            assert_eq!(std::fs::read_to_string(&hook).unwrap(), "{\"stub\":true}", "mode={mode}");
+            assert_eq!(
+                std::fs::read_to_string(&hook).unwrap(),
+                "{\"stub\":true}",
+                "mode={mode}"
+            );
         }
     }
 

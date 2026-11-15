@@ -250,8 +250,15 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let tokens = HookTokenRegistry::new();
             let build = |conversation: &str, full_auto: bool| {
-                register_hook(dir.path(), Path::new("/opt/aioncore"), BASE_URL, &tokens, conversation, full_auto)
-                    .unwrap()
+                register_hook(
+                    dir.path(),
+                    Path::new("/opt/aioncore"),
+                    BASE_URL,
+                    &tokens,
+                    conversation,
+                    full_auto,
+                )
+                .unwrap()
             };
 
             let (auto, asking) = if auto_first {
@@ -262,7 +269,10 @@ mod tests {
                 (build("auto", true), asking)
             };
 
-            assert!(dir.path().join(".agents/hooks.json").exists(), "auto_first={auto_first}");
+            assert!(
+                dir.path().join(".agents/hooks.json").exists(),
+                "auto_first={auto_first}"
+            );
             assert!(tokens.verify("auto", value(&auto, AntigravityHookConfig::ENV_TOKEN).unwrap()));
             assert!(tokens.verify("asking", value(&asking, AntigravityHookConfig::ENV_TOKEN).unwrap()));
         }
