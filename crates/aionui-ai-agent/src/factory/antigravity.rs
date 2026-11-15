@@ -37,6 +37,70 @@ pub(crate) fn is_full_auto(session_mode: Option<&str>, yolo_id: &str) -> bool {
     session_mode.is_some_and(|m| m.eq_ignore_ascii_case(yolo_id))
 }
 
+/// Install the approval hook in `workspace` and return the environment that lets
+/// this conversation's agy reach the callback.
+///
+/// Done for EVERY mode, full auto included. `hooks.json` belongs to the workspace
+/// while the callback coordinates belong to the conversation, and several
+/// conversations can share one workspace. Treating the file as this
+/// conversation's own — install it for approval modes, delete it for full auto,
+/// and give a full-auto session no coordinates — let neighbours break each other:
+///
+/// - an approval-mode conversation installed the hook, and a full-auto one in the
+///   same directory then ran it with no callback address, which fails closed:
+///   every tool denied with "aionui hook is not configured";
+/// - a full-auto conversation deleted the hook, and the approval-mode one beside
+///   it stopped being asked about anything and ran unattended.
+///
+/// Full auto is decided where the mode is known per conversation instead: the
+/// session backend approves a full-auto session's callbacks on the spot.
+fn register_hook(
+    workspace: &std::path::Path,
+    hook_binary: &std::path::Path,
+    base_url: &str,
+    tokens: &crate::antigravity_hook::HookTokenRegistry,
+    conversation_id: &str,
+    full_auto: bool,
+) -> Result<Vec<(String, String)>, AgentError> {
+    if let Err(e) = crate::antigravity_hook::write_hooks_json(workspace, hook_binary) {
+        if !full_auto {
+            // Without the hook this session would run with agy's gate wide open
+            // and no per-call approval, so the failure must be loud.
+            return Err(AgentError::internal(format!(
+                "antigravity: could not register the permission hook in {}: {e}",
+                workspace.display()
+            )));
+        }
+        // Full auto loses nothing: with no hook its tools run unasked, which is
+        // what the mode means, and a hook already there can still call back.
+        tracing::warn!(
+            conversation_id = %conversation_id,
+            error = %e,
+            "antigravity: full auto — could not write the approval hook; continuing without it"
+        );
+    }
+    if full_auto {
+        tracing::info!(
+            conversation_id = %conversation_id,
+            "antigravity: full-auto mode — tool calls are approved without a prompt"
+        );
+    }
+    // Minting here also invalidates any token left over from a prior build of
+    // this conversation, so a stale hook cannot answer for the new session.
+    let token = tokens.issue(conversation_id);
+    Ok(vec![
+        (
+            aionui_api_types::AntigravityHookConfig::ENV_BASE_URL.to_owned(),
+            base_url.to_owned(),
+        ),
+        (aionui_api_types::AntigravityHookConfig::ENV_TOKEN.to_owned(), token),
+        (
+            aionui_api_types::AntigravityHookConfig::ENV_CONVERSATION_ID.to_owned(),
+            conversation_id.to_owned(),
+        ),
+    ])
+}
+
 pub(super) async fn build(
     deps: Arc<AgentFactoryDeps>,
     build_context: AntigravitySessionBuildContext,
@@ -65,56 +129,32 @@ pub(super) async fn build(
         crate::session_agent::resolved_session_mode(&config, build_context.session_snapshot.as_ref(), &meta);
     let full_auto = is_full_auto(resolved_mode.as_deref(), yolo_mode_id(meta.yolo_id.as_deref()));
     let hook_env = match deps.antigravity_hook_base_url.as_deref() {
-        _ if full_auto => {
-            tracing::info!(
-                conversation_id = %ctx.conversation_id,
-                "antigravity: full-auto mode — tools execute without per-call approval"
-            );
-            // Drop any hook an earlier non-full-auto build left in this
-            // workspace, and revoke its token, or agy would keep calling back
-            // and block on approval nobody is there to give.
-            crate::antigravity_hook::remove_hooks_json(std::path::Path::new(&ctx.workspace));
-            deps.antigravity_hook_tokens.revoke(&ctx.conversation_id);
-            Vec::new()
-        }
-        Some(base_url) => {
-            let hook_binary = deps.backend_binary_path.as_path();
-            crate::antigravity_hook::write_hooks_json(std::path::Path::new(&ctx.workspace), hook_binary).map_err(
-                |e| {
-                    AgentError::internal(format!(
-                        "antigravity: could not register the permission hook in {}: {e}",
-                        ctx.workspace
-                    ))
-                },
-            )?;
-            // Minting here also invalidates any token left over from a prior
-            // build of this conversation, so a stale hook cannot answer for the
-            // new session.
-            let token = deps.antigravity_hook_tokens.issue(&ctx.conversation_id);
-            vec![
-                (
-                    aionui_api_types::AntigravityHookConfig::ENV_BASE_URL.to_owned(),
-                    base_url.to_owned(),
-                ),
-                (aionui_api_types::AntigravityHookConfig::ENV_TOKEN.to_owned(), token),
-                (
-                    aionui_api_types::AntigravityHookConfig::ENV_CONVERSATION_ID.to_owned(),
-                    ctx.conversation_id.clone(),
-                ),
-            ]
-        }
+        Some(base_url) => register_hook(
+            std::path::Path::new(&ctx.workspace),
+            deps.backend_binary_path.as_path(),
+            base_url,
+            &deps.antigravity_hook_tokens,
+            &ctx.conversation_id,
+            full_auto,
+        )?,
         None => {
-            tracing::warn!(
-                conversation_id = %ctx.conversation_id,
-                "antigravity: no hook callback address configured — tools will run WITHOUT per-call approval"
-            );
+            if full_auto {
+                // This host can answer no hook at all, so one left behind in the
+                // workspace would deny every tool of a session that asked for none.
+                crate::antigravity_hook::remove_hooks_json(std::path::Path::new(&ctx.workspace));
+                deps.antigravity_hook_tokens.revoke(&ctx.conversation_id);
+            } else {
+                tracing::warn!(
+                    conversation_id = %ctx.conversation_id,
+                    "antigravity: no hook callback address configured — tools will run WITHOUT per-call approval"
+                );
+            }
             Vec::new()
         }
     };
 
-    // Prepared in every branch: full auto does not install it now, but the user
-    // may switch out of full auto later and the backend needs it to restore the
-    // gate.
+    // Handed to the backend in every mode: it puts the file back before each
+    // turn, since anything sharing the workspace can delete it in between.
     let permission_hook_body = deps
         .antigravity_hook_base_url
         .as_deref()
@@ -176,7 +216,75 @@ pub(super) async fn build(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_full_auto, yolo_mode_id};
+    use super::{is_full_auto, register_hook, yolo_mode_id};
+    use crate::antigravity_hook::HookTokenRegistry;
+    use aionui_api_types::AntigravityHookConfig;
+    use std::path::Path;
+
+    const BASE_URL: &str = "http://127.0.0.1:54810";
+
+    fn value<'a>(env: &'a [(String, String)], name: &str) -> Option<&'a str> {
+        env.iter().find(|(key, _)| key == name).map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn a_full_auto_session_can_reach_the_callback_too() {
+        // The hook in a workspace runs for every agy started there. A full-auto
+        // session spawned without these three could only be denied by it.
+        let dir = tempfile::tempdir().unwrap();
+        let tokens = HookTokenRegistry::new();
+
+        let env = register_hook(dir.path(), Path::new("/opt/aioncore"), BASE_URL, &tokens, "auto", true).unwrap();
+
+        assert_eq!(value(&env, AntigravityHookConfig::ENV_BASE_URL), Some(BASE_URL));
+        assert_eq!(value(&env, AntigravityHookConfig::ENV_CONVERSATION_ID), Some("auto"));
+        let token = value(&env, AntigravityHookConfig::ENV_TOKEN).expect("a token is issued");
+        assert!(tokens.verify("auto", token));
+    }
+
+    #[test]
+    fn conversations_sharing_a_workspace_do_not_take_the_hook_from_each_other() {
+        // Whichever is built last, the approval-mode one keeps its gate and both
+        // can authenticate their callbacks.
+        for auto_first in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let tokens = HookTokenRegistry::new();
+            let build = |conversation: &str, full_auto: bool| {
+                register_hook(dir.path(), Path::new("/opt/aioncore"), BASE_URL, &tokens, conversation, full_auto)
+                    .unwrap()
+            };
+
+            let (auto, asking) = if auto_first {
+                let auto = build("auto", true);
+                (auto, build("asking", false))
+            } else {
+                let asking = build("asking", false);
+                (build("auto", true), asking)
+            };
+
+            assert!(dir.path().join(".agents/hooks.json").exists(), "auto_first={auto_first}");
+            assert!(tokens.verify("auto", value(&auto, AntigravityHookConfig::ENV_TOKEN).unwrap()));
+            assert!(tokens.verify("asking", value(&asking, AntigravityHookConfig::ENV_TOKEN).unwrap()));
+        }
+    }
+
+    #[test]
+    fn only_an_approval_session_fails_when_the_hook_cannot_be_written() {
+        // A plain file where the workspace directory should be: nothing can be
+        // created under it.
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("not-a-directory");
+        std::fs::write(&blocked, "").unwrap();
+        let tokens = HookTokenRegistry::new();
+
+        // Unattended anyway, so it still starts — and still gets its coordinates,
+        // for a hook some other conversation may have installed.
+        let env = register_hook(&blocked, Path::new("/opt/aioncore"), BASE_URL, &tokens, "auto", true).unwrap();
+        assert!(value(&env, AntigravityHookConfig::ENV_TOKEN).is_some());
+
+        // Asked to gate every tool and unable to: starting would be the lie.
+        assert!(register_hook(&blocked, Path::new("/opt/aioncore"), BASE_URL, &tokens, "asking", false).is_err());
+    }
 
     #[test]
     fn the_catalog_sentinel_turns_off_the_approval_hook() {

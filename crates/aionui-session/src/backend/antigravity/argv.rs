@@ -2,11 +2,12 @@
 
 /// AionUi's sentinel mode id meaning "run without approval prompts".
 ///
-/// Not one of agy's modes and never sent to it; answered by removing the approval hook.
+/// Not one of agy's modes and never sent to it; answered by the host, which approves
+/// every hook callback of a session on this mode without raising a card.
 pub(crate) const FULL_AUTO_SENTINEL: &str = "yolo";
 
 /// AionUi's mode id meaning "ask before sensitive things" — its counterpart to
-/// [`FULL_AUTO_SENTINEL`], answered by KEEPING the approval hook installed.
+/// [`FULL_AUTO_SENTINEL`], answered by raising a card for each hook callback.
 ///
 /// Also not an agy value: `agy --help` lists exactly two (verified:
 /// samples/antigravity-cli/1.1.8/agy_--help.txt:12 — "Set the agent execution mode for
@@ -118,9 +119,9 @@ pub(crate) fn build_argv(input: &ArgvInput) -> Vec<String> {
     // silently ignored by agy.
     // agy takes exactly two values here: `accept-edits` and `plan`. AionUi's other two
     // modes are host-side concepts expressed through the approval hook — `yolo` by
-    // removing it, `default` by keeping it — and agy rejects both by name, warning and
-    // discarding the flag. Sending either would look fine (exit 0) while silently
-    // leaving the session on agy's default. See the two constants above.
+    // approving every callback, `default` by asking the user — and agy rejects both by
+    // name, warning and discarding the flag. Sending either would look fine (exit 0)
+    // while silently leaving the session on agy's default. See the two constants above.
     let mode = input
         .mode
         .as_deref()

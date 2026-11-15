@@ -352,10 +352,10 @@ pub struct AntigravitySessionBackend {
     /// This is what decides whether a mid-turn mode switch can reach agy at all. The
     /// permission gate lives on the host — agy calls back per tool use and
     /// `request_external_permission` re-reads the mode each time — so a hooked turn
-    /// honours a switch immediately, in both directions. A turn spawned in FULL AUTO has
-    /// no hook, never calls back, and therefore cannot learn about a tightening until the
-    /// next process starts; `sync_permission_hook` writes the file back, but nothing
-    /// proves a running agy re-reads it.
+    /// honours a switch immediately, in both directions. Every turn is hooked once a
+    /// callback address is configured, full auto included (see `turn_calls_back`). Only
+    /// a full-auto turn on a host with NO callback address runs without one: it never
+    /// calls back and cannot learn about a tightening until the next process starts.
     ///
     /// Recorded at spawn rather than derived from the current mode, because the current
     /// mode is exactly what the user just changed.
@@ -527,43 +527,44 @@ impl AntigravitySessionBackend {
         }
     }
 
-    /// Install or remove the approval hook so agy's view matches the current mode.
+    /// Keep the approval hook on disk, whatever mode this session is on.
     ///
-    /// Removal alone would be unsafe in reverse: with no `hooks.json` agy never
-    /// calls back, so switching OUT of full auto has to put the file back or the
-    /// session keeps running unattended behind a UI that says otherwise.
-    fn sync_permission_hook(&self) {
-        let Some(cwd) = self.config.cwd.as_deref() else {
+    /// `hooks.json` belongs to the WORKSPACE, and several conversations can share one.
+    /// It used to follow this session's mode — removed for full auto, written back
+    /// otherwise — which let neighbours break each other: a conversation going full
+    /// auto deleted the gate under an approval-mode one (which then ran unattended),
+    /// and an approval-mode one installed a hook that a full-auto neighbour, spawned
+    /// without the callback address, could only fail closed on — every tool denied
+    /// with "aionui hook is not configured (missing callback address)".
+    ///
+    /// So the file is never removed here. Full auto is answered where the mode is
+    /// known per conversation: `request_external_permission` approves at once.
+    fn install_permission_hook(&self) {
+        let (Some(cwd), Some(body)) = (self.config.cwd.as_deref(), self.config.permission_hook_body.as_deref()) else {
+            // No workspace, or no callback address on this host: there is no hook
+            // to install, and nothing gating tools either.
             return;
         };
         let dir = std::path::Path::new(cwd).join(".agents");
         let path = dir.join("hooks.json");
-        if self.is_full_auto() {
-            match std::fs::remove_file(&path) {
-                Ok(()) => {
-                    tracing::info!(session_id = %self.session_id, "antigravity: full auto — approval hook removed")
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    tracing::warn!(session_id = %self.session_id, error = %e, "antigravity: could not remove the approval hook")
-                }
-            }
+        // Called before every turn, so leave an intact file alone.
+        if std::fs::read_to_string(&path).is_ok_and(|current| current == body) {
             return;
         }
-        let Some(body) = self.config.permission_hook_body.as_deref() else {
-            // No hook was ever configured for this session (no callback address),
-            // so there is nothing to restore — and nothing gating tools either.
-            tracing::warn!(
-                session_id = %self.session_id,
-                "antigravity: leaving full auto but no approval hook is configured; tools stay unattended"
-            );
-            return;
-        };
         if let Err(e) = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, body)) {
-            tracing::warn!(session_id = %self.session_id, error = %e, "antigravity: could not restore the approval hook");
+            tracing::warn!(session_id = %self.session_id, error = %e, "antigravity: could not install the approval hook");
         } else {
-            tracing::info!(session_id = %self.session_id, "antigravity: approval hook restored");
+            tracing::info!(session_id = %self.session_id, "antigravity: approval hook installed");
         }
+    }
+
+    /// Whether a turn spawned right now asks the host before each tool.
+    ///
+    /// With a callback address configured every turn does — a full-auto one too, it
+    /// is simply approved on the spot. Without one no hook exists at all; the answer
+    /// then follows the mode, as it did before full-auto turns kept their hook.
+    fn turn_calls_back(&self) -> bool {
+        self.config.permission_hook_body.is_some() || !self.is_full_auto()
     }
 
     /// The mode this session is on right now, honouring a runtime switch.
@@ -608,8 +609,9 @@ impl AntigravitySessionBackend {
     /// Between turns: yes — the next spawn reads the new mode from argv either way.
     /// During a hooked turn: yes — agy calls back per tool use and the host gate re-reads
     /// the mode, so the switch governs the very next tool, in both directions.
-    /// During a full-auto turn: no — that process was spawned without a hook, never calls
-    /// back, and cannot be told; only the next spawn picks it up.
+    /// During a turn spawned without a hook (full auto on a host with no callback
+    /// address): no — that process never calls back and cannot be told; only the next
+    /// spawn picks it up.
     fn switch_reaches_current_turn(&self) -> bool {
         !self.in_flight.load(Ordering::SeqCst) || self.turn_started_hooked.load(Ordering::SeqCst)
     }
@@ -707,6 +709,11 @@ impl AntigravitySessionBackend {
             cwd: self.config.cwd.clone(),
         };
 
+        // The hook file is the only thing that makes agy ask. It lives in the
+        // workspace, where anything can delete it between turns, so put it back
+        // before each one rather than trusting what the session build left.
+        self.install_permission_hook();
+
         let proc = self
             .spawner
             .spawn(spec, &[], &self.session_id)
@@ -714,9 +721,9 @@ impl AntigravitySessionBackend {
             .map_err(|e| BackendError::Transport(format!("spawn agy: {e}")))?;
         *self.current.lock().await = Some(Arc::clone(&proc));
         // Freeze whether THIS turn can hear about a later mode switch. A hooked turn
-        // calls back per tool use, so the host gate applies a switch at once; a full-auto
-        // turn never calls back and only the next spawn can pick one up.
-        self.turn_started_hooked.store(!self.is_full_auto(), Ordering::SeqCst);
+        // calls back per tool use, so the host gate applies a switch at once; a turn
+        // spawned without a hook never calls back and only the next spawn can pick one up.
+        self.turn_started_hooked.store(self.turn_calls_back(), Ordering::SeqCst);
         self.in_flight.store(true, Ordering::SeqCst);
         self.spawn_reader(Arc::clone(&proc), turn_gen);
         Ok(turn_gen)
@@ -975,18 +982,24 @@ impl SessionBackend for AntigravitySessionBackend {
                 if let Ok(mut guard) = self.mode_override.write() {
                     *guard = Some(mode.clone());
                 }
-                // The hook FILE has to follow the switch too. Turning full auto
-                // off is the dangerous direction: a session that started in it
-                // has no hook installed, so agy never calls back and the
-                // in-process check never runs — the user would think they had
-                // restored approval prompts while everything still ran freely.
-                self.sync_permission_hook();
+                // The hook FILE has to be there for the switch to mean anything.
+                // Turning full auto off is the dangerous direction: with no hook
+                // installed agy never calls back and the in-process check never
+                // runs — the user would think they had restored approval prompts
+                // while everything still ran freely.
+                self.install_permission_hook();
+                if self.config.permission_hook_body.is_none() && !self.is_full_auto() {
+                    tracing::warn!(
+                        session_id = %self.session_id,
+                        "antigravity: leaving full auto but no approval hook is configured; tools stay unattended"
+                    );
+                }
                 let turn_gen = self.turn_gen.load(Ordering::SeqCst);
                 // Confirm the switch. Unlike the other backends this signal originates
                 // here rather than on the wire — agy runs one process per turn and there
                 // is nothing to reconfigure mid-flight — but it is not self-fulfilling:
                 // the permission decision is re-read per tool call (`is_full_auto` in
-                // `request_external_permission`) and the hook file has just been synced,
+                // `request_external_permission`) and the hook file has just been ensured,
                 // so the host-side gate really has changed.
                 //
                 // It is also the ONLY trigger that persists `current_mode_id` (see
@@ -1118,10 +1131,11 @@ impl SessionBackend for AntigravitySessionBackend {
     }
 
     async fn request_external_permission(&self, tool_name: String, input: serde_json::Value) -> PermissionDecision {
-        // Full auto answers itself. The hook file is only removed for sessions
-        // that START in full auto; a session switched into it mid-conversation
-        // still has the hook installed, and without this it would keep raising
-        // cards the user explicitly asked not to see.
+        // Full auto answers itself. The hook stays installed in every mode — it
+        // belongs to the workspace, which other conversations share — so a
+        // full-auto session's agy calls back like any other, and this is where
+        // it gets its yes. Without it the session would raise cards the user
+        // explicitly asked not to see.
         if self.is_full_auto() {
             tracing::debug!(
                 session_id = %self.session_id,
@@ -1472,9 +1486,8 @@ mod tests {
 
     #[tokio::test]
     async fn switching_to_full_auto_mid_conversation_stops_the_prompts() {
-        // The hook file is only skipped for sessions that START in full auto, so
-        // a session switched into it still has the hook installed. Without this
-        // the user would keep seeing cards they explicitly turned off.
+        // The hook stays installed in full auto, so agy keeps calling back.
+        // Without this the user would keep seeing cards they explicitly turned off.
         let b = backend_for_permissions().await;
         b.dispatch(Command::SetMode {
             mode: "yolo".to_owned(),
@@ -1492,15 +1505,15 @@ mod tests {
 
     #[tokio::test]
     async fn switching_back_out_of_full_auto_reinstalls_the_hook_file() {
-        // The FILE is what decides whether agy asks at all. A session that
-        // started in full auto has none, so agy never calls back and the
-        // in-process check never runs — asserting only that the check returns
-        // Denied would pass while the session kept running unattended, which is
-        // exactly how the original bug hid.
+        // The FILE is what decides whether agy asks at all. Where it has gone
+        // missing agy never calls back and the in-process check never runs —
+        // asserting only that the check returns Denied would pass while the
+        // session kept running unattended, which is exactly how the original
+        // bug hid.
         let dir = tempfile::tempdir().unwrap();
         let hook = dir.path().join(".agents/hooks.json");
         let b = backend_with_hook_body(dir.path(), Some("yolo"), Some("{\"stub\":true}"));
-        assert!(!hook.exists(), "a full-auto session starts without the hook");
+        assert!(!hook.exists(), "nothing has installed the hook in this workspace yet");
 
         b.dispatch(Command::SetMode {
             mode: "default".to_owned(),
@@ -1513,12 +1526,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn switching_into_full_auto_removes_the_hook_file() {
+    async fn switching_into_full_auto_leaves_the_hook_file_for_the_workspace() {
+        // The file is shared by every conversation in this directory. Removing it
+        // here used to leave an approval-mode neighbour running unattended.
         let dir = tempfile::tempdir().unwrap();
         let hook = dir.path().join(".agents/hooks.json");
         std::fs::create_dir_all(dir.path().join(".agents")).unwrap();
-        std::fs::write(&hook, "{}").unwrap();
-        let b = backend_with_hook_body(dir.path(), Some("default"), Some("{}"));
+        std::fs::write(&hook, "{\"stub\":true}").unwrap();
+        let b = backend_with_hook_body(dir.path(), Some("default"), Some("{\"stub\":true}"));
 
         b.dispatch(Command::SetMode {
             mode: "yolo".to_owned(),
@@ -1526,7 +1541,37 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(!hook.exists(), "full auto must not leave a hook agy would call");
+        assert!(hook.exists(), "another conversation here may still need the gate");
+        let decision = b.request_external_permission("run_command".into(), json!({})).await;
+        assert_eq!(decision, PermissionDecision::Approved, "full auto is answered by the host");
+    }
+
+    #[tokio::test]
+    async fn every_turn_puts_a_missing_hook_file_back_before_agy_starts() {
+        // Deleted between turns (by a neighbour on an older build, a cleanup, the
+        // user): an approval-mode turn spawned without it would run unattended.
+        let dir = tempfile::tempdir().unwrap();
+        let hook = dir.path().join(".agents/hooks.json");
+        for mode in ["default", "yolo"] {
+            let _ = std::fs::remove_file(&hook);
+            let b = backend_with_hook_body(dir.path(), Some(mode), Some("{\"stub\":true}"));
+
+            // FakeSpawner cannot produce a process; the hook must be there by then.
+            let _ = b.dispatch(send("hello")).await;
+
+            assert_eq!(std::fs::read_to_string(&hook).unwrap(), "{\"stub\":true}", "mode={mode}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_full_auto_turn_calls_back_whenever_a_callback_address_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        // Hook configured: agy asks about every tool, and full auto is approved on
+        // the host — so a tightening switch reaches the running turn.
+        assert!(backend_with_hook_body(dir.path(), Some("yolo"), Some("{}")).turn_calls_back());
+        assert!(backend_with_hook_body(dir.path(), Some("default"), Some("{}")).turn_calls_back());
+        // No callback address on this host: a full-auto turn has no hook at all.
+        assert!(!backend_with_hook_body(dir.path(), Some("yolo"), None).turn_calls_back());
     }
 
     /// A session whose turn is running WITH the approval hook installed applies a mode
@@ -1549,9 +1594,10 @@ mod tests {
         );
     }
 
-    /// The one case that genuinely has to wait: a turn that started in FULL AUTO has no
-    /// hook on disk, so agy never calls back and the host gate never runs. Tightening
-    /// cannot reach that already-spawned process; it lands when the next turn spawns.
+    /// The one case that genuinely has to wait: a turn that started in FULL AUTO with no
+    /// hook on disk (no callback address), so agy never calls back and the host gate never
+    /// runs. Tightening cannot reach that already-spawned process; it lands when the next
+    /// turn spawns.
     ///
     /// Claiming `Immediate` here would be the dangerous lie -- the user would be told the
     /// permission was restored while the agent kept running unattended.
