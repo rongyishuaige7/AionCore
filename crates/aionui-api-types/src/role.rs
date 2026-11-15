@@ -23,7 +23,23 @@ pub struct RoleResponse {
     pub memory: String,
     /// Absolute path of the role's memory directory on the backend host.
     pub memory_dir: String,
+    /// Work the role has under way, most recently touched first.
+    #[serde(default)]
+    pub progress: Vec<RoleProgress>,
     pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// Where one piece of a role's ongoing work stands. Each task is a file in the
+/// role's memory directory (`progress/<task>.md`) that the role replaces as the
+/// work moves and removes when it is finished.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleProgress {
+    /// Name of the task, which is also its file name.
+    pub task: String,
+    /// What is done and what is left, as the role last wrote it.
+    pub state: String,
+    /// When the state was last written, in milliseconds since the epoch.
     pub updated_at: i64,
 }
 

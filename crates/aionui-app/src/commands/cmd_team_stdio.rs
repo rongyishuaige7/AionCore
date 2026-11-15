@@ -262,6 +262,15 @@ struct RememberParams {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct ProgressParams {
+    /// Short name of the task; the same name updates the same task.
+    task: String,
+    /// A one-line summary, then what is done and what is left. Empty when the task is finished.
+    state: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ClearAgentContextParams {
     /// Agent slot_id whose context should be cleared.
     slot_id: String,
@@ -400,6 +409,18 @@ impl TeamStdioServer {
     async fn remember(&self, Parameters(params): Parameters<RememberParams>) -> CallToolResult {
         self.forward_to_tcp("team_remember", &serde_json::json!({ "note": params.note }))
             .await
+    }
+
+    #[tool(
+        name = "team_progress",
+        description = "Record where a piece of ongoing work stands in your resident role's memory, replacing what you recorded for that task before. The list of your tasks in progress is handed back to you in every team you join, so use it for work that outlasts this team. Put a one-line summary first, then what is done and what is left. Send an empty state when the task is finished. Only members spawned from a resident role can use this."
+    )]
+    async fn progress(&self, Parameters(params): Parameters<ProgressParams>) -> CallToolResult {
+        self.forward_to_tcp(
+            "team_progress",
+            &serde_json::json!({ "task": params.task, "state": params.state }),
+        )
+        .await
     }
 
     #[tool(
@@ -887,7 +908,7 @@ mod tests {
     fn team_stdio_descriptions_match_prompt_registry() {
         let router = TeamStdioServer::tool_router();
         let tools = router.list_all();
-        assert_eq!(tools.len(), 14, "stdio must expose the complete shared registry");
+        assert_eq!(tools.len(), 15, "stdio must expose the complete shared registry");
         let mut actual_names: Vec<_> = tools.iter().map(|tool| tool.name.as_ref()).collect();
         actual_names.sort_unstable();
         let mut expected_names: Vec<_> = aionui_team_prompts::tools::team_tool_specs()

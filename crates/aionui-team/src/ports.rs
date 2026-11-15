@@ -149,6 +149,28 @@ pub struct TeamRoleBrief {
     pub denied_tools: Vec<String>,
     /// Whether this role reviews work other members hand in.
     pub verifies: bool,
+    /// Work the role has under way, most recently touched first.
+    pub progress: Vec<TeamRoleProgress>,
+}
+
+/// One task a role has under way.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TeamRoleProgress {
+    /// Name of the task, which is also the name of its file.
+    pub task: String,
+    /// What is done and what is left, as the role last wrote it.
+    pub state: String,
+    /// The day the state was last written (`YYYY-MM-DD`).
+    pub updated_day: String,
+}
+
+/// What became of a task state a member asked its role to keep.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TeamRoleProgressUpdate {
+    /// The task's name as it is kept.
+    pub task: String,
+    /// `true` when the task was closed and its file removed.
+    pub closed: bool,
 }
 
 /// What became of a note a member asked its role to remember.
@@ -173,6 +195,19 @@ pub trait TeamRolePort: Send + Sync {
     /// write to. An `Err` is a reason the note was not kept (the memory is
     /// full, the role cannot be read).
     async fn remember(&self, _assistant_id: &str, _note: &str) -> Result<Option<TeamRoleMemoryNote>, String> {
+        Ok(None)
+    }
+
+    /// Record where `task` stands for the role built on `assistant_id`,
+    /// replacing what was recorded before; an empty `state` closes the task.
+    /// `Ok(None)` means the assistant is not a role. An `Err` is a reason the
+    /// state was not kept.
+    async fn set_progress(
+        &self,
+        _assistant_id: &str,
+        _task: &str,
+        _state: &str,
+    ) -> Result<Option<TeamRoleProgressUpdate>, String> {
         Ok(None)
     }
 }

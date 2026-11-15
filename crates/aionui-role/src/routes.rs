@@ -9,6 +9,7 @@
 //! - `GET /api/roles/{id}` — one role, with its memory.
 //! - `PUT /api/roles/{id}` — create the role or replace its definition.
 //! - `PUT /api/roles/{id}/memory` — replace the role's `MEMORY.md`.
+//! - `DELETE /api/roles/{id}/progress/{task}` — close one task in progress.
 //! - `DELETE /api/roles/{id}` — dismiss the role (its memory stays on disk).
 //!
 //! `{id}` is the id of the assistant the role is built on. All routes require
@@ -18,7 +19,7 @@ use aionui_api_types::{ApiResponse, RoleListResponse, RoleResponse, UpdateRoleMe
 use aionui_common::ApiError;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::routing::{get, put};
+use axum::routing::{delete, get, put};
 use axum::{Json, Router};
 
 use crate::error::RoleError;
@@ -30,6 +31,7 @@ pub fn role_routes(state: RoleRouterState) -> Router {
         .route("/api/roles", get(list_roles))
         .route("/api/roles/{id}", get(get_role).put(put_role).delete(delete_role))
         .route("/api/roles/{id}/memory", put(put_memory))
+        .route("/api/roles/{id}/progress/{task}", delete(delete_progress))
         .with_state(state)
 }
 
@@ -65,6 +67,17 @@ async fn put_memory(
         .set_memory(&id, &body.memory)
         .await
         .map_err(to_api_error)?;
+    Ok(Json(ApiResponse::ok(role)))
+}
+
+/// Close a task the role left in progress, for the user to clear what the role
+/// did not. Answers with the role as it stands afterwards.
+async fn delete_progress(
+    State(state): State<RoleRouterState>,
+    Path((id, task)): Path<(String, String)>,
+) -> Result<Json<ApiResponse<RoleResponse>>, ApiError> {
+    state.service.set_progress(&id, &task, "").await.map_err(to_api_error)?;
+    let role = state.service.get(&id).await.map_err(to_api_error)?;
     Ok(Json(ApiResponse::ok(role)))
 }
 

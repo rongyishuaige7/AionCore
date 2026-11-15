@@ -15,6 +15,8 @@ use crate::error::RoleError;
 const DEFINITION_FILE: &str = "role.json";
 const MEMORY_DIR: &str = "memory";
 const MEMORY_FILE: &str = "MEMORY.md";
+const PROGRESS_DIR: &str = "progress";
+const PROGRESS_EXTENSION: &str = "md";
 const ID_SEPARATOR: &str = ":";
 const DIR_SEPARATOR: &str = "@";
 
@@ -30,6 +32,16 @@ pub(crate) struct RoleDefinition {
     #[serde(default)]
     pub verifies: bool,
     pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// One task file under `memory/progress/`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProgressFile {
+    /// The file's name without its extension.
+    pub task: String,
+    pub state: String,
+    /// Last write, in milliseconds since the epoch.
     pub updated_at: i64,
 }
 
@@ -114,6 +126,69 @@ impl RoleStore {
     pub(crate) async fn write_memory(&self, id: &str, memory: &str) -> Result<(), RoleError> {
         write_atomic(&self.memory_dir(id).join(MEMORY_FILE), memory.as_bytes()).await
     }
+
+    fn progress_dir(&self, id: &str) -> PathBuf {
+        self.memory_dir(id).join(PROGRESS_DIR)
+    }
+
+    fn progress_path(&self, id: &str, task: &str) -> PathBuf {
+        self.progress_dir(id).join(format!("{task}.{PROGRESS_EXTENSION}"))
+    }
+
+    /// Every task file of the role, most recently written first. Files the
+    /// user put there by hand are listed like the ones the role wrote.
+    pub(crate) async fn list_progress(&self, id: &str) -> Result<Vec<ProgressFile>, RoleError> {
+        let mut entries = match tokio::fs::read_dir(self.progress_dir(id)).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut files = Vec::new();
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some(PROGRESS_EXTENSION) {
+                continue;
+            }
+            let Some(task) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            let metadata = entry.metadata().await?;
+            if !metadata.is_file() {
+                continue;
+            }
+            let raw = tokio::fs::read(&path).await?;
+            files.push(ProgressFile {
+                task: task.to_owned(),
+                state: String::from_utf8_lossy(&raw).into_owned(),
+                updated_at: modified_ms(&metadata),
+            });
+        }
+        files.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then_with(|| a.task.cmp(&b.task)));
+        Ok(files)
+    }
+
+    pub(crate) async fn write_progress(&self, id: &str, task: &str, state: &str) -> Result<(), RoleError> {
+        write_atomic(&self.progress_path(id, task), state.as_bytes()).await
+    }
+
+    /// Returns `false` when the task had no file.
+    pub(crate) async fn remove_progress(&self, id: &str, task: &str) -> Result<bool, RoleError> {
+        match tokio::fs::remove_file(self.progress_path(id, task)).await {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+/// A file's last write in milliseconds since the epoch, `0` where the platform
+/// does not say.
+fn modified_ms(metadata: &std::fs::Metadata) -> i64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
 }
 
 /// Write through a sibling temp file and rename, so a reader (a member being

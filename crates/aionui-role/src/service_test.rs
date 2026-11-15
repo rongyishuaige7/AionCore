@@ -304,3 +304,145 @@ async fn list_skips_a_corrupt_definition_and_upsert_can_repair_it() {
     service.upsert("broken", request("repaired", &[])).await.unwrap();
     assert_eq!(service.list().await.unwrap().len(), 2);
 }
+
+#[tokio::test]
+async fn progress_keeps_one_file_per_task_and_replaces_its_state() {
+    let root = tempfile::tempdir().unwrap();
+    let service = service(&root);
+    let role = service.upsert("scout", request("", &[])).await.unwrap();
+    assert!(role.progress.is_empty());
+
+    let first = service
+        .set_progress(
+            "scout",
+            "Weekly report",
+            "  Draft written.\nFigures for week 46 still missing.  ",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        first,
+        ProgressUpdate {
+            task: "weekly-report".into(),
+            closed: false
+        }
+    );
+    service
+        .set_progress("scout", "weekly-report", "Sent to the user.")
+        .await
+        .unwrap();
+
+    let role = service.get("scout").await.unwrap();
+    assert_eq!(role.progress.len(), 1);
+    assert_eq!(role.progress[0].task, "weekly-report");
+    assert_eq!(role.progress[0].state, "Sent to the user.\n");
+    assert!(role.progress[0].updated_at > 0);
+    let file = std::path::Path::new(&role.memory_dir).join("progress/weekly-report.md");
+    assert_eq!(std::fs::read_to_string(file).unwrap(), "Sent to the user.\n");
+}
+
+#[tokio::test]
+async fn progress_lists_the_most_recently_written_task_first() {
+    let root = tempfile::tempdir().unwrap();
+    let service = service(&root);
+    let role = service.upsert("scout", request("", &[])).await.unwrap();
+    service.set_progress("scout", "older", "started").await.unwrap();
+    service.set_progress("scout", "newer", "started").await.unwrap();
+
+    // Push the first file an hour back, so the order does not hang on the clock's resolution.
+    let older = std::path::Path::new(&role.memory_dir).join("progress/older.md");
+    let an_hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    std::fs::File::options()
+        .write(true)
+        .open(older)
+        .unwrap()
+        .set_modified(an_hour_ago)
+        .unwrap();
+
+    let tasks: Vec<String> = service
+        .get("scout")
+        .await
+        .unwrap()
+        .progress
+        .into_iter()
+        .map(|progress| progress.task)
+        .collect();
+    assert_eq!(tasks, vec!["newer", "older"]);
+}
+
+#[tokio::test]
+async fn an_empty_state_closes_the_task_and_closing_twice_is_fine() {
+    let root = tempfile::tempdir().unwrap();
+    let service = service(&root);
+    service.upsert("scout", request("", &[])).await.unwrap();
+    service.set_progress("scout", "migration", "half done").await.unwrap();
+
+    let closed = service.set_progress("scout", "migration", "  ").await.unwrap();
+    assert_eq!(
+        closed,
+        ProgressUpdate {
+            task: "migration".into(),
+            closed: true
+        }
+    );
+    assert!(service.get("scout").await.unwrap().progress.is_empty());
+    assert!(service.set_progress("scout", "migration", "").await.unwrap().closed);
+}
+
+#[tokio::test]
+async fn a_task_name_becomes_a_file_name_that_cannot_leave_the_progress_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let service = service(&root);
+    let role = service.upsert("scout", request("", &[])).await.unwrap();
+
+    let named = |task: &'static str| {
+        let service = service.clone();
+        async move { service.set_progress("scout", task, "x").await.map(|update| update.task) }
+    };
+    assert_eq!(named("  Q4 report: draft #2 ").await.unwrap(), "q4-report-draft-2");
+    assert_eq!(named("舆情 周报").await.unwrap(), "舆情-周报");
+    assert_eq!(named("../../role").await.unwrap(), "role");
+    assert_eq!(named("snake_case").await.unwrap(), "snake_case");
+    assert!(matches!(named("../..").await, Err(RoleError::InvalidRequest(_))));
+    assert!(matches!(named("   ").await, Err(RoleError::InvalidRequest(_))));
+    let long: &'static str = Box::leak("a".repeat(MAX_TASK_NAME_CHARS + 1).into_boxed_str());
+    assert!(matches!(named(long).await, Err(RoleError::InvalidRequest(_))));
+
+    // Everything written went into the progress directory and nowhere else.
+    let memory_dir = std::path::Path::new(&role.memory_dir);
+    assert_eq!(std::fs::read_dir(memory_dir.join("progress")).unwrap().count(), 4);
+    assert_eq!(std::fs::read_dir(memory_dir).unwrap().count(), 1);
+    assert!(memory_dir.parent().unwrap().join("role.json").is_file());
+}
+
+#[tokio::test]
+async fn progress_refuses_an_oversized_state_too_many_tasks_and_an_assistant_that_is_no_role() {
+    let root = tempfile::tempdir().unwrap();
+    let service = service(&root);
+    assert!(matches!(
+        service.set_progress("scout", "task", "x").await,
+        Err(RoleError::NotFound(_))
+    ));
+    service.upsert("scout", request("", &[])).await.unwrap();
+
+    let oversized = "x".repeat(MAX_PROGRESS_STATE_CHARS + 1);
+    assert!(matches!(
+        service.set_progress("scout", "task", &oversized).await,
+        Err(RoleError::InvalidRequest(_))
+    ));
+
+    for index in 0..MAX_PROGRESS_TASKS {
+        service
+            .set_progress("scout", &format!("task-{index}"), "x")
+            .await
+            .unwrap();
+    }
+    assert!(matches!(
+        service.set_progress("scout", "one-too-many", "x").await,
+        Err(RoleError::InvalidRequest(_))
+    ));
+    // A task already under way can still be updated, and closing one makes room.
+    service.set_progress("scout", "task-0", "moved on").await.unwrap();
+    service.set_progress("scout", "task-1", "").await.unwrap();
+    service.set_progress("scout", "one-too-many", "x").await.unwrap();
+}

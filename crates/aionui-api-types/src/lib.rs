@@ -161,7 +161,7 @@ pub use remote_agent::{
     TestRemoteAgentConnectionRequest, UpdateRemoteAgentRequest,
 };
 pub use response::{ApiResponse, ErrorResponse};
-pub use role::{RoleListResponse, RoleResponse, UpdateRoleMemoryRequest, UpsertRoleRequest};
+pub use role::{RoleListResponse, RoleProgress, RoleResponse, UpdateRoleMemoryRequest, UpsertRoleRequest};
 pub use runtime::{
     EnsureNodeRuntimeRequest, EnsureNodeRuntimeResponse, RuntimeFailureKind, RuntimeResourceKind, RuntimeStatusPayload,
     RuntimeStatusPhase, RuntimeStatusScope, RuntimeStatusScopeKind,

@@ -209,6 +209,7 @@ pub(crate) enum TeamCommand {
     InterruptAgent,
     Task(TeamTaskArgs),
     Remember,
+    Progress,
     ListAssistants,
     DescribeAssistant,
     SpawnAgent,

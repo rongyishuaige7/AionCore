@@ -73,6 +73,7 @@ pub enum TeamToolName {
     TeamTaskUpdate,
     TeamTaskList,
     TeamRemember,
+    TeamProgress,
     TeamListAssistants,
     TeamDescribeAssistant,
     TeamSpawnAgent,
@@ -92,6 +93,7 @@ impl TeamToolName {
             Self::TeamTaskUpdate => "team_task_update",
             Self::TeamTaskList => "team_task_list",
             Self::TeamRemember => "team_remember",
+            Self::TeamProgress => "team_progress",
             Self::TeamListAssistants => "team_list_assistants",
             Self::TeamDescribeAssistant => "team_describe_assistant",
             Self::TeamSpawnAgent => "team_spawn_agent",
@@ -111,6 +113,7 @@ impl TeamToolName {
             "team_task_update" => Self::TeamTaskUpdate,
             "team_task_list" => Self::TeamTaskList,
             "team_remember" => Self::TeamRemember,
+            "team_progress" => Self::TeamProgress,
             "team_list_assistants" => Self::TeamListAssistants,
             "team_describe_assistant" => Self::TeamDescribeAssistant,
             "team_spawn_agent" => Self::TeamSpawnAgent,
@@ -490,6 +493,23 @@ fn tool_specs() -> Vec<TeamToolSpec> {
             input_summary: "note",
         },
         TeamToolSpec {
+            name: TeamToolName::TeamProgress,
+            permission: TeamToolPermission::AnyTeamAgent,
+            description: "Record where a piece of ongoing work stands in your resident role's memory, replacing what you recorded for that task before. The list of your tasks in progress is handed back to you in every team you join, so use it for work that outlasts this team. Put a one-line summary first, then what is done and what is left. Send an empty state when the task is finished. Only members spawned from a resident role can use this.",
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "task": { "type": "string", "description": "Short name of the task; the same name updates the same task" },
+                    "state": { "type": "string", "description": "A one-line summary, then what is done and what is left. Empty when the task is finished" }
+                },
+                "required": ["task", "state"]
+            }),
+            cli_command: &["progress"],
+            when: "Record where ongoing work stands",
+            input_summary: "task, state",
+        },
+        TeamToolSpec {
             name: TeamToolName::TeamListAssistants,
             permission: TeamToolPermission::AnyTeamAgent,
             description: TEAM_LIST_ASSISTANTS_DESCRIPTION,
@@ -597,7 +617,7 @@ mod tests {
     #[test]
     fn descriptor_count_and_names_are_unique() {
         let descriptors = team_tool_descriptors();
-        assert_eq!(descriptors.len(), 14);
+        assert_eq!(descriptors.len(), 15);
         let names = descriptors
             .iter()
             .map(|descriptor| descriptor.name.as_str())
@@ -628,6 +648,7 @@ mod tests {
             ("team_task_update", vec!["task", "update"]),
             ("team_task_list", vec!["task", "list"]),
             ("team_remember", vec!["remember"]),
+            ("team_progress", vec!["progress"]),
             ("team_list_assistants", vec!["list-assistants"]),
             ("team_describe_assistant", vec!["describe-assistant"]),
             ("team_spawn_agent", vec!["spawn-agent"]),
@@ -694,6 +715,16 @@ mod tests {
         assert_eq!(descriptor.input_schema["required"], json!(["note"]));
         let properties = descriptor.input_schema["properties"].as_object().unwrap();
         assert_eq!(properties.keys().collect::<Vec<_>>(), vec!["note"]);
+    }
+
+    #[test]
+    fn progress_is_open_to_any_member_and_takes_a_task_and_its_state() {
+        let descriptor = team_tool_descriptor("team_progress").expect("progress descriptor");
+        assert_eq!(descriptor.permission, TeamToolPermission::AnyTeamAgent);
+        assert_eq!(descriptor.input_schema["additionalProperties"], json!(false));
+        assert_eq!(descriptor.input_schema["required"], json!(["task", "state"]));
+        let properties = descriptor.input_schema["properties"].as_object().unwrap();
+        assert_eq!(properties.keys().collect::<Vec<_>>(), vec!["task", "state"]);
     }
 
     #[test]

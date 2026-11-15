@@ -138,6 +138,14 @@ pub struct RememberInput {
     pub note: String,
 }
 
+/// Arguments for the `team_progress` MCP tool call.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProgressInput {
+    pub task: String,
+    pub state: String,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct RenameAgentInput {
     pub slot_id: String,
@@ -204,8 +212,21 @@ mod tests {
     }
 
     #[test]
+    fn progress_is_listed_for_teammates_and_rejects_unknown_arguments() {
+        assert!(authorize_tool(TeammateRole::Teammate, "team_progress").is_ok());
+        assert!(
+            all_tool_descriptors_for_role(TeammateRole::Teammate)
+                .iter()
+                .any(|descriptor| descriptor.name == "team_progress")
+        );
+        assert!(serde_json::from_value::<ProgressInput>(json!({ "task": "t", "state": "" })).is_ok());
+        assert!(serde_json::from_value::<ProgressInput>(json!({ "task": "t", "state": "s", "role": "y" })).is_err());
+        assert!(serde_json::from_value::<ProgressInput>(json!({ "task": "t" })).is_err());
+    }
+
+    #[test]
     fn all_descriptors_count() {
-        assert_eq!(all_tool_descriptors().len(), 14);
+        assert_eq!(all_tool_descriptors().len(), 15);
     }
 
     #[test]
@@ -214,7 +235,7 @@ mod tests {
         let mut names: Vec<&str> = descs.iter().map(|d| d.name.as_str()).collect();
         names.sort();
         names.dedup();
-        assert_eq!(names.len(), 14);
+        assert_eq!(names.len(), 15);
     }
 
     #[test]

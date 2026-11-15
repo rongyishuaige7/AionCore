@@ -23,9 +23,9 @@ use super::protocol::{
     read_request, write_response,
 };
 use super::tools::{
-    ClearAgentContextInput, InterruptAgentInput, MAX_REMEMBER_NOTE_CHARS, ReadMessagesInput, RememberInput,
-    RenameAgentInput, SendMessageInput, ShutdownAgentInput, SpawnAgentInput, TaskCreateInput, TaskListInput,
-    TaskListStatusInput, TaskUpdateInput,
+    ClearAgentContextInput, InterruptAgentInput, MAX_REMEMBER_NOTE_CHARS, ProgressInput, ReadMessagesInput,
+    RememberInput, RenameAgentInput, SendMessageInput, ShutdownAgentInput, SpawnAgentInput, TaskCreateInput,
+    TaskListInput, TaskListStatusInput, TaskUpdateInput,
 };
 
 // ---------------------------------------------------------------------------
@@ -536,6 +536,7 @@ pub(crate) async fn dispatch_tool(
         "team_task_update" => exec_task_update(arguments, scheduler, service, team_id, caller_slot_id).await,
         "team_task_list" => exec_task_list(arguments, scheduler).await,
         "team_remember" => exec_remember(arguments, scheduler, service, caller_slot_id).await,
+        "team_progress" => exec_progress(arguments, scheduler, service, caller_slot_id).await,
         "team_members" => exec_members(scheduler).await,
         "team_rename_agent" => exec_rename_agent(arguments, scheduler, service, team_id).await,
         "team_clear_agent_context" => exec_clear_agent_context(arguments, scheduler, service, team_id).await,
@@ -608,7 +609,7 @@ async fn exec_remember(
         .await
         .map_err(|e| ToolCallError::from_message(e.to_string()))?;
     let Some(assistant_id) = caller.assistant_id else {
-        return Err(remember_needs_a_role());
+        return Err(needs_a_role("team_remember"));
     };
     let service = service
         .upgrade()
@@ -618,7 +619,7 @@ async fn exec_remember(
         .remember(&assistant_id, note)
         .await
         .map_err(|reason| ToolCallError::from_message(format!("team_remember failed: {reason}")))?
-        .ok_or_else(remember_needs_a_role)?;
+        .ok_or_else(|| needs_a_role("team_remember"))?;
 
     let action = if noted.already_recorded {
         "already_remembered"
@@ -628,10 +629,49 @@ async fn exec_remember(
     json_text(&json!({ "status": "ok", "action": action, "line": noted.line }))
 }
 
-/// The "Role policy" prefix reports as `PermissionDenied` (see
+/// `team_progress`: the caller records where a piece of ongoing work stands in
+/// the memory of the resident role it was spawned from, or closes the task
+/// with an empty state. Like `team_remember`, the backend does the write.
+async fn exec_progress(
+    args: &Value,
+    scheduler: &TeammateManager,
+    service: &Weak<TeamSessionService>,
+    caller_slot_id: &str,
+) -> Result<String, ToolCallError> {
+    let input: ProgressInput = serde_json::from_value(args.clone())
+        .map_err(|e| ToolCallError::from_message(format!("Invalid params: {e}")))?;
+    if input.task.trim().is_empty() {
+        return Err(ToolCallError::from_message("Invalid params: task is empty"));
+    }
+
+    let caller = scheduler
+        .get_agent(caller_slot_id)
+        .await
+        .map_err(|e| ToolCallError::from_message(e.to_string()))?;
+    let Some(assistant_id) = caller.assistant_id else {
+        return Err(needs_a_role("team_progress"));
+    };
+    let service = service
+        .upgrade()
+        .ok_or_else(|| ToolCallError::from_message("Team service not available"))?;
+    let update = service
+        .role_port()
+        .set_progress(&assistant_id, &input.task, &input.state)
+        .await
+        .map_err(|reason| ToolCallError::from_message(format!("team_progress failed: {reason}")))?
+        .ok_or_else(|| needs_a_role("team_progress"))?;
+
+    let action = if update.closed { "closed" } else { "saved" };
+    json_text(&json!({ "status": "ok", "action": action, "task": update.task }))
+}
+
+/// Refusal for a role-memory tool called by a member that is not a role. The
+/// "Role policy" prefix reports as `PermissionDenied` (see
 /// `tool_executor::map_tool_error`).
-fn remember_needs_a_role() -> ToolCallError {
-    ToolCallError::from_message("Role policy allows team_remember only to members spawned from a resident role")
+fn needs_a_role(tool: &str) -> ToolCallError {
+    ToolCallError::from_message(format!(
+        "Role policy allows {tool} only to members spawned from a resident role"
+    ))
 }
 
 async fn exec_list_assistants(

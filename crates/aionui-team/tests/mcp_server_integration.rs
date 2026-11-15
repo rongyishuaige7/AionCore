@@ -248,7 +248,7 @@ async fn mc1_correct_token_connects() {
     send_request(&mut stream, &req).await;
     let resp = read_response(&mut stream).await;
     let tools = resp["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 14);
+    assert_eq!(tools.len(), 15);
     let names: Vec<&str> = tools.iter().filter_map(|tool| tool["name"].as_str()).collect();
     assert!(!names.contains(&"team_list_models"));
 
@@ -310,14 +310,15 @@ async fn mc3_no_token_rejected() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn tools_list_returns_all_14_tools() {
+async fn tools_list_returns_all_15_tools() {
     let env = setup().await;
     let mut stream = connect_and_init(env.server.port(), "test-token-123", "lead-1").await;
 
     let names = list_tools(&mut stream, 10).await;
-    assert_eq!(names.len(), 14);
+    assert_eq!(names.len(), 15);
 
     assert!(names.contains(&"team_remember".to_owned()));
+    assert!(names.contains(&"team_progress".to_owned()));
     assert!(names.contains(&"team_read_messages".to_owned()));
     assert!(names.contains(&"team_send_message".to_owned()));
     assert!(names.contains(&"team_spawn_agent".to_owned()));
@@ -392,6 +393,48 @@ async fn remember_checks_its_note_before_reaching_the_role_memory() {
     // This harness runs without a team service, so a good note stops there
     // instead of being reported as kept.
     let good = call_tool(&mut stream, 5, "team_remember", json!({ "note": "run the tests" })).await;
+    assert!(is_error_response(&good));
+    assert!(extract_text(&good).contains("Team service not available"));
+
+    env.server.stop();
+}
+
+// ---------------------------------------------------------------------------
+// Tests: team_progress
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn progress_checks_its_arguments_before_reaching_the_role_memory() {
+    let env = setup().await;
+    let mut stream = connect_and_init(env.server.port(), "test-token-123", "worker-1").await;
+
+    let missing = call_tool(&mut stream, 2, "team_progress", json!({ "task": "weekly report" })).await;
+    assert!(is_error_response(&missing));
+    assert!(extract_text(&missing).contains("Invalid params"));
+
+    let unknown = call_tool(
+        &mut stream,
+        3,
+        "team_progress",
+        json!({ "task": "weekly report", "state": "x", "role": "someone-else" }),
+    )
+    .await;
+    assert!(is_error_response(&unknown));
+    assert!(extract_text(&unknown).contains("Invalid params"));
+
+    let blank = call_tool(&mut stream, 4, "team_progress", json!({ "task": "  ", "state": "x" })).await;
+    assert!(is_error_response(&blank));
+    assert!(extract_text(&blank).contains("task is empty"));
+
+    // This harness runs without a team service, so a good call stops there
+    // instead of being reported as saved.
+    let good = call_tool(
+        &mut stream,
+        5,
+        "team_progress",
+        json!({ "task": "weekly report", "state": "draft written" }),
+    )
+    .await;
     assert!(is_error_response(&good));
     assert!(extract_text(&good).contains("Team service not available"));
 

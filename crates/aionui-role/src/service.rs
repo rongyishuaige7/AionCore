@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use aionui_api_types::{RoleResponse, TeamToolName, UpsertRoleRequest};
+use aionui_api_types::{RoleProgress, RoleResponse, TeamToolName, UpsertRoleRequest};
 use aionui_common::now_ms;
 use tokio::sync::Mutex;
 
@@ -17,6 +17,12 @@ pub const MAX_CHARTER_CHARS: usize = 4_000;
 pub const MAX_MEMORY_BYTES: usize = 64 * 1024;
 /// Cap on one note added through [`RoleService::remember`], in characters.
 pub const MAX_NOTE_CHARS: usize = 600;
+/// Cap on the state of one task in progress, in characters.
+pub const MAX_PROGRESS_STATE_CHARS: usize = 4_000;
+/// Cap on how many tasks a role keeps in progress at once.
+pub const MAX_PROGRESS_TASKS: usize = 40;
+/// Cap on a task name, in characters.
+pub const MAX_TASK_NAME_CHARS: usize = 48;
 const MAX_ROLE_ID_LEN: usize = 128;
 
 /// What [`RoleService::remember`] did with a note.
@@ -26,6 +32,15 @@ pub struct RememberedNote {
     pub line: String,
     /// `true` when the memory already held this note and nothing was written.
     pub already_recorded: bool,
+}
+
+/// What [`RoleService::set_progress`] did with a task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProgressUpdate {
+    /// The task's name as it is kept, which is also its file name.
+    pub task: String,
+    /// `true` when the task was closed and its file removed.
+    pub closed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -168,6 +183,37 @@ impl RoleService {
         })
     }
 
+    /// Record where a task stands, replacing what was recorded for it before.
+    /// An empty `state` closes the task: its file is removed, and closing a
+    /// task that has none is not an error.
+    pub async fn set_progress(&self, id: &str, task: &str, state: &str) -> Result<ProgressUpdate, RoleError> {
+        validate_role_id(id)?;
+        let task = task_file_name(task)?;
+        let state = state.trim();
+        if state.chars().count() > MAX_PROGRESS_STATE_CHARS {
+            return Err(RoleError::InvalidRequest(format!(
+                "a task's state exceeds {MAX_PROGRESS_STATE_CHARS} characters"
+            )));
+        }
+        if self.store.read_definition(id).await?.is_none() {
+            return Err(RoleError::NotFound(id.to_owned()));
+        }
+
+        let _guard = self.memory_lock.lock().await;
+        if state.is_empty() {
+            self.store.remove_progress(id, &task).await?;
+            return Ok(ProgressUpdate { task, closed: true });
+        }
+        let open = self.store.list_progress(id).await?;
+        if open.len() >= MAX_PROGRESS_TASKS && !open.iter().any(|file| file.task == task) {
+            return Err(RoleError::InvalidRequest(format!(
+                "{MAX_PROGRESS_TASKS} tasks are already in progress, close one first"
+            )));
+        }
+        self.store.write_progress(id, &task, &format!("{state}\n")).await?;
+        Ok(ProgressUpdate { task, closed: false })
+    }
+
     /// Dismiss the role. Its memory directory stays on disk and is picked up
     /// again if the role is defined anew.
     pub async fn remove(&self, id: &str) -> Result<(), RoleError> {
@@ -187,6 +233,17 @@ impl RoleService {
             verifies: definition.verifies,
             memory: self.store.read_memory(id).await?,
             memory_dir: self.store.memory_dir(id).to_string_lossy().into_owned(),
+            progress: self
+                .store
+                .list_progress(id)
+                .await?
+                .into_iter()
+                .map(|file| RoleProgress {
+                    task: file.task,
+                    state: file.state,
+                    updated_at: file.updated_at,
+                })
+                .collect(),
             created_at: definition.created_at,
             updated_at: definition.updated_at,
         })
@@ -205,6 +262,33 @@ fn validate_role_id(id: &str) -> Result<(), RoleError> {
         return Err(RoleError::InvalidId(id.chars().take(MAX_ROLE_ID_LEN).collect()));
     }
     Ok(())
+}
+
+/// A task name as its file name: lowercased, with every run of characters that
+/// are not letters, digits or `_` turned into one `-`. Letters and digits of
+/// any script are kept, so a task can be named in the user's own language, and
+/// nothing that could leave the progress directory survives.
+fn task_file_name(task: &str) -> Result<String, RoleError> {
+    let mut name = String::new();
+    for c in task.trim().chars().flat_map(char::to_lowercase) {
+        if c.is_alphanumeric() || c == '_' {
+            name.push(c);
+        } else if !name.is_empty() && !name.ends_with('-') {
+            name.push('-');
+        }
+    }
+    let name = name.trim_end_matches('-');
+    if name.is_empty() {
+        return Err(RoleError::InvalidRequest(
+            "a task name needs at least one letter or digit".to_owned(),
+        ));
+    }
+    if name.chars().count() > MAX_TASK_NAME_CHARS {
+        return Err(RoleError::InvalidRequest(format!(
+            "a task name exceeds {MAX_TASK_NAME_CHARS} characters"
+        )));
+    }
+    Ok(name.to_owned())
 }
 
 /// The text of a memory line without its bullet and its day, so the same note

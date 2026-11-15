@@ -629,6 +629,15 @@ impl aionui_team::TeamRolePort for RoleServiceTeamPort {
                 memory_dir: role.memory_dir,
                 denied_tools: role.denied_tools,
                 verifies: role.verifies,
+                progress: role
+                    .progress
+                    .into_iter()
+                    .map(|progress| aionui_team::TeamRoleProgress {
+                        task: progress.task,
+                        state: progress.state,
+                        updated_day: local_day(progress.updated_at),
+                    })
+                    .collect(),
             })),
             // An assistant id that cannot name a role directory is not a role.
             Err(RoleError::InvalidId(_)) => Ok(None),
@@ -652,6 +661,30 @@ impl aionui_team::TeamRolePort for RoleServiceTeamPort {
             Err(error) => Err(error.to_string()),
         }
     }
+
+    async fn set_progress(
+        &self,
+        assistant_id: &str,
+        task: &str,
+        state: &str,
+    ) -> Result<Option<aionui_team::TeamRoleProgressUpdate>, String> {
+        match self.service.set_progress(assistant_id, task, state).await {
+            Ok(update) => Ok(Some(aionui_team::TeamRoleProgressUpdate {
+                task: update.task,
+                closed: update.closed,
+            })),
+            Err(RoleError::InvalidId(_) | RoleError::NotFound(_)) => Ok(None),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+}
+
+/// The day of a millisecond timestamp in the user's own time zone
+/// (`YYYY-MM-DD`), empty for a timestamp that names no moment.
+fn local_day(timestamp_ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(timestamp_ms)
+        .map(|moment| moment.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string())
+        .unwrap_or_default()
 }
 
 /// Adapts the concrete conversation / team / project services to the sidebar's

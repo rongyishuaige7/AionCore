@@ -139,3 +139,38 @@ async fn path_traversal_in_the_id_is_refused() {
     assert_eq!(body["code"], "role_invalid_id");
     assert!(!root.path().join("escape").exists());
 }
+
+#[tokio::test]
+async fn a_task_in_progress_shows_on_the_role_and_can_be_closed_over_http() {
+    let root = tempfile::tempdir().unwrap();
+    let service = Arc::new(RoleService::new(root.path().join("roles")));
+    let app = role_routes(RoleRouterState {
+        service: service.clone(),
+    });
+    send(&app, Method::PUT, "/api/roles/scout", Some(json!({}))).await;
+    service
+        .set_progress("scout", "舆情 周报", "Monday's sweep done.")
+        .await
+        .unwrap();
+
+    let (status, body) = send(&app, Method::GET, "/api/roles/scout", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["progress"][0]["task"], "舆情-周报");
+    assert_eq!(body["data"]["progress"][0]["state"], "Monday's sweep done.\n");
+    assert!(body["data"]["progress"][0]["updated_at"].as_i64().unwrap() > 0);
+
+    // The task name travels percent-encoded, as a browser sends it.
+    let (status, body) = send(
+        &app,
+        Method::DELETE,
+        "/api/roles/scout/progress/%E8%88%86%E6%83%85-%E5%91%A8%E6%8A%A5",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["progress"], json!([]));
+
+    let (status, body) = send(&app, Method::DELETE, "/api/roles/nobody/progress/task", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["code"], "role_not_found");
+}

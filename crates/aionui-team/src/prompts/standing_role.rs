@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use crate::ports::TeamRoleBrief;
+use crate::ports::{TeamRoleBrief, TeamRoleProgress};
 
 /// Cap on the memory text placed in the prompt. The file itself may be longer;
 /// the member gets its newest part and is pointed at the file for the rest.
@@ -11,6 +11,15 @@ const MAX_INJECTED_MEMORY_CHARS: usize = 8_000;
 
 /// The team tool a role member writes its memory with.
 const REMEMBER_TOOL: &str = "team_remember";
+
+/// The team tool a role member records its ongoing work with.
+const PROGRESS_TOOL: &str = "team_progress";
+
+/// Cap on the tasks in progress listed in the prompt; the rest stay in the directory.
+const MAX_LISTED_TASKS: usize = 20;
+
+/// Cap on the summary shown for one task, in characters.
+const MAX_TASK_SUMMARY_CHARS: usize = 160;
 
 /// Render the standing-role section. No trailing newline.
 pub fn render_standing_role(brief: &TeamRoleBrief) -> String {
@@ -54,6 +63,36 @@ pub fn render_standing_role(brief: &TeamRoleBrief) -> String {
         ));
     }
 
+    let may_record_progress = !brief.denied_tools.iter().any(|tool| tool == PROGRESS_TOOL);
+    if !brief.progress.is_empty() {
+        let progress_dir = Path::new(&brief.memory_dir).join("progress");
+        out.push_str("\n\n### Work in progress\n\n");
+        for progress in brief.progress.iter().take(MAX_LISTED_TASKS) {
+            out.push_str(&task_line(progress));
+        }
+        if brief.progress.len() > MAX_LISTED_TASKS {
+            out.push_str(&format!(
+                "- and {} more in the directory below\n",
+                brief.progress.len() - MAX_LISTED_TASKS
+            ));
+        }
+        out.push_str(&format!(
+            "\nThese are tasks you left under way, each with its state in a file in `{}`. Read a task's file \
+             before you pick it up.",
+            progress_dir.display()
+        ));
+        if may_record_progress {
+            out.push_str(&format!(
+                " Keep it current with `{PROGRESS_TOOL}`, and send an empty state when the task is finished."
+            ));
+        }
+    } else if may_record_progress {
+        out.push_str(&format!(
+            "\n\nFor work that will outlast this team, record where it stands with `{PROGRESS_TOOL}`, one task \
+             per call, so that you can pick it up in another team."
+        ));
+    }
+
     if brief.verifies {
         out.push_str(
             "\n\n### Reviewing\n\n\
@@ -72,6 +111,30 @@ pub fn render_standing_role(brief: &TeamRoleBrief) -> String {
         out.push_str("\nThe backend refuses these for your role. If the work needs one, ask the Lead.");
     }
     out
+}
+
+/// One line of the task list: the task, the day its state was last written and
+/// the first line of that state.
+fn task_line(progress: &TeamRoleProgress) -> String {
+    let summary: String = progress
+        .state
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default()
+        .chars()
+        .take(MAX_TASK_SUMMARY_CHARS)
+        .collect();
+    let day = if progress.updated_day.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", progress.updated_day)
+    };
+    if summary.is_empty() {
+        format!("- `{}`{day}\n", progress.task)
+    } else {
+        format!("- `{}`{day}: {summary}\n", progress.task)
+    }
 }
 
 /// The newest part of a memory longer than `max_chars`, or `None` when the
@@ -109,7 +172,83 @@ mod tests {
             memory_dir: "/data/roles/reviewer/memory".into(),
             denied_tools: vec!["team_task_create".into()],
             verifies: false,
+            progress: Vec::new(),
         }
+    }
+
+    fn task(name: &str, state: &str, day: &str) -> TeamRoleProgress {
+        TeamRoleProgress {
+            task: name.into(),
+            state: state.into(),
+            updated_day: day.into(),
+        }
+    }
+
+    #[test]
+    fn a_role_with_nothing_under_way_is_told_how_to_record_ongoing_work() {
+        let section = render_standing_role(&brief());
+
+        assert!(!section.contains("### Work in progress"));
+        assert!(section.contains("record where it stands with `team_progress`"));
+    }
+
+    #[test]
+    fn tasks_in_progress_are_listed_by_name_day_and_first_line_only() {
+        let section = render_standing_role(&TeamRoleBrief {
+            progress: vec![
+                task(
+                    "weekly-report",
+                    "\nDraft sent, figures for week 46 missing.\nDetails: ask finance.",
+                    "2026-11-14",
+                ),
+                task("migration", "", ""),
+            ],
+            ..brief()
+        });
+
+        assert!(section.contains(
+            "### Work in progress\n\n\
+             - `weekly-report` (2026-11-14): Draft sent, figures for week 46 missing.\n\
+             - `migration`\n\n\
+             These are tasks you left under way"
+        ));
+        // The rest of a state stays in its file, which the member is pointed at.
+        assert!(!section.contains("ask finance"));
+        assert!(section.contains("/data/roles/reviewer/memory/progress"));
+        assert!(section.contains("Keep it current with `team_progress`"));
+        assert!(!section.contains("record where it stands with"));
+        assert!(!section.ends_with('\n'));
+    }
+
+    #[test]
+    fn a_role_denied_the_progress_tool_sees_its_tasks_but_is_not_told_to_call_it() {
+        let denied = TeamRoleBrief {
+            denied_tools: vec!["team_progress".into()],
+            ..brief()
+        };
+        assert!(!render_standing_role(&denied).contains("call `team_progress`"));
+        assert!(!render_standing_role(&denied).contains("with `team_progress`"));
+
+        let section = render_standing_role(&TeamRoleBrief {
+            progress: vec![task("migration", "half done", "2026-11-15")],
+            ..denied
+        });
+        assert!(section.contains("- `migration` (2026-11-15): half done"));
+        assert!(!section.contains("Keep it current"));
+    }
+
+    #[test]
+    fn a_long_task_list_names_the_newest_and_counts_the_rest() {
+        let section = render_standing_role(&TeamRoleBrief {
+            progress: (0..MAX_LISTED_TASKS + 3)
+                .map(|index| task(&format!("task-{index}"), "x", ""))
+                .collect(),
+            ..brief()
+        });
+
+        assert!(section.contains(&format!("- `task-{}`: x\n", MAX_LISTED_TASKS - 1)));
+        assert!(!section.contains(&format!("- `task-{MAX_LISTED_TASKS}`")));
+        assert!(section.contains("- and 3 more in the directory below\n"));
     }
 
     #[test]
