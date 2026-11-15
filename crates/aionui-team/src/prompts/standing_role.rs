@@ -6,7 +6,7 @@ use std::path::Path;
 use crate::ports::TeamRoleBrief;
 
 /// Cap on the memory text placed in the prompt. The file itself may be longer;
-/// the member is pointed at it for the rest.
+/// the member gets its newest part and is pointed at the file for the rest.
 const MAX_INJECTED_MEMORY_CHARS: usize = 8_000;
 
 /// The team tool a role member writes its memory with.
@@ -30,9 +30,10 @@ pub fn render_standing_role(brief: &TeamRoleBrief) -> String {
     let memory = brief.memory.trim();
     if memory.is_empty() {
         out.push_str("Nothing recorded yet.\n\n");
-    } else if memory.chars().count() > MAX_INJECTED_MEMORY_CHARS {
-        out.extend(memory.chars().take(MAX_INJECTED_MEMORY_CHARS));
-        out.push_str("\n\n[Memory cut here; the rest is in the file below.]\n\n");
+    } else if let Some(newest) = newest_memory(memory, MAX_INJECTED_MEMORY_CHARS) {
+        out.push_str("[Older notes are left out here; the whole memory is in the file below.]\n\n");
+        out.push_str(newest);
+        out.push_str("\n\n");
     } else {
         out.push_str(memory);
         out.push_str("\n\n");
@@ -71,6 +72,30 @@ pub fn render_standing_role(brief: &TeamRoleBrief) -> String {
         out.push_str("\nThe backend refuses these for your role. If the work needs one, ask the Lead.");
     }
     out
+}
+
+/// The newest part of a memory longer than `max_chars`, or `None` when the
+/// whole memory fits. Notes are appended, so the newest are at the end and
+/// those are the ones kept. The kept part starts on a line boundary where
+/// there is one, so it never opens in the middle of a note.
+fn newest_memory(memory: &str, max_chars: usize) -> Option<&str> {
+    let total = memory.chars().count();
+    if total <= max_chars {
+        return None;
+    }
+    let start = memory
+        .char_indices()
+        .nth(total - max_chars)
+        .map_or(memory.len(), |(index, _)| index);
+    let tail = &memory[start..];
+    if memory[..start].ends_with('\n') {
+        return Some(tail);
+    }
+    // The cut landed inside a note: drop what is left of it.
+    match tail.split_once('\n') {
+        Some((_, rest)) if !rest.trim().is_empty() => Some(rest),
+        _ => Some(tail),
+    }
 }
 
 #[cfg(test)]
@@ -148,6 +173,34 @@ mod tests {
         });
 
         assert_eq!(section.matches('记').count(), MAX_INJECTED_MEMORY_CHARS);
-        assert!(section.contains("[Memory cut here"));
+        assert!(section.contains("[Older notes are left out here"));
+    }
+
+    #[test]
+    fn long_memory_keeps_its_newest_notes_whole() {
+        let old_note = format!("- 2026-01-01 {}", "o".repeat(MAX_INJECTED_MEMORY_CHARS));
+        let memory = format!("{old_note}\n- 2026-11-14 run the tests\n- 2026-11-15 ask before pushing");
+
+        let section = render_standing_role(&TeamRoleBrief { memory, ..brief() });
+
+        // The cut lands inside the oldest note, which is dropped rather than shown in part.
+        assert!(!section.contains("ooo"));
+        assert!(section.contains(
+            "[Older notes are left out here; the whole memory is in the file below.]\n\n\
+             - 2026-11-14 run the tests\n- 2026-11-15 ask before pushing\n\n"
+        ));
+    }
+
+    #[test]
+    fn newest_memory_is_none_for_a_memory_that_fits() {
+        assert_eq!(newest_memory("- a\n- b", 7), None);
+    }
+
+    #[test]
+    fn newest_memory_keeps_a_note_the_cut_lands_in_front_of() {
+        // Four characters fit: exactly the last note, which starts a line.
+        assert_eq!(newest_memory("- a\n- b\n- cd", 4), Some("- cd"));
+        // Five do not reach the start of "- b", so that note is dropped.
+        assert_eq!(newest_memory("- a\n- b\n- cd", 5), Some("- cd"));
     }
 }
