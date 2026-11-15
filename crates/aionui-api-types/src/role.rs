@@ -67,3 +67,108 @@ pub struct UpdateRoleMemoryRequest {
     #[serde(default)]
     pub memory: String,
 }
+
+/// Schema version of the envelopes the agent-facing `role` helper prints.
+pub const ROLE_CLI_SCHEMA_VERSION: u32 = 1;
+
+/// Why a `role` helper command was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoleCliErrorCode {
+    /// The runtime token does not open this conversation.
+    RuntimeAuthFailed,
+    /// The conversation does not run as a resident role.
+    NotARole,
+    /// The role's permission table keeps it from this write.
+    PermissionDenied,
+    SchemaValidationFailed,
+    TransportUnavailable,
+    Internal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleCliError {
+    pub code: RoleCliErrorCode,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleCliMeta {
+    pub schema_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+}
+
+/// What every `role` helper command prints, and what the runtime role routes
+/// answer with.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoleCliEnvelope<T> {
+    pub success: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<T>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<RoleCliError>,
+    pub meta: RoleCliMeta,
+}
+
+impl<T> RoleCliEnvelope<T> {
+    pub fn success(data: T, command: &str) -> Self {
+        Self {
+            success: true,
+            data: Some(data),
+            error: None,
+            meta: RoleCliMeta {
+                schema_version: ROLE_CLI_SCHEMA_VERSION,
+                command: Some(command.to_owned()),
+            },
+        }
+    }
+
+    pub fn failure(code: RoleCliErrorCode, message: impl Into<String>, command: &str) -> Self {
+        Self {
+            success: false,
+            data: None,
+            error: Some(RoleCliError {
+                code,
+                message: message.into(),
+            }),
+            meta: RoleCliMeta {
+                schema_version: ROLE_CLI_SCHEMA_VERSION,
+                command: Some(command.to_owned()),
+            },
+        }
+    }
+}
+
+/// Body of `POST /api/runtime/role/remember` — one note for the role's memory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoleRememberRequest {
+    pub note: String,
+}
+
+/// The line the memory now holds for a note.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleRememberResponse {
+    pub line: String,
+    /// The memory already held this note, so nothing was written.
+    pub already_recorded: bool,
+}
+
+/// Body of `POST /api/runtime/role/progress` — where one task stands. An empty
+/// `state` closes the task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoleProgressRequest {
+    pub task: String,
+    #[serde(default)]
+    pub state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleProgressResponse {
+    /// Name the task is filed under.
+    pub task: String,
+    /// The task was closed rather than updated.
+    pub closed: bool,
+}

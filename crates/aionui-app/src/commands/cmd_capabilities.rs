@@ -152,6 +152,22 @@ fn data() -> Value {
                     "read_only": true,
                     "scoped_to_conversation_snapshot": true
                 }
+            },
+            {
+                "name": "role",
+                "mode": "role-memory",
+                "description": "For a conversation run as a resident role: read the role's whole memory and the work it has under way, add a note to the memory, and record where a task stands.",
+                "contract": "agent-facing-role-cli",
+                "contract_command": "role capabilities",
+                "invocation": "aioncore role capabilities",
+                "runtime_required": ["AIONUI_BASE_URL", "AIONUI_CONVERSATION_ID", "AIONUI_USER_ID", "AIONUI_RUNTIME_TOKEN"],
+                "runtime_free_commands": ["role capabilities"],
+                "safety": {
+                    "can_write": true,
+                    "runtime_token_required_for_context_and_call": true,
+                    "does_not_accept_identity_authority_from_stdin": true,
+                    "scoped_to_the_role_this_conversation_runs_as": true
+                }
             }
         ],
         "non_agent_subcommands": [
@@ -206,7 +222,7 @@ mod tests {
     use super::*;
     use crate::cli::Cli;
     use crate::commands::{
-        config_capabilities, conversation_capabilities, diagnose_capabilities, session_capabilities,
+        config_capabilities, conversation_capabilities, diagnose_capabilities, role_capabilities, session_capabilities,
         skills_capabilities, team_capabilities,
     };
 
@@ -291,6 +307,7 @@ mod tests {
             ("session", session_capabilities::data()),
             ("conversation", conversation_capabilities::data()),
             ("skills", skills_capabilities::data()),
+            ("role", role_capabilities::data()),
         ] {
             let entry = domains
                 .iter()

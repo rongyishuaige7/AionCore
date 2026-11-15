@@ -16,6 +16,11 @@ const REMEMBER_TOOL: &str = "team_remember";
 /// The team tool a role member records its ongoing work with.
 const PROGRESS_TOOL: &str = "team_progress";
 
+/// The helper a role run outside a team reads and writes its memory with. The
+/// stdin JSON arrives through a quoted here-document, so a note may hold any
+/// quote character.
+const ROLE_HELPER: &str = "\"$AIONUI_HELPER_BIN\" role";
+
 /// Cap on the tasks in progress listed in the prompt; the rest stay in the directory.
 const MAX_LISTED_TASKS: usize = 20;
 
@@ -38,8 +43,8 @@ pub fn render_standing_role(brief: &TeamRoleBrief) -> String {
 }
 
 /// Render the standing-role section for a role run on its own by a scheduled
-/// task. It has no team tools there, so it is asked to say in its reply what
-/// belongs in its memory, and nothing is said about reviewing or the team
+/// task. It has no team tools there, so it is shown the `role` helper commands
+/// that write its memory, and nothing is said about reviewing or the team
 /// tools it is denied. No trailing newline.
 pub fn render_scheduled_standing_role(brief: &TeamRoleBrief) -> String {
     render(brief, Setting::Scheduled)
@@ -77,10 +82,18 @@ fn render(brief: &TeamRoleBrief, setting: Setting) -> String {
         out.push_str("\n\n");
     }
     let memory_file = Path::new(&brief.memory_dir).join("MEMORY.md");
-    if !in_team || brief.denied_tools.iter().any(|tool| tool == REMEMBER_TOOL) {
+    if brief.denied_tools.iter().any(|tool| tool == REMEMBER_TOOL) {
         out.push_str(&format!(
             "The user keeps this memory (`{}`). When you learn something that should outlast {here}, say in \
              your reply what should be remembered.",
+            memory_file.display()
+        ));
+    } else if !in_team {
+        out.push_str(&format!(
+            "When you learn something that should outlast this run (a preference of the user, a mistake not to \
+             repeat, a decision and its reason), record one note:\n\n\
+             ```\n{ROLE_HELPER} remember <<'JSON'\n{{\"note\": \"<one line>\"}}\nJSON\n```\n\n\
+             The whole memory is kept in `{}`, and `{ROLE_HELPER} show` prints it.",
             memory_file.display()
         ));
     } else {
@@ -92,7 +105,12 @@ fn render(brief: &TeamRoleBrief, setting: Setting) -> String {
         ));
     }
 
-    let may_record_progress = in_team && !brief.denied_tools.iter().any(|tool| tool == PROGRESS_TOOL);
+    let may_record_progress = !brief.denied_tools.iter().any(|tool| tool == PROGRESS_TOOL);
+    // How a run outside a team writes where a task stands.
+    let progress_command = format!(
+        "```\n{ROLE_HELPER} progress <<'JSON'\n{{\"task\": \"<short name>\", \"state\": \"<what is done and what is \
+         left>\"}}\nJSON\n```"
+    );
     if !brief.progress.is_empty() {
         let progress_dir = Path::new(&brief.memory_dir).join("progress");
         out.push_str("\n\n### Work in progress\n\n");
@@ -110,17 +128,26 @@ fn render(brief: &TeamRoleBrief, setting: Setting) -> String {
              before you pick it up.",
             progress_dir.display()
         ));
-        if may_record_progress {
+        if may_record_progress && in_team {
             out.push_str(&format!(
                 " Keep it current with `{PROGRESS_TOOL}`, and send an empty state when the task is finished."
+            ));
+        } else if may_record_progress {
+            out.push_str(&format!(
+                " Keep it current, and send an empty state when the task is finished:\n\n{progress_command}"
             ));
         } else if !in_team {
             out.push_str(" When you move one forward, say in your reply where it now stands.");
         }
-    } else if may_record_progress {
+    } else if may_record_progress && in_team {
         out.push_str(&format!(
             "\n\nFor work that will outlast this team, record where it stands with `{PROGRESS_TOOL}`, one task \
              per call, so that you can pick it up in another team."
+        ));
+    } else if may_record_progress {
+        out.push_str(&format!(
+            "\n\nFor work that will outlast this run, record where it stands, one task per call, so that the \
+             next run can pick it up:\n\n{progress_command}"
         ));
     }
 
@@ -280,14 +307,39 @@ mod tests {
         assert!(section.contains("across every scheduled run and every team you join"));
         assert!(section.contains("### Charter\n\nChecks work before it is called done."));
         assert!(section.contains("### Memory\n\n- the user wants tests run, not described"));
-        assert!(section.contains("should outlast this run, say in your reply what should be remembered"));
         assert!(section.contains("- `weekly-report` (2026-11-14): Draft sent."));
-        assert!(section.contains("say in your reply where it now stands"));
-        // Nothing it is told to call exists outside a team.
+        // It writes its memory with the helper every conversation carries.
+        assert!(section.contains("\"$AIONUI_HELPER_BIN\" role remember <<'JSON'\n{\"note\": \"<one line>\"}\nJSON"));
+        assert!(section.contains("\"$AIONUI_HELPER_BIN\" role progress <<'JSON'\n{\"task\": "));
+        assert!(section.contains("`\"$AIONUI_HELPER_BIN\" role show` prints it"));
+        // Nothing it is told to call exists only in a team.
         assert!(!section.contains("team_"));
         assert!(!section.contains("### Reviewing"));
         assert!(!section.contains("may not call"));
         assert!(!section.ends_with('\n'));
+    }
+
+    #[test]
+    fn a_scheduled_run_with_no_task_yet_is_shown_how_to_leave_one_for_the_next_run() {
+        let section = render_scheduled_standing_role(&brief());
+
+        assert!(!section.contains("### Work in progress"));
+        assert!(section.contains("so that the next run can pick it up"));
+        assert!(section.contains("\"$AIONUI_HELPER_BIN\" role progress <<'JSON'"));
+    }
+
+    #[test]
+    fn a_scheduled_run_kept_from_its_memory_is_asked_to_say_it_in_the_reply() {
+        let section = render_scheduled_standing_role(&TeamRoleBrief {
+            denied_tools: vec![REMEMBER_TOOL.into(), PROGRESS_TOOL.into()],
+            progress: vec![task("weekly-report", "Draft sent.", "2026-11-14")],
+            ..brief()
+        });
+
+        assert!(section.contains("should outlast this run, say in your reply what should be remembered"));
+        assert!(section.contains("say in your reply where it now stands"));
+        assert!(!section.contains("AIONUI_HELPER_BIN"));
+        assert!(!section.contains("team_"));
     }
 
     #[test]

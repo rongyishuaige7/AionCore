@@ -124,6 +124,10 @@ pub(crate) enum Command {
     /// Channel A of skill delivery: a normal tool call instead of the
     /// `[LOAD_SKILL]` text-protocol round trip.
     Skills(SkillsArgs),
+    /// Agent-facing CLI for the resident role THIS conversation runs as: read
+    /// its memory and the work it has under way, and write to both. How a role
+    /// keeps its memory where it has no team tools.
+    Role(RoleArgs),
     /// PreToolUse permission gate for the Antigravity CLI (spawned by agy).
     /// Reads the tool request on stdin, asks the running AionUi backend, and
     /// writes agy's decision to stdout.
@@ -165,6 +169,7 @@ impl Command {
             Self::Session(_) => "session",
             Self::Conversation(_) => "conversation",
             Self::Skills(_) => "skills",
+            Self::Role(_) => "role",
             Self::AntigravityHook => "antigravity-hook",
             Self::McpTeamStdio => "mcp-team-stdio",
             Self::Doctor => "doctor",
@@ -260,6 +265,22 @@ pub(crate) struct ConversationArgs {
 pub(crate) enum ConversationCommand {
     Capabilities,
     Create,
+    #[command(external_subcommand)]
+    Unknown(Vec<OsString>),
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct RoleArgs {
+    #[command(subcommand)]
+    pub command: RoleCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum RoleCommand {
+    Capabilities,
+    Show,
+    Remember,
+    Progress,
     #[command(external_subcommand)]
     Unknown(Vec<OsString>),
 }

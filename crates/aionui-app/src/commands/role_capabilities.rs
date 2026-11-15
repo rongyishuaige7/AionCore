@@ -1,0 +1,93 @@
+use aionui_api_types::ROLE_CLI_SCHEMA_VERSION;
+use serde_json::{Value, json};
+
+const RUNTIME_ENV: [&str; 4] = [
+    "AIONUI_BASE_URL",
+    "AIONUI_USER_ID",
+    "AIONUI_CONVERSATION_ID",
+    "AIONUI_RUNTIME_TOKEN",
+];
+
+/// Stdin fields of `role remember`.
+pub(crate) const REMEMBER_FIELDS: Fields = Fields {
+    required: &["note"],
+    optional: &[],
+};
+
+/// Stdin fields of `role progress`.
+pub(crate) const PROGRESS_FIELDS: Fields = Fields {
+    required: &["task"],
+    optional: &["state"],
+};
+
+/// The string fields a command reads from its stdin JSON object.
+pub(crate) struct Fields {
+    pub required: &'static [&'static str],
+    pub optional: &'static [&'static str],
+}
+
+pub(crate) fn data() -> Value {
+    json!({
+        "schema_version": ROLE_CLI_SCHEMA_VERSION,
+        "contract": "agent-facing-role-cli",
+        "purpose": "A resident role's own memory, for a conversation that runs as that role. The role is the one this conversation's assistant is; no command takes a role id.",
+        "commands": {
+            "capabilities": { "runtime_env_required": [] },
+            "show": {
+                "runtime_env_required": RUNTIME_ENV,
+                "stdin": "none",
+                "data": "{ id, charter, memory, memory_dir, denied_tools, verifies, progress: [{ task, state, updated_at }] } — the whole memory and the full state of every task under way"
+            },
+            "remember": {
+                "runtime_env_required": RUNTIME_ENV,
+                "stdin_json": { "required": REMEMBER_FIELDS.required, "optional": REMEMBER_FIELDS.optional },
+                "fields": { "note": "one thing worth keeping, kept as a single dated line" },
+                "data": "{ line, already_recorded }"
+            },
+            "progress": {
+                "runtime_env_required": RUNTIME_ENV,
+                "stdin_json": { "required": PROGRESS_FIELDS.required, "optional": PROGRESS_FIELDS.optional },
+                "fields": {
+                    "task": "a short name for the task; the same name replaces what was recorded before",
+                    "state": "what is done and what is left; empty or absent closes the task"
+                },
+                "data": "{ task, closed }"
+            }
+        },
+        "output_envelope": {
+            "success": "boolean",
+            "data": "object when success=true",
+            "error": "object when success=false: { code, message }",
+            "meta": { "schema_version": ROLE_CLI_SCHEMA_VERSION }
+        },
+        "semantics": {
+            "memory": "notes are appended, never rewritten; a note the memory already holds is not written twice",
+            "permission": "a role the user keeps from writing its memory or its task progress is answered permission_denied, and should say in its reply what it would have recorded"
+        },
+        "errors": [
+            "not_a_role",
+            "permission_denied",
+            "runtime_auth_failed",
+            "schema_validation_failed",
+            "transport_unavailable",
+            "internal"
+        ]
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use aionui_api_types::RoleCliErrorCode;
+
+    use super::*;
+
+    #[test]
+    fn every_error_the_contract_lists_is_a_code_the_backend_can_answer_with() {
+        for code in data()["errors"].as_array().unwrap() {
+            assert!(
+                serde_json::from_value::<RoleCliErrorCode>(code.clone()).is_ok(),
+                "{code} is not an error code"
+            );
+        }
+    }
+}

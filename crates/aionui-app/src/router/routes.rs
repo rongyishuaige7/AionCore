@@ -50,6 +50,7 @@ use super::health::health_check;
 use aionui_session_message::{session_message_routes, session_message_user_routes};
 use aionui_skill_runtime::skill_runtime_routes;
 
+use super::runtime_role::{RuntimeRoleState, runtime_role_routes};
 use super::runtime_team_tools::{RuntimeTeamToolsState, runtime_team_tools_routes};
 use super::scm_monitor::{CompositeMessageRouter, spawn_scm_monitor};
 use super::state::{ModuleStates, RouterBuildError, build_module_states, build_ws_state};
@@ -312,6 +313,15 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     let sidebar_authenticated =
         sidebar_routes(states.sidebar).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
+    // What a resident role reads and writes about itself from inside its own
+    // conversation. Runtime-token self-authentication, like the other runtime
+    // routes, so it is mounted after the CSRF layer.
+    let role_runtime = runtime_role_routes(RuntimeRoleState {
+        roles: states.role.service.clone(),
+        conversations: services.conversation_service.conversation_repo().clone(),
+        runtime_token_service: services.runtime_token_service.clone(),
+    });
+
     // Resident-role routes protected by auth middleware
     let role_authenticated =
         role_routes(states.role).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
@@ -441,6 +451,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     }
     .merge(ws_routes)
     .merge(runtime_team_tools)
+    .merge(role_runtime)
     .merge(session_message_runtime)
     .merge(conversation_runtime)
     .merge(office_proxy)
