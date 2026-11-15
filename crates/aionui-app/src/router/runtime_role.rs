@@ -8,6 +8,10 @@
 //! that assistant has to be a resident role. The role's permission table
 //! applies here as it does in a team.
 //!
+//! A role can also set itself a follow-up here: a one-shot timer that brings a
+//! note back to this conversation later, so a matter it cannot finish now is
+//! not left to chance.
+//!
 //! Authenticates on the three `x-aionui-*` headers itself, like the other
 //! runtime routes, and is mounted outside the ordinary auth and CSRF middleware.
 
@@ -15,9 +19,12 @@ use std::sync::Arc;
 
 use aionui_ai_agent::{RuntimeTokenScope, RuntimeTokenService, TEAM_RUNTIME_TOKEN_SESSION_GENERATION};
 use aionui_api_types::{
-    RoleCliEnvelope, RoleCliErrorCode, RoleCurateRequest, RoleCurateResponse, RoleProgressRequest,
-    RoleProgressResponse, RoleRememberRequest, RoleRememberResponse, RoleResponse, TeamToolName,
+    RoleCliEnvelope, RoleCliErrorCode, RoleCurateRequest, RoleCurateResponse, RoleFollowUpRequest,
+    RoleFollowUpResponse, RoleProgressRequest, RoleProgressResponse, RoleRememberRequest, RoleRememberResponse,
+    RoleResponse, TeamToolName,
 };
+use aionui_cron::error::CronError;
+use aionui_cron::service::CronService;
 use aionui_db::IConversationRepository;
 use aionui_role::{RoleError, RoleService};
 use axum::extract::State;
@@ -35,6 +42,8 @@ const HEADER_RUNTIME_TOKEN: &str = "x-aionui-runtime-token";
 #[derive(Clone)]
 pub struct RuntimeRoleState {
     pub roles: Arc<RoleService>,
+    /// Where a role's follow-ups wait until they are due.
+    pub timers: Arc<CronService>,
     pub conversations: Arc<dyn IConversationRepository>,
     pub runtime_token_service: Arc<RuntimeTokenService>,
 }
@@ -45,6 +54,7 @@ pub fn runtime_role_routes(state: RuntimeRoleState) -> Router {
         .route("/api/runtime/role/remember", post(remember))
         .route("/api/runtime/role/curate", post(curate))
         .route("/api/runtime/role/progress", post(progress))
+        .route("/api/runtime/role/follow-up", post(follow_up))
         .with_state(state)
 }
 
@@ -171,10 +181,65 @@ async fn progress(
     }
 }
 
+/// Set a follow-up for the calling conversation. Open to every role: it
+/// touches nothing the user keeps, and what it wakes is the role itself.
+async fn follow_up(
+    State(state): State<RuntimeRoleState>,
+    headers: HeaderMap,
+    body: Result<Json<RoleFollowUpRequest>, JsonRejection>,
+) -> Reply {
+    const COMMAND: &str = "role follow-up";
+    let (caller, _role) = match caller_and_role(&state, &headers, COMMAND).await {
+        Ok(found) => found,
+        Err(reply) => return reply,
+    };
+    let request = match parsed(body, COMMAND) {
+        Ok(request) => request,
+        Err(reply) => return *reply,
+    };
+    match state
+        .timers
+        .create_follow_up(
+            &caller.user_id,
+            &caller.conversation_id,
+            &request.note,
+            request.after_minutes,
+        )
+        .await
+    {
+        Ok(set) => success(
+            COMMAND,
+            &RoleFollowUpResponse {
+                job_id: set.job_id,
+                due_at: set.due_at,
+                pending: set.pending,
+            },
+        ),
+        Err(CronError::FollowUpRefused(message)) => failure(
+            StatusCode::BAD_REQUEST,
+            RoleCliErrorCode::SchemaValidationFailed,
+            message,
+            COMMAND,
+        ),
+        Err(error) => {
+            tracing::error!(command = COMMAND, error = %error, "role helper: follow-up could not be set");
+            internal(COMMAND)
+        }
+    }
+}
+
 /// The resident role the calling conversation runs as. Refuses a caller whose
 /// token does not open the conversation it names, and a conversation whose
 /// assistant is not a role.
 async fn caller_role(state: &RuntimeRoleState, headers: &HeaderMap, command: &str) -> Result<RoleResponse, Reply> {
+    caller_and_role(state, headers, command).await.map(|(_, role)| role)
+}
+
+async fn caller_and_role(
+    state: &RuntimeRoleState,
+    headers: &HeaderMap,
+    command: &str,
+) -> Result<(RuntimeCaller, RoleResponse), Reply> {
     let caller = runtime_caller(state, headers).ok_or_else(|| {
         // No header values are logged — the token must never reach the logs.
         tracing::warn!(command, error_code = "runtime_auth_failed", "role helper refused");
@@ -203,7 +268,7 @@ async fn caller_role(state: &RuntimeRoleState, headers: &HeaderMap, command: &st
         })?
         .ok_or_else(not_a_role)?;
     match state.roles.find(&snapshot.assistant_id).await {
-        Ok(Some(role)) => Ok(role),
+        Ok(Some(role)) => Ok((caller, role)),
         // An assistant id that cannot name a role directory is not a role.
         Ok(None) | Err(RoleError::InvalidId(_)) => Err(not_a_role()),
         Err(error) => {

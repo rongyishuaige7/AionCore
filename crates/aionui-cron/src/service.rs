@@ -23,6 +23,10 @@ use crate::events::CronEventEmitter;
 
 use crate::error::CronError;
 use crate::executor::{ExecutionResult, JobExecutor, PreparedRunNow, RETRY_INTERVAL_MS};
+use crate::follow_up::{
+    FOLLOW_UP_MAX_RETRIES, FollowUp, MAX_FOLLOW_UP_MINUTES, MAX_FOLLOW_UP_NOTE_CHARS, MAX_PENDING_FOLLOW_UPS,
+    follow_up_name, is_follow_up,
+};
 use crate::scheduler::{
     CronScheduler, compute_next_run, compute_next_run_after_occurrence, validate_schedule, validate_timezone,
 };
@@ -97,7 +101,7 @@ impl CronService {
     // -----------------------------------------------------------------------
 
     pub async fn add_job(&self, user_id: &str, req: CreateCronJobRequest) -> Result<CronJob, CronError> {
-        self.add_job_internal(user_id, req, None, None).await
+        self.add_job_internal(user_id, req, None, None, false).await
     }
 
     pub async fn create_for_conversation_helper(
@@ -130,7 +134,7 @@ impl CronService {
         };
 
         let job = self
-            .add_job_internal(user_id, create_req, Some(agent_type), assistant_backend_override)
+            .add_job_internal(user_id, create_req, Some(agent_type), assistant_backend_override, false)
             .await?;
         if let Err(err) = self
             .executor
@@ -161,6 +165,90 @@ impl CronService {
         Ok(CreateConversationCronResponse {
             job_id: job.id.clone(),
             message: format!("Created cron job '{}' ({})", job.name, job.id),
+        })
+    }
+
+    /// Sets a follow-up: `note` comes back to `conversation_id` in
+    /// `after_minutes`, once. The caller has already established that the
+    /// request comes from inside that conversation.
+    pub async fn create_follow_up(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        note: &str,
+        after_minutes: u32,
+    ) -> Result<FollowUp, CronError> {
+        let note = note.trim();
+        if note.is_empty() {
+            return Err(CronError::FollowUpRefused(
+                "a follow-up needs a note saying what to pick up".into(),
+            ));
+        }
+        if note.chars().count() > MAX_FOLLOW_UP_NOTE_CHARS {
+            return Err(CronError::FollowUpRefused(format!(
+                "a follow-up note holds at most {MAX_FOLLOW_UP_NOTE_CHARS} characters; keep the detail in your memory or task progress"
+            )));
+        }
+        if !(1..=MAX_FOLLOW_UP_MINUTES).contains(&after_minutes) {
+            return Err(CronError::FollowUpRefused(format!(
+                "after_minutes must be between 1 and {MAX_FOLLOW_UP_MINUTES}"
+            )));
+        }
+
+        let row = self
+            .executor
+            .get_conversation_row_for_user(user_id, conversation_id)
+            .await?
+            .ok_or_else(|| {
+                CronError::Conversation(aionui_conversation::ConversationError::NotFound {
+                    id: conversation_id.to_owned(),
+                })
+            })?;
+
+        let waiting = self
+            .list_jobs(
+                user_id,
+                &ListCronJobsQuery {
+                    conversation_id: Some(conversation_id.to_owned()),
+                },
+            )
+            .await?
+            .iter()
+            .filter(|job| job.enabled && is_follow_up(job))
+            .count();
+        if waiting >= MAX_PENDING_FOLLOW_UPS {
+            return Err(CronError::FollowUpRefused(format!(
+                "{waiting} follow-ups are already waiting for this conversation, which is the most it may hold"
+            )));
+        }
+
+        let due_at = now_ms() + i64::from(after_minutes) * 60_000;
+        let (agent_type, agent_config, assistant_backend_override) =
+            self.build_agent_config_from_conversation(&row).await;
+        let create_req = CreateCronJobRequest {
+            name: follow_up_name(note),
+            description: None,
+            schedule: CronScheduleDto::At {
+                at_ms: due_at,
+                description: None,
+            },
+            prompt: None,
+            message: Some(note.to_owned()),
+            conversation_id: conversation_id.to_owned(),
+            conversation_title: Some(row.name.clone()),
+            created_by: "agent".to_owned(),
+            execution_mode: Some("existing".to_owned()),
+            queue_enabled: false,
+            agent_config,
+        };
+        let job = self
+            .add_job_internal(user_id, create_req, Some(agent_type), assistant_backend_override, true)
+            .await?;
+
+        Ok(FollowUp {
+            job_id: job.id,
+            due_at,
+            pending: waiting + 1,
         })
     }
 
@@ -256,6 +344,7 @@ impl CronService {
         req: CreateCronJobRequest,
         runtime_agent_type: Option<String>,
         assistant_backend_override: Option<String>,
+        follow_up: bool,
     ) -> Result<CronJob, CronError> {
         let schedule = schedule_from_dto(&req.schedule);
         validate_schedule(&schedule)?;
@@ -316,7 +405,7 @@ impl CronService {
             last_error: None,
             run_count: 0,
             retry_count: 0,
-            max_retries: 3,
+            max_retries: if follow_up { FOLLOW_UP_MAX_RETRIES } else { 3 },
             queue_enabled: req.queue_enabled,
         };
 
@@ -324,7 +413,11 @@ impl CronService {
 
         let row = cron_job_to_row(&job)?;
         self.repo.insert(&row).await?;
-        self.bind_existing_conversation_if_needed(&job).await;
+        // A follow-up only visits its conversation: the conversation stays
+        // filed under whichever task, if any, it already belongs to.
+        if !follow_up {
+            self.bind_existing_conversation_if_needed(&job).await;
+        }
         self.scheduler.schedule_job(&job);
         self.emitter.emit_job_created(user_id, &cron_job_to_response(&job));
 
@@ -764,8 +857,12 @@ impl CronService {
                 }
             }
 
+            // A follow-up is a promise to come back to something, not a
+            // report tied to its hour: one that came due while the machine
+            // slept is delivered late rather than dropped.
             if let Some(next_run) = job.next_run_at
                 && next_run < now
+                && !is_follow_up(&job)
             {
                 info!(
                     job_id = %job.id,
@@ -1188,9 +1285,18 @@ impl CronService {
                 }
                 self.update_job_after_success(&job.user_id, job_id, &conversation_id)
                     .await;
-                self.reschedule_after_execution(&job, scheduled_at).await;
+                let delivered_follow_up = is_follow_up(&job);
+                if !delivered_follow_up {
+                    self.reschedule_after_execution(&job, scheduled_at).await;
+                }
                 if let Some(user_id) = owner_user_id.as_deref() {
                     self.emitter.emit_job_executed(user_id, job_id, "ok", None);
+                }
+                // A delivered follow-up has nothing left to say; one that
+                // failed stays behind, disabled, with its error.
+                if delivered_follow_up && let Err(error) = self.remove_job(&job.user_id, job_id).await {
+                    warn!(job_id, error = %error, "Failed to remove a delivered follow-up");
+                    self.reschedule_after_execution(&job, scheduled_at).await;
                 }
             }
             ExecutionResult::Retrying { attempt } => {

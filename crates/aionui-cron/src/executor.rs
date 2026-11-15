@@ -18,6 +18,7 @@ use tracing::{error, info, warn};
 
 use crate::artifacts::{broadcast_artifact, build_cron_trigger_artifact};
 use crate::error::CronError;
+use crate::follow_up::{build_follow_up_prompt, is_follow_up};
 use crate::prompt::{
     build_existing_conversation_prompt, build_new_conversation_prompt_with_skill_suggest,
     build_new_conversation_with_skill_prompt,
@@ -1186,6 +1187,9 @@ async fn build_task_extra(registry: &AgentRegistry, job: &CronJob, skills: &[Str
 }
 
 fn build_prompt(job: &CronJob, saved_skill: Option<&SavedSkillContext>) -> String {
+    if is_follow_up(job) {
+        return build_follow_up_prompt(&job.message);
+    }
     let schedule_desc = schedule_description_text(&job.schedule);
 
     match job.execution_mode {

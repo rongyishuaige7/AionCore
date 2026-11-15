@@ -153,6 +153,17 @@ fn render(brief: &TeamRoleBrief, setting: Setting) -> String {
         ));
     }
 
+    if !in_team {
+        out.push_str(&format!(
+            "\n\n### Coming back to something\n\n\
+             When a matter cannot be finished in this run because it has to wait (a build, a reply, a date), set \
+             yourself a follow-up instead of waiting for it or letting it drop:\n\n\
+             ```\n{ROLE_HELPER} follow-up <<'JSON'\n{{\"note\": \"<what to pick up, written for a reader who \
+             remembers nothing of this run>\", \"after_minutes\": 30}}\nJSON\n```\n\n\
+             It wakes you once, in this conversation, after that many minutes (a week at most), with the note."
+        ));
+    }
+
     if in_team && brief.verifies {
         out.push_str(
             "\n\n### Reviewing\n\n\
@@ -332,6 +343,20 @@ mod tests {
     }
 
     #[test]
+    fn a_scheduled_run_is_shown_how_to_come_back_to_a_matter_and_a_team_member_is_not() {
+        let scheduled = render_scheduled_standing_role(&brief());
+        assert!(scheduled.contains("### Coming back to something"), "{scheduled}");
+        assert!(
+            scheduled.contains("\"$AIONUI_HELPER_BIN\" role follow-up <<'JSON'"),
+            "{scheduled}"
+        );
+        assert!(scheduled.contains("\"after_minutes\": 30"), "{scheduled}");
+
+        let in_team = render_standing_role(&brief());
+        assert!(!in_team.contains("follow-up"), "{in_team}");
+    }
+
+    #[test]
     fn a_scheduled_run_kept_from_its_memory_is_asked_to_say_it_in_the_reply() {
         let section = render_scheduled_standing_role(&TeamRoleBrief {
             denied_tools: vec![REMEMBER_TOOL.into(), PROGRESS_TOOL.into()],
@@ -341,7 +366,11 @@ mod tests {
 
         assert!(section.contains("should outlast this run, say in your reply what should be remembered"));
         assert!(section.contains("say in your reply where it now stands"));
-        assert!(!section.contains("AIONUI_HELPER_BIN"));
+        for kept_from in ["role remember", "role curate", "role progress", "role show"] {
+            assert!(!section.contains(kept_from), "{kept_from}: {section}");
+        }
+        // Coming back to a matter writes nothing the user keeps.
+        assert!(section.contains("role follow-up"), "{section}");
         assert!(!section.contains("team_"));
     }
 

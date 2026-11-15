@@ -13,7 +13,9 @@ use aionui_api_types::{RoleCliEnvelope, RoleCliErrorCode};
 use serde_json::{Map, Value};
 
 use crate::cli::{RoleArgs, RoleCommand};
-use crate::commands::role_capabilities::{self, CURATE_FIELDS, Fields, PROGRESS_FIELDS, REMEMBER_FIELDS};
+use crate::commands::role_capabilities::{
+    self, CURATE_FIELDS, FOLLOW_UP_FIELDS, Fields, PROGRESS_FIELDS, REMEMBER_FIELDS,
+};
 
 const ENV_BASE_URL: &str = "AIONUI_BASE_URL";
 const ENV_USER_ID: &str = "AIONUI_USER_ID";
@@ -38,6 +40,7 @@ async fn run_role_inner(args: RoleArgs) -> Result<(), ExitCode> {
         RoleCommand::Remember => write("role remember", "/api/runtime/role/remember", &REMEMBER_FIELDS).await,
         RoleCommand::Curate => write("role curate", "/api/runtime/role/curate", &CURATE_FIELDS).await,
         RoleCommand::Progress => write("role progress", "/api/runtime/role/progress", &PROGRESS_FIELDS).await,
+        RoleCommand::FollowUp => write("role follow-up", "/api/runtime/role/follow-up", &FOLLOW_UP_FIELDS).await,
         RoleCommand::Unknown(path) => Err(unknown_command(path)),
     }
 }
@@ -145,7 +148,11 @@ fn checked_fields(fields: &Fields, value: Value) -> Result<Value, String> {
         if !fields.required.contains(&key.as_str()) && !fields.optional.contains(&key.as_str()) {
             return Err(format!("unknown stdin field: {key}"));
         }
-        if !field.is_string() {
+        if fields.whole_numbers.contains(&key.as_str()) {
+            if !field.is_u64() {
+                return Err(format!("stdin field must be a whole number: {key}"));
+            }
+        } else if !field.is_string() {
             return Err(format!("stdin field must be a string: {key}"));
         }
     }
@@ -260,6 +267,21 @@ mod tests {
         assert!(checked_fields(&CURATE_FIELDS, json!({ "memory": "- uses pnpm\n- reads on a phone\n" })).is_ok());
         assert!(checked_fields(&CURATE_FIELDS, json!({ "note": "x" })).is_err());
         assert!(checked_fields(&CURATE_FIELDS, json!({})).is_err());
+    }
+
+    #[test]
+    fn follow_up_takes_a_note_and_a_whole_number_of_minutes() {
+        assert!(
+            checked_fields(
+                &FOLLOW_UP_FIELDS,
+                json!({ "note": "check the deploy", "after_minutes": 30 })
+            )
+            .is_ok()
+        );
+        assert!(checked_fields(&FOLLOW_UP_FIELDS, json!({ "note": "check the deploy" })).is_err());
+        assert!(checked_fields(&FOLLOW_UP_FIELDS, json!({ "note": "x", "after_minutes": "30" })).is_err());
+        assert!(checked_fields(&FOLLOW_UP_FIELDS, json!({ "note": "x", "after_minutes": 1.5 })).is_err());
+        assert!(checked_fields(&FOLLOW_UP_FIELDS, json!({ "note": "x", "after_minutes": -5 })).is_err());
     }
 
     #[test]

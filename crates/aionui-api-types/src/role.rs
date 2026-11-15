@@ -4,6 +4,7 @@
 //! assistant's own definition it carries a charter, a memory that outlives any
 //! single team, and a table of team tools it may not call.
 
+use aionui_common::TimestampMs;
 use serde::{Deserialize, Serialize};
 
 /// One resident role.
@@ -189,4 +190,22 @@ pub struct RoleCurateResponse {
     pub archived_as: Option<String>,
     pub bytes_before: usize,
     pub bytes_after: usize,
+}
+
+/// Stdin of `role follow-up`: a one-shot timer the role sets for itself. The
+/// note comes back to the conversation that set it, once, after the delay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoleFollowUpRequest {
+    pub note: String,
+    pub after_minutes: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleFollowUpResponse {
+    /// The scheduled task the follow-up waits as until it is delivered.
+    pub job_id: String,
+    pub due_at: TimestampMs,
+    /// Follow-ups this conversation now has waiting, this one included.
+    pub pending: usize,
 }

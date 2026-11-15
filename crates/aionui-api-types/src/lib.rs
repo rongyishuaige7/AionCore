@@ -163,8 +163,9 @@ pub use remote_agent::{
 pub use response::{ApiResponse, ErrorResponse};
 pub use role::{
     ROLE_CLI_SCHEMA_VERSION, RoleCliEnvelope, RoleCliError, RoleCliErrorCode, RoleCliMeta, RoleCurateRequest,
-    RoleCurateResponse, RoleListResponse, RoleProgress, RoleProgressRequest, RoleProgressResponse, RoleRememberRequest,
-    RoleRememberResponse, RoleResponse, UpdateRoleMemoryRequest, UpsertRoleRequest,
+    RoleCurateResponse, RoleFollowUpRequest, RoleFollowUpResponse, RoleListResponse, RoleProgress, RoleProgressRequest,
+    RoleProgressResponse, RoleRememberRequest, RoleRememberResponse, RoleResponse, UpdateRoleMemoryRequest,
+    UpsertRoleRequest,
 };
 pub use runtime::{
     EnsureNodeRuntimeRequest, EnsureNodeRuntimeResponse, RuntimeFailureKind, RuntimeResourceKind, RuntimeStatusPayload,

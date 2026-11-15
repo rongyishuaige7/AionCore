@@ -88,9 +88,24 @@ async fn conversation_as(fixture: &Fixture, conversation_id: &str, assistant_id:
 
 /// Define the role the way the user does, through the ordinary role service.
 async fn define_role(fixture: &Fixture, denied_tools: &[&str]) {
+    define_role_as(fixture, ROLE, denied_tools).await;
+}
+
+/// An assistant the app really has, for what needs more of a role's assistant
+/// than its id: a timer is set up to run as it.
+async fn seeded_assistant_id(fixture: &Fixture) -> String {
+    let (assistant_id,): (String,) =
+        sqlx::query_as("SELECT assistant_id FROM assistant_definitions WHERE source = 'builtin' LIMIT 1")
+            .fetch_one(fixture.services.database.pool())
+            .await
+            .expect("the app seeds its built-in assistants");
+    assistant_id
+}
+
+async fn define_role_as(fixture: &Fixture, role: &str, denied_tools: &[&str]) {
     aionui_role::RoleService::new(fixture.services.data_dir.join("roles"))
         .upsert(
-            ROLE,
+            role,
             aionui_api_types::UpsertRoleRequest {
                 charter: "Checks work before it is called done.".into(),
                 denied_tools: denied_tools.iter().map(|tool| (*tool).to_owned()).collect(),
@@ -254,6 +269,71 @@ async fn a_role_kept_from_its_memory_is_refused_here_as_it_is_in_a_team() {
     // Reading stays open: the role is still told what it knows.
     let (status, _) = call(&fixture, "GET", "/api/runtime/role", "conv-role", &token, None).await;
     assert_eq!(status, StatusCode::OK);
+    fixture.services.database.close().await;
+}
+
+#[tokio::test]
+async fn a_role_sets_itself_a_follow_up_that_waits_as_a_one_shot_task_for_its_conversation() {
+    let fixture = fixture().await;
+    let role = seeded_assistant_id(&fixture).await;
+    define_role_as(&fixture, &role, &[]).await;
+    let token = conversation_as(&fixture, "conv-role", Some(&role)).await;
+    let plain = conversation_as(&fixture, "conv-plain", None).await;
+
+    let (status, set) = call(
+        &fixture,
+        "POST",
+        "/api/runtime/role/follow-up",
+        "conv-role",
+        &token,
+        Some(json!({ "note": "check whether the deploy went out", "after_minutes": 45 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{set}");
+    assert_eq!(set["meta"]["command"], json!("role follow-up"));
+    assert_eq!(set["data"]["pending"], json!(1));
+    let job_id = set["data"]["job_id"].as_str().expect("job id").to_owned();
+    let due_at = set["data"]["due_at"].as_i64().expect("due time");
+
+    let (kind, created_by, conversation_id, message, next_run_at): (String, String, String, String, Option<i64>) =
+        sqlx::query_as(
+            "SELECT schedule_kind, created_by, conversation_id, payload_message, next_run_at
+             FROM cron_jobs WHERE id = ?",
+        )
+        .bind(&job_id)
+        .fetch_one(fixture.services.database.pool())
+        .await
+        .unwrap();
+    assert_eq!(kind, "at");
+    assert_eq!(created_by, "agent");
+    assert_eq!(conversation_id, "conv-role");
+    assert_eq!(message, "check whether the deploy went out");
+    assert_eq!(next_run_at, Some(due_at));
+
+    // The delay has to be a real one, and the caller has to be a role.
+    let (status, refused) = call(
+        &fixture,
+        "POST",
+        "/api/runtime/role/follow-up",
+        "conv-role",
+        &token,
+        Some(json!({ "note": "x", "after_minutes": 0 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    assert_eq!(refused["error"]["code"], json!("schema_validation_failed"));
+
+    let (status, refused) = call(
+        &fixture,
+        "POST",
+        "/api/runtime/role/follow-up",
+        "conv-plain",
+        &plain,
+        Some(json!({ "note": "x", "after_minutes": 10 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{refused}");
+    assert_eq!(refused["error"]["code"], json!("not_a_role"));
     fixture.services.database.close().await;
 }
 

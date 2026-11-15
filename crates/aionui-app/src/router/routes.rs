@@ -318,6 +318,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     // routes, so it is mounted after the CSRF layer.
     let role_runtime = runtime_role_routes(RuntimeRoleState {
         roles: states.role.service.clone(),
+        timers: states.cron.cron_service.clone(),
         conversations: services.conversation_service.conversation_repo().clone(),
         runtime_token_service: services.runtime_token_service.clone(),
     });

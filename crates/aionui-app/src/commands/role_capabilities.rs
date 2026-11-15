@@ -12,31 +12,43 @@ const RUNTIME_ENV: [&str; 4] = [
 pub(crate) const REMEMBER_FIELDS: Fields = Fields {
     required: &["note"],
     optional: &[],
+    whole_numbers: &[],
 };
 
 /// Stdin fields of `role curate`.
 pub(crate) const CURATE_FIELDS: Fields = Fields {
     required: &["memory"],
     optional: &[],
+    whole_numbers: &[],
 };
 
 /// Stdin fields of `role progress`.
 pub(crate) const PROGRESS_FIELDS: Fields = Fields {
     required: &["task"],
     optional: &["state"],
+    whole_numbers: &[],
 };
 
-/// The string fields a command reads from its stdin JSON object.
+/// Stdin fields of `role follow-up`.
+pub(crate) const FOLLOW_UP_FIELDS: Fields = Fields {
+    required: &["note", "after_minutes"],
+    optional: &[],
+    whole_numbers: &["after_minutes"],
+};
+
+/// The fields a command reads from its stdin JSON object: strings, except the
+/// ones named in `whole_numbers`.
 pub(crate) struct Fields {
     pub required: &'static [&'static str],
     pub optional: &'static [&'static str],
+    pub whole_numbers: &'static [&'static str],
 }
 
 pub(crate) fn data() -> Value {
     json!({
         "schema_version": ROLE_CLI_SCHEMA_VERSION,
         "contract": "agent-facing-role-cli",
-        "purpose": "A resident role's own memory, for a conversation that runs as that role. The role is the one this conversation's assistant is; no command takes a role id.",
+        "purpose": "A resident role's own memory and follow-ups, for a conversation that runs as that role. The role is the one this conversation's assistant is; no command takes a role id.",
         "commands": {
             "capabilities": { "runtime_env_required": [] },
             "show": {
@@ -64,6 +76,15 @@ pub(crate) fn data() -> Value {
                     "state": "what is done and what is left; empty or absent closes the task"
                 },
                 "data": "{ task, closed }"
+            },
+            "follow-up": {
+                "runtime_env_required": RUNTIME_ENV,
+                "stdin_json": { "required": FOLLOW_UP_FIELDS.required, "optional": FOLLOW_UP_FIELDS.optional },
+                "fields": {
+                    "note": "what to pick up when woken, written for a reader who remembers nothing of this run",
+                    "after_minutes": "a whole number of minutes from now, from 1 to 10080 (a week)"
+                },
+                "data": "{ job_id, due_at, pending }"
             }
         },
         "output_envelope": {
@@ -75,6 +96,7 @@ pub(crate) fn data() -> Value {
         "semantics": {
             "memory": "remember appends one note and never rewrites; a note the memory already holds is not written twice",
             "curation": "curate replaces the whole memory; the version it replaces is kept in the archive directory beside it, and an empty memory is refused",
+            "follow_up": "follow-up sets a one-shot timer: the note comes back to this conversation once, after the delay, and the timer is gone once delivered; a conversation holds at most 5 waiting at a time",
             "permission": "a role the user keeps from writing its memory or its task progress is answered permission_denied, and should say in its reply what it would have recorded"
         },
         "errors": [

@@ -282,6 +282,8 @@ pub(crate) enum RoleCommand {
     Remember,
     Curate,
     Progress,
+    #[command(name = "follow-up")]
+    FollowUp,
     #[command(external_subcommand)]
     Unknown(Vec<OsString>),
 }

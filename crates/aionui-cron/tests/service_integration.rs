@@ -2712,6 +2712,92 @@ async fn create_for_conversation_helper_creates_claimed_conversation_job_with_mu
 }
 
 #[tokio::test]
+async fn a_follow_up_is_a_one_shot_job_that_leaves_the_conversation_filed_where_it_was() {
+    let (svc, cron_repo, _, conv_repo, _) = setup_with_conv_runtime().await;
+    let before = now_ms();
+
+    let follow_up = svc
+        .create_follow_up("u1", "conv_1", "  check the deploy\nthen tell the lead  ", 30)
+        .await
+        .unwrap();
+
+    assert_eq!(follow_up.pending, 1);
+    assert!(follow_up.due_at >= before + 30 * 60_000);
+    let row = cron_repo.get_by_id_system(&follow_up.job_id).await.unwrap().unwrap();
+    assert_eq!(row.schedule_kind, "at");
+    assert_eq!(row.schedule_value, follow_up.due_at.to_string());
+    assert_eq!(row.created_by, "agent");
+    assert_eq!(row.execution_mode, "existing");
+    assert_eq!(row.conversation_id, "conv_1");
+    assert_eq!(row.name, "check the deploy");
+    assert_eq!(row.payload_message, "check the deploy\nthen tell the lead");
+    assert_eq!(row.next_run_at, Some(follow_up.due_at));
+    assert!(row.max_retries > 3, "a busy conversation is waited for longer");
+
+    let conversation = conv_repo.get("u1", "conv_1").await.unwrap().unwrap();
+    let extra: serde_json::Value = serde_json::from_str(&conversation.extra).unwrap();
+    assert!(extra.get("cron_job_id").is_none(), "{extra}");
+    assert!(
+        conv_repo
+            .list_by_cron_job("u1", &follow_up.job_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn a_conversation_holds_only_so_many_follow_ups_at_a_time() {
+    let (svc, _, _, _, _) = setup_with_conv_runtime().await;
+
+    for index in 0..aionui_cron::follow_up::MAX_PENDING_FOLLOW_UPS {
+        let follow_up = svc
+            .create_follow_up("u1", "conv_1", &format!("matter {index}"), 10)
+            .await
+            .unwrap();
+        assert_eq!(follow_up.pending, index + 1);
+    }
+
+    let refused = svc.create_follow_up("u1", "conv_1", "one too many", 10).await;
+    assert!(
+        matches!(&refused, Err(aionui_cron::error::CronError::FollowUpRefused(message)) if message.contains("already waiting")),
+        "{refused:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_follow_up_needs_a_note_a_delay_within_a_week_and_a_conversation_of_the_caller() {
+    use aionui_cron::error::CronError;
+    let (svc, cron_repo, _, _, _) = setup_with_conv_runtime().await;
+
+    for (note, minutes) in [
+        ("   ", 10),
+        ("x", 0),
+        ("x", aionui_cron::follow_up::MAX_FOLLOW_UP_MINUTES + 1),
+    ] {
+        let refused = svc.create_follow_up("u1", "conv_1", note, minutes).await;
+        assert!(
+            matches!(refused, Err(CronError::FollowUpRefused(_))),
+            "{note:?} {minutes}"
+        );
+    }
+    let too_long = "x".repeat(aionui_cron::follow_up::MAX_FOLLOW_UP_NOTE_CHARS + 1);
+    assert!(matches!(
+        svc.create_follow_up("u1", "conv_1", &too_long, 10).await,
+        Err(CronError::FollowUpRefused(_))
+    ));
+    assert!(matches!(
+        svc.create_follow_up("u1", "missing_conv", "x", 10).await,
+        Err(CronError::Conversation(_))
+    ));
+    assert!(matches!(
+        svc.create_follow_up("someone-else", "conv_1", "x", 10).await,
+        Err(CronError::Conversation(_))
+    ));
+    assert!(cron_repo.list_all_system().await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn create_for_conversation_helper_keeps_conversation_extra_mode_unchanged() {
     let (svc, cron_repo, _, conv_repo, conv_service) = setup_with_conv_runtime().await;
     let runtime_state = conv_service.runtime_state();
