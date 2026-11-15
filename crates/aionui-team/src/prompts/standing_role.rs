@@ -1,5 +1,6 @@
-//! The section a member spawned from a resident role receives with its role
-//! prompt: the charter, the role's memory, and the team tools it may not call.
+//! The section a resident role receives when it is put to work: the charter,
+//! the role's memory, the work it left under way and, in a team, the team
+//! tools it may not call.
 
 use std::path::Path;
 
@@ -21,12 +22,40 @@ const MAX_LISTED_TASKS: usize = 20;
 /// Cap on the summary shown for one task, in characters.
 const MAX_TASK_SUMMARY_CHARS: usize = 160;
 
-/// Render the standing-role section. No trailing newline.
+/// Where a role is put to work. Team tools exist only in a team, so the place
+/// decides what the role is told about writing to its own memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Setting {
+    /// A member of a team, with the team tools at hand.
+    Team,
+    /// Run on its own by a scheduled task, with no team around it.
+    Scheduled,
+}
+
+/// Render the standing-role section for a member of a team. No trailing newline.
 pub fn render_standing_role(brief: &TeamRoleBrief) -> String {
-    let mut out = String::from(
-        "## Your Standing Role\n\n\
-         You are a resident role. The charter and memory below stay with you across every team you join.\n\n",
-    );
+    render(brief, Setting::Team)
+}
+
+/// Render the standing-role section for a role run on its own by a scheduled
+/// task. It has no team tools there, so it is asked to say in its reply what
+/// belongs in its memory, and nothing is said about reviewing or the team
+/// tools it is denied. No trailing newline.
+pub fn render_scheduled_standing_role(brief: &TeamRoleBrief) -> String {
+    render(brief, Setting::Scheduled)
+}
+
+fn render(brief: &TeamRoleBrief, setting: Setting) -> String {
+    let in_team = setting == Setting::Team;
+    // What a lesson or a piece of work has to outlast to be worth keeping.
+    let here = if in_team { "this team" } else { "this run" };
+    let mut out = String::from("## Your Standing Role\n\n");
+    out.push_str(if in_team {
+        "You are a resident role. The charter and memory below stay with you across every team you join.\n\n"
+    } else {
+        "You are a resident role. The charter and memory below stay with you across every scheduled run and \
+         every team you join.\n\n"
+    });
 
     let charter = brief.charter.trim();
     if !charter.is_empty() {
@@ -48,9 +77,9 @@ pub fn render_standing_role(brief: &TeamRoleBrief) -> String {
         out.push_str("\n\n");
     }
     let memory_file = Path::new(&brief.memory_dir).join("MEMORY.md");
-    if brief.denied_tools.iter().any(|tool| tool == REMEMBER_TOOL) {
+    if !in_team || brief.denied_tools.iter().any(|tool| tool == REMEMBER_TOOL) {
         out.push_str(&format!(
-            "The user keeps this memory (`{}`). When you learn something that should outlast this team, say in \
+            "The user keeps this memory (`{}`). When you learn something that should outlast {here}, say in \
              your reply what should be remembered.",
             memory_file.display()
         ));
@@ -63,7 +92,7 @@ pub fn render_standing_role(brief: &TeamRoleBrief) -> String {
         ));
     }
 
-    let may_record_progress = !brief.denied_tools.iter().any(|tool| tool == PROGRESS_TOOL);
+    let may_record_progress = in_team && !brief.denied_tools.iter().any(|tool| tool == PROGRESS_TOOL);
     if !brief.progress.is_empty() {
         let progress_dir = Path::new(&brief.memory_dir).join("progress");
         out.push_str("\n\n### Work in progress\n\n");
@@ -85,6 +114,8 @@ pub fn render_standing_role(brief: &TeamRoleBrief) -> String {
             out.push_str(&format!(
                 " Keep it current with `{PROGRESS_TOOL}`, and send an empty state when the task is finished."
             ));
+        } else if !in_team {
+            out.push_str(" When you move one forward, say in your reply where it now stands.");
         }
     } else if may_record_progress {
         out.push_str(&format!(
@@ -93,7 +124,7 @@ pub fn render_standing_role(brief: &TeamRoleBrief) -> String {
         ));
     }
 
-    if brief.verifies {
+    if in_team && brief.verifies {
         out.push_str(
             "\n\n### Reviewing\n\n\
              You review work in every team you join. When another member marks a task completed, the backend holds \
@@ -103,7 +134,7 @@ pub fn render_standing_role(brief: &TeamRoleBrief) -> String {
         );
     }
 
-    if !brief.denied_tools.is_empty() {
+    if in_team && !brief.denied_tools.is_empty() {
         out.push_str("\n\n### Team tools you may not call\n\n");
         for tool in &brief.denied_tools {
             out.push_str(&format!("- `{tool}`\n"));
@@ -235,6 +266,28 @@ mod tests {
         });
         assert!(section.contains("- `migration` (2026-11-15): half done"));
         assert!(!section.contains("Keep it current"));
+    }
+
+    #[test]
+    fn a_scheduled_run_gets_charter_memory_and_tasks_but_no_word_of_team_tools() {
+        let section = render_scheduled_standing_role(&TeamRoleBrief {
+            verifies: true,
+            progress: vec![task("weekly-report", "Draft sent.", "2026-11-14")],
+            ..brief()
+        });
+
+        assert!(section.starts_with("## Your Standing Role"));
+        assert!(section.contains("across every scheduled run and every team you join"));
+        assert!(section.contains("### Charter\n\nChecks work before it is called done."));
+        assert!(section.contains("### Memory\n\n- the user wants tests run, not described"));
+        assert!(section.contains("should outlast this run, say in your reply what should be remembered"));
+        assert!(section.contains("- `weekly-report` (2026-11-14): Draft sent."));
+        assert!(section.contains("say in your reply where it now stands"));
+        // Nothing it is told to call exists outside a team.
+        assert!(!section.contains("team_"));
+        assert!(!section.contains("### Reviewing"));
+        assert!(!section.contains("may not call"));
+        assert!(!section.ends_with('\n'));
     }
 
     #[test]

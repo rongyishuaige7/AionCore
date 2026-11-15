@@ -5,7 +5,7 @@ use aionui_api_types::TeamToolTransport;
 mod standing_role;
 mod wake_summary;
 
-pub use standing_role::render_standing_role;
+pub use standing_role::{render_scheduled_standing_role, render_standing_role};
 
 pub use aionui_team_prompts::AvailableAssistant;
 

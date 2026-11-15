@@ -55,7 +55,19 @@ struct SkillSuggestContext {
     workspace: String,
 }
 
+/// Tells a scheduled run who it is when the assistant it runs as is a resident
+/// role. Owned by the composition layer, so this crate does not depend on the
+/// role crate.
+#[async_trait::async_trait]
+pub trait CronRolePort: Send + Sync {
+    /// The standing-role section to lead the run's prompt with: the role's
+    /// charter, its memory and the work it left under way. `None` when the
+    /// assistant is not a role or the role cannot be read.
+    async fn standing_role(&self, assistant_id: &str) -> Option<String>;
+}
+
 pub struct JobExecutor {
+    role_port: Option<Arc<dyn CronRolePort>>,
     conversation_repo: Arc<dyn IConversationRepository>,
     conversation_service: Arc<ConversationService>,
     work_dir: PathBuf,
@@ -79,6 +91,7 @@ impl JobExecutor {
         let skill_suggest_detector =
             SkillSuggestDetector::new(Arc::clone(&broadcaster), conversation_repo.clone(), data_dir.clone());
         Self {
+            role_port: None,
             conversation_repo,
             conversation_service,
             work_dir,
@@ -86,6 +99,39 @@ impl JobExecutor {
             broadcaster,
             agent_registry,
             skill_suggest_detector,
+        }
+    }
+
+    /// Wires the role lookup. Without it no run is treated as a role's run.
+    pub fn with_role_port(mut self, role_port: Arc<dyn CronRolePort>) -> Self {
+        self.role_port = Some(role_port);
+        self
+    }
+
+    /// Leads `prompt` with the standing role of the assistant the job runs as,
+    /// when that assistant is a resident role. Memory is read afresh on every
+    /// run, so a run sees what earlier runs and teams left there.
+    async fn with_standing_role(&self, job: &CronJob, conversation_id: &str, prompt: String) -> String {
+        let Some(role_port) = &self.role_port else {
+            return prompt;
+        };
+        let assistant_id = match build_assistant_request(job) {
+            Some(assistant) => Some(assistant.id),
+            // A task bound to an existing conversation may not name its assistant.
+            None => match self.get_assistant_snapshot(conversation_id).await {
+                Ok(snapshot) => snapshot.map(|snapshot| snapshot.assistant_id),
+                Err(_) => None,
+            },
+        };
+        let Some(assistant_id) = assistant_id else {
+            return prompt;
+        };
+        match role_port.standing_role(&assistant_id).await {
+            Some(section) => {
+                info!(job_id = %job.id, conversation_id, assistant_id = %assistant_id, "cron run carries its resident role");
+                format!("{section}\n\n{prompt}")
+            }
+            None => prompt,
         }
     }
 
@@ -708,7 +754,9 @@ impl JobExecutor {
             }
         };
 
-        let prompt = build_prompt(job, saved_skill);
+        let prompt = self
+            .with_standing_role(job, conversation_id, build_prompt(job, saved_skill))
+            .await;
         let user_id = match self.resolve_target_conversation_user_id(conversation_id).await {
             Ok(user_id) => user_id,
             Err(e) => {
@@ -2176,6 +2224,35 @@ mod tests {
             .next()
             .expect("task manager should capture build options");
         assert!(options.context.skills.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_run_as_a_resident_role_leads_its_prompt_with_the_standing_role() {
+        struct Roles;
+
+        #[async_trait::async_trait]
+        impl CronRolePort for Roles {
+            async fn standing_role(&self, assistant_id: &str) -> Option<String> {
+                (assistant_id == "assistant-sample").then(|| "## Your Standing Role\n\nWatches the news.".to_owned())
+            }
+        }
+
+        let agent = Arc::new(RecordingAgent::new("conv_1", "default", true));
+        let executor = make_executor_with_agent(AgentInstance::Mock(agent.clone())).with_role_port(Arc::new(Roles));
+
+        executor.execute_inner(&sample_job(), "conv_1", None).await;
+        wait_for_agent_send(&agent, 1).await;
+        let role_run = agent.sent_messages().await[0].content.clone();
+        assert!(role_run.starts_with("## Your Standing Role\n\nWatches the news.\n\n[Scheduled Task Execution]"));
+        assert!(role_run.ends_with("do something"));
+
+        // The same task run as an assistant that is no role is sent as before.
+        let mut plain_job = sample_job();
+        plain_job.agent_config.as_mut().unwrap().assistant_id = Some("assistant-plain".into());
+        executor.execute_inner(&plain_job, "conv_1", None).await;
+        wait_for_agent_send(&agent, 2).await;
+        let plain_run = agent.sent_messages().await[1].content.clone();
+        assert!(plain_run.starts_with("[Scheduled Task Execution]"));
     }
 
     #[tokio::test]

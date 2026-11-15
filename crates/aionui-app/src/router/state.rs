@@ -679,6 +679,29 @@ impl aionui_team::TeamRolePort for RoleServiceTeamPort {
     }
 }
 
+/// Adapts the role service to the scheduler's [`aionui_cron::executor::CronRolePort`]:
+/// a scheduled task run as a resident role is told who it is, with the same
+/// brief a team member gets, worded for a run that has no team around it.
+struct RoleServiceCronPort {
+    roles: RoleServiceTeamPort,
+}
+
+#[async_trait::async_trait]
+impl aionui_cron::executor::CronRolePort for RoleServiceCronPort {
+    async fn standing_role(&self, assistant_id: &str) -> Option<String> {
+        use aionui_team::TeamRolePort;
+
+        match self.roles.role_brief(assistant_id).await {
+            Ok(brief) => brief.map(|brief| aionui_team::prompts::render_scheduled_standing_role(&brief)),
+            Err(error) => {
+                // The run goes ahead without its role rather than not at all.
+                tracing::warn!(assistant_id, error = %error, "cron: role brief unavailable");
+                None
+            }
+        }
+    }
+}
+
 /// The day of a millisecond timestamp in the user's own time zone
 /// (`YYYY-MM-DD`), empty for a timestamp that names no moment.
 fn local_day(timestamp_ms: i64) -> String {
@@ -1114,15 +1137,22 @@ pub fn build_cron_state(services: &AppServices) -> CronRouterState {
     // every CLI-initiated (orphan) turn would be persisted twice.
     let conv_service = services.conversation_service.clone();
 
-    let executor = Arc::new(aionui_cron::executor::JobExecutor::new(
-        services.worker_task_manager.clone(),
-        conv_service.conversation_repo().clone(),
-        Arc::new(conv_service.clone()),
-        services.work_dir.clone(),
-        services.data_dir.clone(),
-        services.event_bus.clone(),
-        services.agent_registry.clone(),
-    ));
+    let executor = Arc::new(
+        aionui_cron::executor::JobExecutor::new(
+            services.worker_task_manager.clone(),
+            conv_service.conversation_repo().clone(),
+            Arc::new(conv_service.clone()),
+            services.work_dir.clone(),
+            services.data_dir.clone(),
+            services.event_bus.clone(),
+            services.agent_registry.clone(),
+        )
+        .with_role_port(Arc::new(RoleServiceCronPort {
+            roles: RoleServiceTeamPort {
+                service: role_service(services),
+            },
+        })),
+    );
 
     let tick_service_ref: Arc<CronServiceTickRef> = Arc::new(CronServiceTickRef::default());
     let tick_ref = tick_service_ref.clone();
