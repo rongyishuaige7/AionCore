@@ -17,6 +17,8 @@ pub const MAX_CHARTER_CHARS: usize = 4_000;
 pub const MAX_MEMORY_BYTES: usize = 64 * 1024;
 /// Cap on one note added through [`RoleService::remember`], in characters.
 pub const MAX_NOTE_CHARS: usize = 600;
+/// Replaced memories kept under `memory/archive/`; older ones are dropped.
+pub const MAX_MEMORY_ARCHIVES: usize = 10;
 /// Cap on the state of one task in progress, in characters.
 pub const MAX_PROGRESS_STATE_CHARS: usize = 4_000;
 /// Cap on how many tasks a role keeps in progress at once.
@@ -32,6 +34,16 @@ pub struct RememberedNote {
     pub line: String,
     /// `true` when the memory already held this note and nothing was written.
     pub already_recorded: bool,
+}
+
+/// What [`RoleService::curate_memory`] did with the memory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CuratedMemory {
+    /// File the replaced memory was kept as, under `memory/archive/`. `None`
+    /// when nothing was replaced: the memory was empty or already read the same.
+    pub archived_as: Option<String>,
+    pub bytes_before: usize,
+    pub bytes_after: usize,
 }
 
 /// What [`RoleService::set_progress`] did with a task.
@@ -180,6 +192,58 @@ impl RoleService {
         Ok(RememberedNote {
             line,
             already_recorded: false,
+        })
+    }
+
+    /// Replace the whole memory with a tidied version of itself: what a role
+    /// does on a curation run, merging what repeats and dropping what no longer
+    /// holds. Unlike the user's own edit through [`Self::set_memory`], nobody is
+    /// watching, so the memory it replaces is first kept under
+    /// `memory/archive/` and an empty memory is refused. `stamp` names that
+    /// copy (the caller's local time, digits and `-` only).
+    pub async fn curate_memory(&self, id: &str, memory: &str, stamp: &str) -> Result<CuratedMemory, RoleError> {
+        validate_role_id(id)?;
+        let curated = memory.trim_end();
+        if curated.trim().is_empty() {
+            return Err(RoleError::InvalidRequest("a curated memory cannot be empty".to_owned()));
+        }
+        let curated = format!("{curated}\n");
+        if curated.len() > MAX_MEMORY_BYTES {
+            return Err(RoleError::InvalidRequest(format!(
+                "memory exceeds {MAX_MEMORY_BYTES} bytes"
+            )));
+        }
+        if stamp.is_empty() || !stamp.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            return Err(RoleError::InvalidRequest("invalid archive stamp".to_owned()));
+        }
+        if self.store.read_definition(id).await?.is_none() {
+            return Err(RoleError::NotFound(id.to_owned()));
+        }
+
+        let _guard = self.memory_lock.lock().await;
+        let previous = self.store.read_memory(id).await?;
+        let bytes_before = previous.len();
+        if previous.trim_end() == curated.trim_end() {
+            return Ok(CuratedMemory {
+                archived_as: None,
+                bytes_before,
+                bytes_after: bytes_before,
+            });
+        }
+        let archived_as = if previous.trim().is_empty() {
+            None
+        } else {
+            Some(
+                self.store
+                    .archive_memory(id, &previous, stamp, MAX_MEMORY_ARCHIVES)
+                    .await?,
+            )
+        };
+        self.store.write_memory(id, &curated).await?;
+        Ok(CuratedMemory {
+            archived_as,
+            bytes_before,
+            bytes_after: curated.len(),
         })
     }
 

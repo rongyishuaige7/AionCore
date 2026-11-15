@@ -280,6 +280,7 @@ pub(crate) enum RoleCommand {
     Capabilities,
     Show,
     Remember,
+    Curate,
     Progress,
     #[command(external_subcommand)]
     Unknown(Vec<OsString>),

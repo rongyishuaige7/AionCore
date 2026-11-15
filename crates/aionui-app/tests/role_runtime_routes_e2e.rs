@@ -185,6 +185,58 @@ async fn a_role_run_on_its_own_writes_its_memory_and_progress_and_reads_them_bac
 }
 
 #[tokio::test]
+async fn a_role_tidies_its_whole_memory_and_the_version_it_replaced_is_kept() {
+    let fixture = fixture().await;
+    define_role(&fixture, &[]).await;
+    let token = conversation_as(&fixture, "conv-role", Some(ROLE)).await;
+    for note in ["run the tests", "run the tests before pushing"] {
+        call(
+            &fixture,
+            "POST",
+            "/api/runtime/role/remember",
+            "conv-role",
+            &token,
+            Some(json!({ "note": note })),
+        )
+        .await;
+    }
+
+    let (status, curated) = call(
+        &fixture,
+        "POST",
+        "/api/runtime/role/curate",
+        "conv-role",
+        &token,
+        Some(json!({ "memory": "- run the tests before pushing" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{curated}");
+    let archived_as = curated["data"]["archived_as"]
+        .as_str()
+        .expect("the old memory is archived");
+
+    let (_, shown) = call(&fixture, "GET", "/api/runtime/role", "conv-role", &token, None).await;
+    assert_eq!(shown["data"]["memory"], json!("- run the tests before pushing\n"));
+    let archived = std::path::Path::new(shown["data"]["memory_dir"].as_str().unwrap())
+        .join("archive")
+        .join(archived_as);
+    let replaced = std::fs::read_to_string(archived).unwrap();
+    assert!(replaced.contains("run the tests\n"), "{replaced}");
+
+    let (status, refused) = call(
+        &fixture,
+        "POST",
+        "/api/runtime/role/curate",
+        "conv-role",
+        &token,
+        Some(json!({ "memory": "   " })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    fixture.services.database.close().await;
+}
+
+#[tokio::test]
 async fn a_role_kept_from_its_memory_is_refused_here_as_it_is_in_a_team() {
     let fixture = fixture().await;
     define_role(&fixture, &["team_remember", "team_progress"]).await;
@@ -192,6 +244,7 @@ async fn a_role_kept_from_its_memory_is_refused_here_as_it_is_in_a_team() {
 
     for (path, body) in [
         ("/api/runtime/role/remember", json!({ "note": "x" })),
+        ("/api/runtime/role/curate", json!({ "memory": "- x" })),
         ("/api/runtime/role/progress", json!({ "task": "t", "state": "s" })),
     ] {
         let (status, refused) = call(&fixture, "POST", path, "conv-role", &token, Some(body)).await;

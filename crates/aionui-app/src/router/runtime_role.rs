@@ -15,8 +15,8 @@ use std::sync::Arc;
 
 use aionui_ai_agent::{RuntimeTokenScope, RuntimeTokenService, TEAM_RUNTIME_TOKEN_SESSION_GENERATION};
 use aionui_api_types::{
-    RoleCliEnvelope, RoleCliErrorCode, RoleProgressRequest, RoleProgressResponse, RoleRememberRequest,
-    RoleRememberResponse, RoleResponse, TeamToolName,
+    RoleCliEnvelope, RoleCliErrorCode, RoleCurateRequest, RoleCurateResponse, RoleProgressRequest,
+    RoleProgressResponse, RoleRememberRequest, RoleRememberResponse, RoleResponse, TeamToolName,
 };
 use aionui_db::IConversationRepository;
 use aionui_role::{RoleError, RoleService};
@@ -43,6 +43,7 @@ pub fn runtime_role_routes(state: RuntimeRoleState) -> Router {
     Router::new()
         .route("/api/runtime/role", get(show))
         .route("/api/runtime/role/remember", post(remember))
+        .route("/api/runtime/role/curate", post(curate))
         .route("/api/runtime/role/progress", post(progress))
         .with_state(state)
 }
@@ -89,6 +90,47 @@ async fn remember(
             &RoleRememberResponse {
                 line: noted.line,
                 already_recorded: noted.already_recorded,
+            },
+        ),
+        Err(error) => role_failure(error, COMMAND),
+    }
+}
+
+/// Replace the whole memory with a tidied version; the one it replaces is
+/// archived. Writing the memory is one permission, whether a note at a time or
+/// all of it.
+async fn curate(
+    State(state): State<RuntimeRoleState>,
+    headers: HeaderMap,
+    body: Result<Json<RoleCurateRequest>, JsonRejection>,
+) -> Reply {
+    const COMMAND: &str = "role curate";
+    let role = match caller_role(&state, &headers, COMMAND).await {
+        Ok(role) => role,
+        Err(reply) => return reply,
+    };
+    let request = match parsed(body, COMMAND) {
+        Ok(request) => request,
+        Err(reply) => return *reply,
+    };
+    if is_denied(&role, TeamToolName::TeamRemember) {
+        return failure(
+            StatusCode::FORBIDDEN,
+            RoleCliErrorCode::PermissionDenied,
+            "the user keeps this role's memory; say in your reply what you would change in it",
+            COMMAND,
+        );
+    }
+    // The replaced memory is filed under the moment it was replaced, in the
+    // user's own time zone.
+    let stamp = chrono::Local::now().format("%Y-%m-%d-%H%M%S").to_string();
+    match state.roles.curate_memory(&role.id, &request.memory, &stamp).await {
+        Ok(curated) => success(
+            COMMAND,
+            &RoleCurateResponse {
+                archived_as: curated.archived_as,
+                bytes_before: curated.bytes_before,
+                bytes_after: curated.bytes_after,
             },
         ),
         Err(error) => role_failure(error, COMMAND),

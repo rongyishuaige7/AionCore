@@ -446,3 +446,116 @@ async fn progress_refuses_an_oversized_state_too_many_tasks_and_an_assistant_tha
     service.set_progress("scout", "task-1", "").await.unwrap();
     service.set_progress("scout", "one-too-many", "x").await.unwrap();
 }
+
+#[tokio::test]
+async fn curating_replaces_the_memory_and_keeps_what_it_replaced() {
+    let root = tempfile::tempdir().unwrap();
+    let service = service(&root);
+    service.upsert("reviewer", request("Reviews.", &[])).await.unwrap();
+    service
+        .set_memory("reviewer", "- run the tests\n- run the tests first\n- uses pnpm\n")
+        .await
+        .unwrap();
+
+    let curated = service
+        .curate_memory(
+            "reviewer",
+            "- run the tests first\n- uses pnpm\n\n\n",
+            "2026-11-15-090000",
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(curated.archived_as.as_deref(), Some("MEMORY-2026-11-15-090000.md"));
+    assert_eq!(
+        curated.bytes_before,
+        "- run the tests\n- run the tests first\n- uses pnpm\n".len()
+    );
+    let role = service.get("reviewer").await.unwrap();
+    assert_eq!(role.memory, "- run the tests first\n- uses pnpm\n");
+    assert_eq!(curated.bytes_after, role.memory.len());
+    let archived = std::path::Path::new(&role.memory_dir)
+        .join("archive")
+        .join("MEMORY-2026-11-15-090000.md");
+    assert_eq!(
+        std::fs::read_to_string(archived).unwrap(),
+        "- run the tests\n- run the tests first\n- uses pnpm\n"
+    );
+}
+
+#[tokio::test]
+async fn curating_to_the_same_memory_writes_and_archives_nothing() {
+    let root = tempfile::tempdir().unwrap();
+    let service = service(&root);
+    service.upsert("reviewer", request("Reviews.", &[])).await.unwrap();
+    service.set_memory("reviewer", "- uses pnpm\n").await.unwrap();
+
+    let curated = service
+        .curate_memory("reviewer", "- uses pnpm", "2026-11-15-090000")
+        .await
+        .unwrap();
+
+    assert_eq!(curated.archived_as, None);
+    let role = service.get("reviewer").await.unwrap();
+    assert!(!std::path::Path::new(&role.memory_dir).join("archive").exists());
+}
+
+#[tokio::test]
+async fn curating_refuses_an_empty_or_oversized_memory_and_a_stamp_that_is_no_file_name() {
+    let root = tempfile::tempdir().unwrap();
+    let service = service(&root);
+    service.upsert("reviewer", request("Reviews.", &[])).await.unwrap();
+    service.set_memory("reviewer", "- uses pnpm\n").await.unwrap();
+
+    for (memory, stamp) in [
+        ("  \n", "2026-11-15-090000"),
+        (&"x".repeat(MAX_MEMORY_BYTES + 1)[..], "2026-11-15-090000"),
+        ("- tidy", "../escape"),
+        ("- tidy", ""),
+    ] {
+        assert!(
+            matches!(
+                service.curate_memory("reviewer", memory, stamp).await,
+                Err(RoleError::InvalidRequest(_))
+            ),
+            "stamp {stamp:?}"
+        );
+    }
+    assert!(matches!(
+        service.curate_memory("stranger", "- tidy", "2026-11-15-090000").await,
+        Err(RoleError::NotFound(_))
+    ));
+    assert_eq!(service.get("reviewer").await.unwrap().memory, "- uses pnpm\n");
+}
+
+#[tokio::test]
+async fn only_the_newest_replaced_memories_are_kept() {
+    let root = tempfile::tempdir().unwrap();
+    let service = service(&root);
+    service.upsert("reviewer", request("Reviews.", &[])).await.unwrap();
+    service.set_memory("reviewer", "- version 0\n").await.unwrap();
+
+    for round in 1..=MAX_MEMORY_ARCHIVES + 2 {
+        service
+            .curate_memory(
+                "reviewer",
+                &format!("- version {round}"),
+                &format!("2026-11-15-{round:06}"),
+            )
+            .await
+            .unwrap();
+    }
+
+    let role = service.get("reviewer").await.unwrap();
+    let mut kept: Vec<String> = std::fs::read_dir(std::path::Path::new(&role.memory_dir).join("archive"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    kept.sort();
+    assert_eq!(kept.len(), MAX_MEMORY_ARCHIVES);
+    assert_eq!(kept[0], "MEMORY-2026-11-15-000003.md");
+    assert_eq!(
+        kept[MAX_MEMORY_ARCHIVES - 1],
+        format!("MEMORY-2026-11-15-{:06}.md", MAX_MEMORY_ARCHIVES + 2)
+    );
+}

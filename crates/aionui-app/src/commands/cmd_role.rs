@@ -13,7 +13,7 @@ use aionui_api_types::{RoleCliEnvelope, RoleCliErrorCode};
 use serde_json::{Map, Value};
 
 use crate::cli::{RoleArgs, RoleCommand};
-use crate::commands::role_capabilities::{self, Fields, PROGRESS_FIELDS, REMEMBER_FIELDS};
+use crate::commands::role_capabilities::{self, CURATE_FIELDS, Fields, PROGRESS_FIELDS, REMEMBER_FIELDS};
 
 const ENV_BASE_URL: &str = "AIONUI_BASE_URL";
 const ENV_USER_ID: &str = "AIONUI_USER_ID";
@@ -36,6 +36,7 @@ async fn run_role_inner(args: RoleArgs) -> Result<(), ExitCode> {
         )),
         RoleCommand::Show => show().await,
         RoleCommand::Remember => write("role remember", "/api/runtime/role/remember", &REMEMBER_FIELDS).await,
+        RoleCommand::Curate => write("role curate", "/api/runtime/role/curate", &CURATE_FIELDS).await,
         RoleCommand::Progress => write("role progress", "/api/runtime/role/progress", &PROGRESS_FIELDS).await,
         RoleCommand::Unknown(path) => Err(unknown_command(path)),
     }
@@ -252,6 +253,13 @@ mod tests {
         assert!(checked_fields(&REMEMBER_FIELDS, json!({ "note": "x", "role": "other" })).is_err());
         assert!(checked_fields(&REMEMBER_FIELDS, json!({ "note": 3 })).is_err());
         assert!(checked_fields(&REMEMBER_FIELDS, json!(["note"])).is_err());
+    }
+
+    #[test]
+    fn curate_takes_the_whole_memory() {
+        assert!(checked_fields(&CURATE_FIELDS, json!({ "memory": "- uses pnpm\n- reads on a phone\n" })).is_ok());
+        assert!(checked_fields(&CURATE_FIELDS, json!({ "note": "x" })).is_err());
+        assert!(checked_fields(&CURATE_FIELDS, json!({})).is_err());
     }
 
     #[test]

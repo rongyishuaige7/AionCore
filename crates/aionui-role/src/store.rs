@@ -15,6 +15,8 @@ use crate::error::RoleError;
 const DEFINITION_FILE: &str = "role.json";
 const MEMORY_DIR: &str = "memory";
 const MEMORY_FILE: &str = "MEMORY.md";
+const ARCHIVE_DIR: &str = "archive";
+const ARCHIVE_PREFIX: &str = "MEMORY-";
 const PROGRESS_DIR: &str = "progress";
 const PROGRESS_EXTENSION: &str = "md";
 const ID_SEPARATOR: &str = ":";
@@ -125,6 +127,47 @@ impl RoleStore {
 
     pub(crate) async fn write_memory(&self, id: &str, memory: &str) -> Result<(), RoleError> {
         write_atomic(&self.memory_dir(id).join(MEMORY_FILE), memory.as_bytes()).await
+    }
+
+    /// Keep a copy of `memory` as `archive/MEMORY-<stamp>.md` and drop the
+    /// oldest copies beyond `keep`. `stamp` sorts by time and must be safe as a
+    /// file name; the caller checks it. Returns the copy's file name.
+    pub(crate) async fn archive_memory(
+        &self,
+        id: &str,
+        memory: &str,
+        stamp: &str,
+        keep: usize,
+    ) -> Result<String, RoleError> {
+        let dir = self.memory_dir(id).join(ARCHIVE_DIR);
+        tokio::fs::create_dir_all(&dir).await?;
+        // Two rewrites within one stamp keep both copies.
+        let mut name = format!("{ARCHIVE_PREFIX}{stamp}.md");
+        let mut attempt = 1;
+        while tokio::fs::try_exists(dir.join(&name)).await? {
+            attempt += 1;
+            name = format!("{ARCHIVE_PREFIX}{stamp}-{attempt}.md");
+        }
+        write_atomic(&dir.join(&name), memory.as_bytes()).await?;
+
+        let mut copies = Vec::new();
+        let mut entries = tokio::fs::read_dir(&dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            if let Some(file) = entry.file_name().to_str()
+                && file.starts_with(ARCHIVE_PREFIX)
+                && file.ends_with(".md")
+            {
+                copies.push(file.to_owned());
+            }
+        }
+        copies.sort_unstable();
+        let excess = copies.len().saturating_sub(keep);
+        for old in copies.into_iter().take(excess) {
+            if old != name {
+                tokio::fs::remove_file(dir.join(old)).await?;
+            }
+        }
+        Ok(name)
     }
 
     fn progress_dir(&self, id: &str) -> PathBuf {

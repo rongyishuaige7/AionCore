@@ -14,6 +14,12 @@ pub(crate) const REMEMBER_FIELDS: Fields = Fields {
     optional: &[],
 };
 
+/// Stdin fields of `role curate`.
+pub(crate) const CURATE_FIELDS: Fields = Fields {
+    required: &["memory"],
+    optional: &[],
+};
+
 /// Stdin fields of `role progress`.
 pub(crate) const PROGRESS_FIELDS: Fields = Fields {
     required: &["task"],
@@ -44,6 +50,12 @@ pub(crate) fn data() -> Value {
                 "fields": { "note": "one thing worth keeping, kept as a single dated line" },
                 "data": "{ line, already_recorded }"
             },
+            "curate": {
+                "runtime_env_required": RUNTIME_ENV,
+                "stdin_json": { "required": CURATE_FIELDS.required, "optional": CURATE_FIELDS.optional },
+                "fields": { "memory": "the whole memory, tidied: what repeats merged, what no longer holds dropped" },
+                "data": "{ archived_as?, bytes_before, bytes_after }"
+            },
             "progress": {
                 "runtime_env_required": RUNTIME_ENV,
                 "stdin_json": { "required": PROGRESS_FIELDS.required, "optional": PROGRESS_FIELDS.optional },
@@ -61,7 +73,8 @@ pub(crate) fn data() -> Value {
             "meta": { "schema_version": ROLE_CLI_SCHEMA_VERSION }
         },
         "semantics": {
-            "memory": "notes are appended, never rewritten; a note the memory already holds is not written twice",
+            "memory": "remember appends one note and never rewrites; a note the memory already holds is not written twice",
+            "curation": "curate replaces the whole memory; the version it replaces is kept in the archive directory beside it, and an empty memory is refused",
             "permission": "a role the user keeps from writing its memory or its task progress is answered permission_denied, and should say in its reply what it would have recorded"
         },
         "errors": [

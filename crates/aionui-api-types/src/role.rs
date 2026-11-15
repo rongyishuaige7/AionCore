@@ -172,3 +172,21 @@ pub struct RoleProgressResponse {
     /// The task was closed rather than updated.
     pub closed: bool,
 }
+
+/// Body of `POST /api/runtime/role/curate` — the whole memory, tidied, to take
+/// the place of the one the role has now.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoleCurateRequest {
+    pub memory: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleCurateResponse {
+    /// File the replaced memory was kept as, in the `archive` directory beside
+    /// the memory. Absent when nothing was replaced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_as: Option<String>,
+    pub bytes_before: usize,
+    pub bytes_after: usize,
+}

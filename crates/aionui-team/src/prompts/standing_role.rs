@@ -93,7 +93,9 @@ fn render(brief: &TeamRoleBrief, setting: Setting) -> String {
             "When you learn something that should outlast this run (a preference of the user, a mistake not to \
              repeat, a decision and its reason), record one note:\n\n\
              ```\n{ROLE_HELPER} remember <<'JSON'\n{{\"note\": \"<one line>\"}}\nJSON\n```\n\n\
-             The whole memory is kept in `{}`, and `{ROLE_HELPER} show` prints it.",
+             The whole memory is kept in `{}`, and `{ROLE_HELPER} show` prints it. To tidy the memory itself \
+             (merge what repeats, drop what no longer holds), replace it whole with `{ROLE_HELPER} curate`, which \
+             takes `{{\"memory\": \"<the whole new memory>\"}}` the same way and archives the version it replaces.",
             memory_file.display()
         ));
     } else {
@@ -312,6 +314,7 @@ mod tests {
         assert!(section.contains("\"$AIONUI_HELPER_BIN\" role remember <<'JSON'\n{\"note\": \"<one line>\"}\nJSON"));
         assert!(section.contains("\"$AIONUI_HELPER_BIN\" role progress <<'JSON'\n{\"task\": "));
         assert!(section.contains("`\"$AIONUI_HELPER_BIN\" role show` prints it"));
+        assert!(section.contains("replace it whole with `\"$AIONUI_HELPER_BIN\" role curate`"));
         // Nothing it is told to call exists only in a team.
         assert!(!section.contains("team_"));
         assert!(!section.contains("### Reviewing"));

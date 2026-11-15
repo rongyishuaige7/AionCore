@@ -11,6 +11,7 @@
 //! ```text
 //! roles/<assistant_id>/role.json                    charter + permission table
 //! roles/<assistant_id>/memory/MEMORY.md             the role's memory
+//! roles/<assistant_id>/memory/archive/MEMORY-*.md   memories the role replaced when tidying
 //! roles/<assistant_id>/memory/progress/<task>.md    where one task under way stands
 //! ```
 //!
@@ -27,7 +28,7 @@ pub mod routes;
 pub use error::RoleError;
 pub use routes::role_routes;
 pub use service::{
-    MAX_CHARTER_CHARS, MAX_MEMORY_BYTES, MAX_NOTE_CHARS, MAX_PROGRESS_STATE_CHARS, MAX_PROGRESS_TASKS,
-    MAX_TASK_NAME_CHARS, ProgressUpdate, RememberedNote, RoleService,
+    CuratedMemory, MAX_CHARTER_CHARS, MAX_MEMORY_ARCHIVES, MAX_MEMORY_BYTES, MAX_NOTE_CHARS, MAX_PROGRESS_STATE_CHARS,
+    MAX_PROGRESS_TASKS, MAX_TASK_NAME_CHARS, ProgressUpdate, RememberedNote, RoleService,
 };
 pub use state::RoleRouterState;
