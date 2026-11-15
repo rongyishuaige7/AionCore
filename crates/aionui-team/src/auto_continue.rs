@@ -423,7 +423,10 @@ mod tests {
     #[test]
     fn a_returned_task_wakes_its_owner_again() {
         let tasks = [reviewed(task("1", TaskStatus::InProgress, Some("dev")), "returned")];
-        assert_eq!(targets(&plan(&tasks, &team())), vec![("dev", vec![("1", Why::Returned)])]);
+        assert_eq!(
+            targets(&plan(&tasks, &team())),
+            vec![("dev", vec![("1", Why::Returned)])]
+        );
     }
 
     #[test]

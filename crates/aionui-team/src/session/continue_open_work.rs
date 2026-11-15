@@ -221,7 +221,9 @@ impl TeamSession {
                     .any(|slot| slot.slot_id == agent.slot_id && slot.state == SlotPhase::Paused);
                 let can_run = matches!(
                     self.member_runtimes.snapshot(&agent.slot_id),
-                    MemberRuntimeSnapshot::Absent | MemberRuntimeSnapshot::Attaching { .. } | MemberRuntimeSnapshot::Ready
+                    MemberRuntimeSnapshot::Absent
+                        | MemberRuntimeSnapshot::Attaching { .. }
+                        | MemberRuntimeSnapshot::Ready
                 );
                 Member {
                     slot_id: agent.slot_id.clone(),

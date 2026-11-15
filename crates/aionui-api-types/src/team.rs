@@ -1836,7 +1836,10 @@ mod tests {
         assert_eq!(value["session_generation"], "generation-1");
         assert!(value["active_run"].is_null());
         assert_eq!(value["slot_work"][0]["slot_id"], "lead-1");
-        assert!(value.get("auto_continue").is_none(), "absent, not null, without a session");
+        assert!(
+            value.get("auto_continue").is_none(),
+            "absent, not null, without a session"
+        );
     }
 
     #[test]
