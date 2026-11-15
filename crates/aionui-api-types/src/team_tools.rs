@@ -723,8 +723,12 @@ mod tests {
         assert_eq!(descriptor.permission, TeamToolPermission::AnyTeamAgent);
         assert_eq!(descriptor.input_schema["additionalProperties"], json!(false));
         assert_eq!(descriptor.input_schema["required"], json!(["task", "state"]));
+        // Key order follows serde_json's `preserve_order`, which other crates
+        // in the build may or may not switch on.
         let properties = descriptor.input_schema["properties"].as_object().unwrap();
-        assert_eq!(properties.keys().collect::<Vec<_>>(), vec!["task", "state"]);
+        let mut names = properties.keys().map(String::as_str).collect::<Vec<_>>();
+        names.sort_unstable();
+        assert_eq!(names, vec!["state", "task"]);
     }
 
     #[test]
