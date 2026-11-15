@@ -100,6 +100,12 @@ impl CronService {
     // CRUD
     // -----------------------------------------------------------------------
 
+    /// Wires the inbox follow-ups are delivered to when their conversation
+    /// has one. See [`JobExecutor::set_inbox_port`].
+    pub fn set_inbox_port(&self, inbox_port: Arc<dyn crate::executor::CronInboxPort>) {
+        self.executor.set_inbox_port(inbox_port);
+    }
+
     pub async fn add_job(&self, user_id: &str, req: CreateCronJobRequest) -> Result<CronJob, CronError> {
         self.add_job_internal(user_id, req, None, None, false).await
     }
@@ -785,6 +791,14 @@ impl CronService {
         }
 
         let heartbeat = self.spawn_run_lease_heartbeat(job_id.to_owned(), scheduled_at);
+
+        // A follow-up for a conversation with an inbox is handed to the inbox
+        // and no run is started here, so a busy conversation is no obstacle.
+        if let Some(result) = self.executor.deliver_follow_up_to_inbox(&job).await {
+            heartbeat.abort();
+            self.handle_execution_result(job, scheduled_at, result).await;
+            return;
+        }
 
         let prepared = match self.executor.prepare_scheduled(&job).await {
             Ok(prepared) => prepared,

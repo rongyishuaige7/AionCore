@@ -149,6 +149,7 @@ pub struct TeamSession {
 }
 
 mod continue_open_work;
+mod follow_up;
 
 impl TeamSession {
     #[allow(clippy::too_many_arguments)]
@@ -3317,6 +3318,26 @@ mod tests {
         .await
         .unwrap();
         (session, repo)
+    }
+
+    #[tokio::test]
+    async fn a_follow_up_that_came_due_waits_in_the_mailbox_of_the_member_that_set_it() {
+        let session = start_session().await;
+
+        session
+            .deliver_follow_up("worker-1", "[Follow-up you set for yourself]\ncheck the deploy")
+            .await
+            .unwrap();
+
+        let unread = session.mailbox.peek_unread("t1", "worker-1").await.unwrap();
+        assert_eq!(unread.len(), 1);
+        assert_eq!(unread[0].from_agent_id, "team_system");
+        assert!(unread[0].content.contains("check the deploy"));
+        assert!(session.mailbox.peek_unread("t1", "lead-1").await.unwrap().is_empty());
+
+        // A member that has left the team has no mailbox to deliver to.
+        assert!(session.deliver_follow_up("worker-gone", "x").await.is_err());
+        session.stop();
     }
 
     #[tokio::test]

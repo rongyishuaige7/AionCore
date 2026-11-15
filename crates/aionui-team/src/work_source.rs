@@ -28,6 +28,10 @@ pub(crate) enum WorkSource {
     /// reminded of its share. Never resumes a paused slot: a member the user
     /// stopped stays stopped.
     AutoContinue,
+    /// A timer the member set for itself came due. Takes its turn like a
+    /// teammate's message. Never resumes a paused slot: the note waits for
+    /// the user to resume the member.
+    FollowUp,
 }
 
 impl WorkSource {
@@ -37,7 +41,7 @@ impl WorkSource {
                 WorkPriority::Foreground
             }
             Self::McpShutdownRequest | Self::ShutdownRejected => WorkPriority::Control,
-            Self::McpSendMessage => WorkPriority::Directed,
+            Self::McpSendMessage | Self::FollowUp => WorkPriority::Directed,
             Self::SpawnWelcome
             | Self::TeamMembershipChanged
             | Self::SpawnAttachFailure
@@ -72,6 +76,7 @@ impl WorkSource {
                 | Self::ShutdownRejected
                 | Self::RecoveryDrain
                 | Self::AutoContinue
+                | Self::FollowUp
         )
     }
 }
@@ -94,6 +99,7 @@ impl fmt::Display for WorkSource {
             Self::ShutdownRejected => "shutdown_rejected",
             Self::RecoveryDrain => "recovery_drain",
             Self::AutoContinue => "auto_continue",
+            Self::FollowUp => "follow_up",
         };
         formatter.write_str(value)
     }
@@ -146,6 +152,11 @@ mod tests {
             "a member the user stopped must not be restarted by a reminder"
         );
         assert_eq!(WorkSource::AutoContinue.to_string(), "auto_continue");
+
+        assert_eq!(WorkSource::FollowUp.priority(), WorkPriority::Directed);
+        assert!(WorkSource::FollowUp.requires_mailbox_message());
+        assert!(!WorkSource::FollowUp.resumes_paused_slot());
+        assert_eq!(WorkSource::FollowUp.to_string(), "follow_up");
     }
 
     #[test]

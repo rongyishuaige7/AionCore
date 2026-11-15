@@ -819,6 +819,13 @@ impl TeamConversationProvisioningPort for FakeConversationPorts {
         self.repo.delete(_user_id, conversation_id).await?;
         Ok(())
     }
+
+    async fn lookup_team_binding_by_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<TeamConversationBindingLookup>, aionui_team::TeamError> {
+        <Self as TeamConversationLookupPort>::lookup_team_binding_by_conversation(self, conversation_id).await
+    }
 }
 
 #[async_trait::async_trait]
@@ -2445,6 +2452,62 @@ async fn teammate_first_wake_uses_canonical_prompt_at_service_boundary() {
         "You execute tasks assigned by the Lead Agent. Focus on completing your assigned work thoroughly and reporting back."
     ));
     assert!(first_message.contains("do X"));
+}
+
+#[tokio::test]
+async fn a_follow_up_set_by_a_member_comes_back_through_its_mailbox_and_wakes_it() {
+    let (svc, _team_repo, turn_port, _conv_repo) = setup_with_recording_turn_port();
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Follow Up".into(),
+                agents: aionrs_two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .expect("create team");
+    let worker = created.assistants[1].clone();
+    // The team is not running when the timer comes due.
+    svc.stop_session("user1", &created.id)
+        .await
+        .expect("clear existing session");
+
+    let delivered = svc
+        .deliver_follow_up(
+            "user1",
+            &worker.conversation_id,
+            "[Follow-up you set for yourself]\ncheck the deploy",
+        )
+        .await
+        .expect("deliver follow-up");
+    assert!(delivered);
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if turn_port
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request.slot_id == worker.slot_id && request.content.contains("check the deploy"))
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the member should be woken with its note");
+
+    // A conversation that is no member's, or another user's, has no mailbox.
+    assert!(!svc.deliver_follow_up("user1", "conv-of-nobody", "x").await.unwrap());
+    assert!(
+        !svc.deliver_follow_up("someone-else", &worker.conversation_id, "x")
+            .await
+            .unwrap()
+    );
 }
 
 #[tokio::test]

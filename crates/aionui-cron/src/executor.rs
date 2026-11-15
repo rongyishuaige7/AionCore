@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use aionui_ai_agent::AgentRegistry;
 use aionui_ai_agent::task_manager::IWorkerTaskManager;
@@ -67,8 +67,20 @@ pub trait CronRolePort: Send + Sync {
     async fn standing_role(&self, assistant_id: &str) -> Option<String>;
 }
 
+/// Reaches the inbox of a conversation that has one — a team member's
+/// mailbox. Owned by the composition layer, so this crate does not depend on
+/// the team crate.
+#[async_trait::async_trait]
+pub trait CronInboxPort: Send + Sync {
+    /// Puts `content` in the inbox of `conversation_id` and wakes its agent
+    /// if it is idle. `Ok(false)` when the conversation has no inbox.
+    async fn deliver(&self, user_id: &str, conversation_id: &str, content: &str) -> Result<bool, String>;
+}
+
 pub struct JobExecutor {
     role_port: Option<Arc<dyn CronRolePort>>,
+    /// Set once the team runtime exists, which is after this executor is built.
+    inbox_port: OnceLock<Arc<dyn CronInboxPort>>,
     conversation_repo: Arc<dyn IConversationRepository>,
     conversation_service: Arc<ConversationService>,
     work_dir: PathBuf,
@@ -93,6 +105,7 @@ impl JobExecutor {
             SkillSuggestDetector::new(Arc::clone(&broadcaster), conversation_repo.clone(), data_dir.clone());
         Self {
             role_port: None,
+            inbox_port: OnceLock::new(),
             conversation_repo,
             conversation_service,
             work_dir,
@@ -100,6 +113,49 @@ impl JobExecutor {
             broadcaster,
             agent_registry,
             skill_suggest_detector,
+        }
+    }
+
+    /// Wires the inbox a follow-up is delivered to when its conversation has
+    /// one. Without it every follow-up is delivered as a turn. Set once; a
+    /// second call is ignored.
+    pub fn set_inbox_port(&self, inbox_port: Arc<dyn CronInboxPort>) {
+        let _ = self.inbox_port.set(inbox_port);
+    }
+
+    /// Delivers a follow-up that came due through its conversation's inbox,
+    /// when the conversation has one: the note takes its place behind
+    /// whatever is already waiting there, and no run is started here. `None`
+    /// when the job is not a follow-up or the conversation has no inbox, and
+    /// the job then runs as a turn.
+    pub(crate) async fn deliver_follow_up_to_inbox(&self, job: &CronJob) -> Option<ExecutionResult> {
+        if !is_follow_up(job) {
+            return None;
+        }
+        let inbox = self.inbox_port.get()?;
+        let conversation_id = job.conversation_id.trim();
+        if conversation_id.is_empty() {
+            return None;
+        }
+        match inbox
+            .deliver(&job.user_id, conversation_id, &build_follow_up_prompt(&job.message))
+            .await
+        {
+            Ok(true) => {
+                info!(job_id = %job.id, conversation_id, "follow-up delivered to its conversation's inbox");
+                Some(ExecutionResult::Success {
+                    conversation_id: conversation_id.to_owned(),
+                })
+            }
+            Ok(false) => None,
+            Err(message) => {
+                warn!(job_id = %job.id, conversation_id, error = %message, "follow-up could not reach its inbox");
+                // Tried again like a busy conversation; the last failure is kept.
+                Some(match self.handle_busy(job) {
+                    ExecutionResult::Skipped => ExecutionResult::Error { message },
+                    retrying => retrying,
+                })
+            }
         }
     }
 

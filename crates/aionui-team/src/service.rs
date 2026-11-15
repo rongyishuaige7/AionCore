@@ -2544,6 +2544,48 @@ impl TeamSessionService {
         session.send_message_to_agent(slot_id, &content, files).await
     }
 
+    /// Brings a follow-up that came due to the member whose conversation set
+    /// it, through the member's mailbox. Answers `false` when the conversation
+    /// is not a member's, or no longer one, so the caller can deliver the
+    /// follow-up some other way.
+    pub async fn deliver_follow_up(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        content: &str,
+    ) -> Result<bool, TeamError> {
+        let Some(binding) = self
+            .conversation_port
+            .lookup_team_binding_by_conversation(conversation_id)
+            .await?
+        else {
+            return Ok(false);
+        };
+        let (Some(team_id), Some(slot_id)) = (binding.team_id, binding.slot_id) else {
+            return Ok(false);
+        };
+        if binding.user_id != user_id {
+            return Ok(false);
+        }
+        let team = match self.load_owned_team(user_id, &team_id).await {
+            Ok(team) => team,
+            Err(TeamError::TeamNotFound(_)) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let still_a_member = team
+            .agents
+            .iter()
+            .any(|agent| agent.slot_id == slot_id && agent.conversation_id == conversation_id);
+        if !still_a_member {
+            return Ok(false);
+        }
+        self.ensure_session_inner(&team_id, Some(user_id)).await?;
+        self.published_session(&team_id)?
+            .deliver_follow_up(&slot_id, content)
+            .await?;
+        Ok(true)
+    }
+
     pub async fn interrupt_agent(
         &self,
         user_id: &str,

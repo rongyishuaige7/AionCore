@@ -153,16 +153,21 @@ fn render(brief: &TeamRoleBrief, setting: Setting) -> String {
         ));
     }
 
-    if !in_team {
-        out.push_str(&format!(
-            "\n\n### Coming back to something\n\n\
-             When a matter cannot be finished in this run because it has to wait (a build, a reply, a date), set \
-             yourself a follow-up instead of waiting for it or letting it drop:\n\n\
-             ```\n{ROLE_HELPER} follow-up <<'JSON'\n{{\"note\": \"<what to pick up, written for a reader who \
-             remembers nothing of this run>\", \"after_minutes\": 30}}\nJSON\n```\n\n\
-             It wakes you once, in this conversation, after that many minutes (a week at most), with the note."
-        ));
-    }
+    // Open to every role: it writes nothing the user keeps.
+    out.push_str(&format!(
+        "\n\n### Coming back to something\n\n\
+         When a matter cannot be finished now because it has to wait (a build, a reply, a date), set yourself a \
+         follow-up instead of waiting for it or letting it drop:\n\n\
+         ```\n{ROLE_HELPER} follow-up <<'JSON'\n{{\"note\": \"<what to pick up, written for a reader who \
+         remembers nothing of this moment>\", \"after_minutes\": 30}}\nJSON\n```\n\n\
+         {}",
+        if in_team {
+            "It reaches you once, as a message in your mailbox, after that many minutes (a week at most), with the \
+             note."
+        } else {
+            "It wakes you once, in this conversation, after that many minutes (a week at most), with the note."
+        }
+    ));
 
     if in_team && brief.verifies {
         out.push_str(
@@ -343,7 +348,7 @@ mod tests {
     }
 
     #[test]
-    fn a_scheduled_run_is_shown_how_to_come_back_to_a_matter_and_a_team_member_is_not() {
+    fn a_role_is_shown_how_to_come_back_to_a_matter_wherever_it_works() {
         let scheduled = render_scheduled_standing_role(&brief());
         assert!(scheduled.contains("### Coming back to something"), "{scheduled}");
         assert!(
@@ -352,8 +357,17 @@ mod tests {
         );
         assert!(scheduled.contains("\"after_minutes\": 30"), "{scheduled}");
 
+        assert!(
+            scheduled.contains("wakes you once, in this conversation"),
+            "{scheduled}"
+        );
+
         let in_team = render_standing_role(&brief());
-        assert!(!in_team.contains("follow-up"), "{in_team}");
+        assert!(
+            in_team.contains("\"$AIONUI_HELPER_BIN\" role follow-up <<'JSON'"),
+            "{in_team}"
+        );
+        assert!(in_team.contains("as a message in your mailbox"), "{in_team}");
     }
 
     #[test]

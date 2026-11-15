@@ -2746,6 +2746,119 @@ async fn a_follow_up_is_a_one_shot_job_that_leaves_the_conversation_filed_where_
     );
 }
 
+/// An inbox that records what it is handed and answers as it is told to.
+struct StubInbox {
+    answer: Result<bool, String>,
+    delivered: Mutex<Vec<(String, String, String)>>,
+}
+
+impl StubInbox {
+    fn answering(answer: Result<bool, String>) -> Arc<Self> {
+        Arc::new(Self {
+            answer,
+            delivered: Mutex::new(Vec::new()),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl aionui_cron::executor::CronInboxPort for StubInbox {
+    async fn deliver(&self, user_id: &str, conversation_id: &str, content: &str) -> Result<bool, String> {
+        self.delivered
+            .lock()
+            .unwrap()
+            .push((user_id.to_owned(), conversation_id.to_owned(), content.to_owned()));
+        self.answer.clone()
+    }
+}
+
+#[tokio::test]
+async fn a_follow_up_for_a_conversation_with_an_inbox_goes_there_and_is_then_gone() {
+    let (svc, cron_repo, _, conv_repo, conv_service) = setup_with_conv_runtime().await;
+    let inbox = StubInbox::answering(Ok(true));
+    svc.set_inbox_port(inbox.clone());
+    let follow_up = svc
+        .create_follow_up("u1", "conv_1", "check the deploy", 5)
+        .await
+        .unwrap();
+    // The conversation is in the middle of a turn: the inbox takes the note anyway.
+    let _claim = conv_service
+        .runtime_state()
+        .try_claim_turn("conv_1", "turn_in_progress")
+        .expect("claim conversation");
+
+    svc.tick(&follow_up.job_id, follow_up.due_at).await;
+
+    let delivered = inbox.delivered.lock().unwrap().clone();
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(delivered[0].0, "u1");
+    assert_eq!(delivered[0].1, "conv_1");
+    assert!(delivered[0].2.contains("check the deploy"), "{}", delivered[0].2);
+    assert!(delivered[0].2.contains("not a message from the user"));
+    assert!(
+        cron_repo.get_by_id_system(&follow_up.job_id).await.unwrap().is_none(),
+        "a delivered follow-up is not kept"
+    );
+    assert!(conv_repo.take_messages().is_empty(), "no turn was started for it");
+}
+
+#[tokio::test]
+async fn a_follow_up_whose_inbox_cannot_be_reached_is_kept_and_tried_again() {
+    let (svc, cron_repo, _, _, _) = setup_with_conv_runtime().await;
+    let inbox = StubInbox::answering(Err("team session could not start".into()));
+    svc.set_inbox_port(inbox.clone());
+    let follow_up = svc
+        .create_follow_up("u1", "conv_1", "check the deploy", 5)
+        .await
+        .unwrap();
+
+    svc.tick(&follow_up.job_id, follow_up.due_at).await;
+
+    assert_eq!(inbox.delivered.lock().unwrap().len(), 1);
+    let row = cron_repo.get_by_id_system(&follow_up.job_id).await.unwrap().unwrap();
+    assert!(row.enabled);
+    assert_eq!(row.retry_count, 1);
+}
+
+#[tokio::test]
+async fn only_follow_ups_are_offered_to_the_inbox() {
+    let (svc, _, _, _, _) = setup_with_conv_runtime().await;
+    let inbox = StubInbox::answering(Ok(true));
+    svc.set_inbox_port(inbox.clone());
+    // A one-shot task the user made, and a recurring one.
+    let once = svc
+        .add_job(
+            "u1",
+            make_create_req(
+                "once",
+                CronScheduleDto::At {
+                    at_ms: now_ms() + 60_000,
+                    description: None,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let recurring = svc
+        .add_job(
+            "u1",
+            make_create_req(
+                "recurring",
+                CronScheduleDto::Every {
+                    every_ms: 60_000,
+                    description: None,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+
+    svc.tick(&once.id, now_ms()).await;
+    svc.tick(&recurring.id, now_ms()).await;
+
+    assert!(inbox.delivered.lock().unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn a_conversation_holds_only_so_many_follow_ups_at_a_time() {
     let (svc, _, _, _, _) = setup_with_conv_runtime().await;

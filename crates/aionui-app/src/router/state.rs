@@ -364,6 +364,12 @@ pub async fn build_module_states(
             task_manager: services.worker_task_manager.clone(),
             team: states.team.service.clone(),
         }));
+    // And once more: a follow-up set by a team member comes due in the
+    // scheduler, which is built before the team service it has to hand the
+    // note to. `set_inbox_port` is set-once.
+    states.cron.cron_service.set_inbox_port(Arc::new(TeamInboxCronPort {
+        team: states.team.service.clone(),
+    }));
     states
         .conversation
         .service
@@ -676,6 +682,23 @@ impl aionui_team::TeamRolePort for RoleServiceTeamPort {
             Err(RoleError::InvalidId(_) | RoleError::NotFound(_)) => Ok(None),
             Err(error) => Err(error.to_string()),
         }
+    }
+}
+
+/// Adapts the team service to the scheduler's [`aionui_cron::executor::CronInboxPort`]:
+/// a follow-up set from a team member's conversation is put in that member's
+/// mailbox instead of being run as a turn behind the team's back.
+struct TeamInboxCronPort {
+    team: Arc<aionui_team::TeamSessionService>,
+}
+
+#[async_trait::async_trait]
+impl aionui_cron::executor::CronInboxPort for TeamInboxCronPort {
+    async fn deliver(&self, user_id: &str, conversation_id: &str, content: &str) -> Result<bool, String> {
+        self.team
+            .deliver_follow_up(user_id, conversation_id, content)
+            .await
+            .map_err(|error| error.to_string())
     }
 }
 
