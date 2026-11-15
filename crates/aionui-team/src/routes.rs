@@ -216,6 +216,7 @@ pub fn team_routes(state: TeamRouterState) -> Router {
             put(set_conversation_config_option),
         )
         .route("/api/teams/{id}/runs/{team_run_id}/cancel", post(cancel_run))
+        .route("/api/teams/{id}/auto-continue/stop", post(stop_auto_continue))
         .route(
             "/api/teams/{id}/runs/{team_run_id}/agents/{slot_id}/cancel",
             post(cancel_child_turn),
@@ -561,6 +562,15 @@ async fn cancel_run(
             req.reason,
         )
         .await?;
+    Ok(Json(ApiResponse::success()))
+}
+
+async fn stop_auto_continue(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    state.service.stop_auto_continue(&user.id, &id).await?;
     Ok(Json(ApiResponse::success()))
 }
 

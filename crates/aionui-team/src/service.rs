@@ -2256,6 +2256,7 @@ impl TeamSessionService {
                 session_generation: None,
                 active_run: None,
                 slot_work: Vec::new(),
+                auto_continue: None,
             });
         };
         let snapshot = session.work_coordinator().snapshot();
@@ -2272,6 +2273,7 @@ impl TeamSessionService {
             session_generation: Some(snapshot.session_generation),
             active_run,
             slot_work,
+            auto_continue: Some(session.auto_continue_payload().await),
         })
     }
 
@@ -3083,6 +3085,17 @@ impl TeamSessionService {
             Arc::clone(&entry.session)
         };
         session.cancel_run(team_run_id, target_slot_id, reason).await
+    }
+
+    /// Ends the automatic reminders of a team and whatever it is doing right
+    /// now. A team that is not loaded has nothing to stop.
+    pub async fn stop_auto_continue(&self, user_id: &str, team_id: &str) -> Result<(), TeamError> {
+        self.load_owned_team(user_id, team_id).await?;
+        let session = self.sessions.get(team_id).map(|entry| Arc::clone(&entry.session));
+        match session {
+            Some(session) => session.stop_auto_continue().await,
+            None => Ok(()),
+        }
     }
 
     pub async fn cancel_child_turn(

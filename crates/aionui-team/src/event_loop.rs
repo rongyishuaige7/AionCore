@@ -152,12 +152,14 @@ async fn run_event_loop(
             _ = notify.notified() => {}
         }
 
+        let mut ran_turn = false;
         loop {
             if *shutdown_rx.borrow() {
                 return;
             }
             match ctx.session.prepare_next_batch(&ctx.slot_id).await {
                 Ok(PrepareBatchResult::Execute { batch, input }) => {
+                    ran_turn = true;
                     if execute_and_finalize(&ctx, *batch, input).await == ExecuteResult::WaitForSignal {
                         break;
                     }
@@ -165,11 +167,17 @@ async fn run_event_loop(
                 Ok(PrepareBatchResult::SettleSignals { intent_ids }) => {
                     ctx.session.handle_signal_intents(&ctx.slot_id, &intent_ids).await;
                 }
-                Ok(
-                    PrepareBatchResult::WaitingForCompletion
-                    | PrepareBatchResult::Blocked
-                    | PrepareBatchResult::Quiescent,
-                ) => break,
+                Ok(PrepareBatchResult::Quiescent) => {
+                    // This member has nothing left. If that makes the whole team
+                    // quiet while the board still holds open work, wake whoever
+                    // it is waiting on. Only after a turn: a loop that merely
+                    // settled signals has changed nothing to react to.
+                    if ran_turn {
+                        ctx.session.continue_open_work().await;
+                    }
+                    break;
+                }
+                Ok(PrepareBatchResult::WaitingForCompletion | PrepareBatchResult::Blocked) => break,
                 Err(error) => {
                     warn!(
                         team_id = %ctx.team_id,

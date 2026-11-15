@@ -446,6 +446,36 @@ pub struct TeamRunStateResponse {
     pub session_generation: Option<String>,
     pub active_run: Option<TeamRunPayload>,
     pub slot_work: Vec<TeamSlotWorkPayload>,
+    /// Where the team stands with its automatic reminders; absent while no
+    /// session is running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_continue: Option<TeamAutoContinuePayload>,
+}
+
+/// Where a team stands with waking its members while the task board still
+/// holds open work.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamAutoContinueStatus {
+    /// No reminder is out.
+    Idle,
+    /// Members were reminded and are working.
+    Running,
+    /// Ended: the last reminders changed nothing on the board.
+    Stalled,
+    /// Ended: the limit of reminders per user message was reached.
+    RoundLimit,
+}
+
+/// Payload of `team.autoContinueChanged`, and part of the run state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamAutoContinuePayload {
+    pub team_id: String,
+    pub status: TeamAutoContinueStatus,
+    /// Reminder rounds sent since the user last wrote.
+    pub round: u32,
+    /// Tasks on the board that are neither completed nor deleted.
+    pub open_tasks: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1799,12 +1829,29 @@ mod tests {
             session_generation: Some("generation-1".into()),
             active_run: None,
             slot_work: vec![active_slot_work()],
+            auto_continue: None,
         })
         .unwrap();
 
         assert_eq!(value["session_generation"], "generation-1");
         assert!(value["active_run"].is_null());
         assert_eq!(value["slot_work"][0]["slot_id"], "lead-1");
+        assert!(value.get("auto_continue").is_none(), "absent, not null, without a session");
+    }
+
+    #[test]
+    fn team_auto_continue_payload_serializes_snake_case() {
+        let value = serde_json::to_value(TeamAutoContinuePayload {
+            team_id: "team-1".into(),
+            status: TeamAutoContinueStatus::RoundLimit,
+            round: 20,
+            open_tasks: 3,
+        })
+        .unwrap();
+
+        assert_eq!(value["status"], "round_limit");
+        assert_eq!(value["round"], 20);
+        assert_eq!(value["open_tasks"], 3);
     }
 
     #[test]

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use aionui_api_types::{
     TeamAgentRemovedPayload, TeamAgentRenamedPayload, TeamAgentRuntimeStatus, TeamAgentRuntimeStatusPayload,
-    TeamAgentSpawnedPayload, TeamAgentStatusPayload, TeamChildTurnPayload, TeamMailboxChange,
+    TeamAgentSpawnedPayload, TeamAgentStatusPayload, TeamAutoContinuePayload, TeamChildTurnPayload, TeamMailboxChange,
     TeamMailboxChangedPayload, TeamMailboxMessageResponse, TeamRunPayload, TeamSlotWorkChangedPayload, TeamTaskChange,
     TeamTaskChangedPayload, TeamTaskResponse, WebSocketMessage,
 };
@@ -37,6 +37,7 @@ pub const TEAM_CHILD_TURN_STARTED_EVENT: &str = "team.childTurnStarted";
 pub const TEAM_CHILD_TURN_COMPLETED_EVENT: &str = "team.childTurnCompleted";
 pub const TEAM_CHILD_TURN_CANCELLED_EVENT: &str = "team.childTurnCancelled";
 pub const TEAM_SLOT_WORK_CHANGED_EVENT: &str = "team.slotWorkChanged";
+pub const TEAM_AUTO_CONTINUE_CHANGED_EVENT: &str = "team.autoContinueChanged";
 
 pub struct TeamEventEmitter {
     team_id: String,
@@ -161,6 +162,19 @@ impl TeamEventEmitter {
             "team websocket event emitted"
         );
         let event = WebSocketMessage::new(TEAM_SLOT_WORK_CHANGED_EVENT, self.scoped_payload(payload));
+        self.broadcaster.broadcast(event);
+    }
+
+    pub fn broadcast_auto_continue(&self, payload: TeamAutoContinuePayload) {
+        debug!(
+            event_name = TEAM_AUTO_CONTINUE_CHANGED_EVENT,
+            team_id = %payload.team_id,
+            status = ?payload.status,
+            round = payload.round,
+            open_tasks = payload.open_tasks,
+            "team websocket event emitted"
+        );
+        let event = WebSocketMessage::new(TEAM_AUTO_CONTINUE_CHANGED_EVENT, self.scoped_payload(payload));
         self.broadcaster.broadcast(event);
     }
 
@@ -443,6 +457,26 @@ mod tests {
         assert_eq!(payload.team_run_id, "run-1");
         assert_eq!(payload.slot_id, "worker-1");
         assert_eq!(payload.status, aionui_api_types::TeamRunStatus::Running);
+    }
+
+    #[test]
+    fn auto_continue_changed_event_has_correct_shape() {
+        let (emitter, bc) = make_emitter();
+        emitter.broadcast_auto_continue(aionui_api_types::TeamAutoContinuePayload {
+            team_id: "team-1".into(),
+            status: aionui_api_types::TeamAutoContinueStatus::Running,
+            round: 2,
+            open_tasks: 3,
+        });
+
+        let events = bc.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].name, "team.autoContinueChanged");
+        assert_eq!(events[0].data["team_id"], "team-1");
+        assert_eq!(events[0].data["status"], "running");
+        assert_eq!(events[0].data["round"], 2);
+        assert_eq!(events[0].data["open_tasks"], 3);
+        assert_eq!(events[0].data["user_id"], "user-1");
     }
 
     #[test]

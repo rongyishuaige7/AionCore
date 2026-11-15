@@ -141,7 +141,14 @@ pub struct TeamSession {
     /// Reset only by constructing a fresh `TeamSession` during a new restore,
     /// reconnect, or explicit re-ensure lifecycle.
     recovery_scan_completed: AtomicBool,
+    /// Counts the automatic reminders sent while the board holds open work
+    /// (see [`crate::auto_continue`]). Held across a whole "went quiet" check,
+    /// so two members going quiet together send one round, not two. In memory
+    /// only: a restarted session starts counting again.
+    auto_continue: tokio::sync::Mutex<crate::auto_continue::Budget>,
 }
+
+mod continue_open_work;
 
 impl TeamSession {
     #[allow(clippy::too_many_arguments)]
@@ -253,6 +260,7 @@ impl TeamSession {
             member_runtimes,
             prompt_dump,
             recovery_scan_completed: AtomicBool::new(false),
+            auto_continue: tokio::sync::Mutex::new(crate::auto_continue::Budget::default()),
         })
     }
 
@@ -687,6 +695,8 @@ impl TeamSession {
         content: &str,
         files: Option<Vec<String>>,
     ) -> Result<TeamRunAckResponse, TeamError> {
+        // The user is driving again: the automatic reminders start over.
+        self.restart_auto_continue().await;
         // Human-direct delivery: lazily wake a dormant teammate. Failures stay
         // inline for the user, so do NOT notify the leader.
         self.ensure_member_runtime_lazy(slot_id, false).await?;
@@ -1215,6 +1225,8 @@ impl TeamSession {
                 "team run {team_run_id} is not active"
             )));
         }
+        // A stop is a stop: the team must not be woken again behind it.
+        self.halt_auto_continue().await;
         self.team_run_manager.begin_cancel(team_run_id, reason)?;
         let result = self.work_coordinator.cancel_run(team_run_id);
         if !result.terminal_message_ids.is_empty() {
@@ -1277,6 +1289,7 @@ impl TeamSession {
                 "agent {slot_id} is not active in team run {team_run_id}"
             )));
         }
+        self.halt_auto_continue().await;
         if let Some(turn_id) = snapshot.active_turn_id {
             let agent = self.scheduler.get_agent(slot_id).await?;
             self.cancellation_port
@@ -1316,6 +1329,7 @@ impl TeamSession {
                 "team run {team_run_id} is not active"
             )));
         }
+        self.halt_auto_continue().await;
         let outcome = self.work_coordinator.pause_slot(slot_id);
         if let Some(target) = outcome.cancel_target {
             if let Some(turn_id) = target.turn_id {
@@ -1632,6 +1646,7 @@ impl TeamSession {
         reason: Option<String>,
         queued_policy: TeamQueuedPolicy,
     ) -> Result<TeamInterruptAgentResponse, TeamError> {
+        self.restart_auto_continue().await;
         self.interrupt_agent_message(None, to_slot_id, content, files, reason, queued_policy)
             .await
     }
@@ -3302,6 +3317,76 @@ mod tests {
         .await
         .unwrap();
         (session, repo)
+    }
+
+    #[tokio::test]
+    async fn a_quiet_team_reminds_the_owner_of_an_open_task_once() {
+        let session = start_session().await;
+        session
+            .scheduler
+            .create_task("Write the report", None, Some("worker-1"), &[])
+            .await
+            .unwrap();
+
+        session.continue_open_work().await;
+
+        let unread = session.mailbox.peek_unread("t1", "worker-1").await.unwrap();
+        assert_eq!(unread.len(), 1);
+        assert_eq!(unread[0].from_agent_id, "team_system");
+        assert!(unread[0].content.contains("Write the report"));
+        assert!(session.mailbox.peek_unread("t1", "lead-1").await.unwrap().is_empty());
+        let standing = session.auto_continue_payload().await;
+        assert_eq!(standing.status, aionui_api_types::TeamAutoContinueStatus::Running);
+        assert_eq!(standing.round, 1);
+        assert_eq!(standing.open_tasks, 1);
+
+        // The reminder is still queued, so the team is not quiet: no second one.
+        session.continue_open_work().await;
+        assert_eq!(session.mailbox.peek_unread("t1", "worker-1").await.unwrap().len(), 1);
+        assert_eq!(session.auto_continue_payload().await.round, 1);
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn a_board_with_nothing_for_a_member_to_do_wakes_nobody() {
+        let session = start_session().await;
+        session.continue_open_work().await;
+        session
+            .scheduler
+            .create_task("Approve the budget", None, Some("user"), &[])
+            .await
+            .unwrap();
+        session.continue_open_work().await;
+
+        assert!(session.mailbox.peek_unread("t1", "lead-1").await.unwrap().is_empty());
+        assert!(session.mailbox.peek_unread("t1", "worker-1").await.unwrap().is_empty());
+        let standing = session.auto_continue_payload().await;
+        assert_eq!(standing.status, aionui_api_types::TeamAutoContinueStatus::Idle);
+        assert_eq!(standing.round, 0);
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn a_team_the_user_stopped_is_not_reminded_until_the_user_writes_again() {
+        let session = start_session().await;
+        session
+            .scheduler
+            .create_task("Write the report", None, Some("worker-1"), &[])
+            .await
+            .unwrap();
+
+        session.halt_auto_continue().await;
+        session.continue_open_work().await;
+        assert!(session.mailbox.peek_unread("t1", "worker-1").await.unwrap().is_empty());
+        assert_eq!(
+            session.auto_continue_payload().await.status,
+            aionui_api_types::TeamAutoContinueStatus::Idle
+        );
+
+        session.restart_auto_continue().await;
+        session.continue_open_work().await;
+        assert_eq!(session.mailbox.peek_unread("t1", "worker-1").await.unwrap().len(), 1);
+        session.stop();
     }
 
     #[tokio::test]

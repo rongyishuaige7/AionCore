@@ -24,6 +24,10 @@ pub(crate) enum WorkSource {
     InterruptedNotification,
     ShutdownRejected,
     RecoveryDrain,
+    /// The team went quiet with open work on the board and this member is
+    /// reminded of its share. Never resumes a paused slot: a member the user
+    /// stopped stays stopped.
+    AutoContinue,
 }
 
 impl WorkSource {
@@ -40,7 +44,8 @@ impl WorkSource {
             | Self::DeliveryFailureNotification
             | Self::IdleNotification
             | Self::InterruptedNotification
-            | Self::RecoveryDrain => WorkPriority::Background,
+            | Self::RecoveryDrain
+            | Self::AutoContinue => WorkPriority::Background,
         }
     }
 
@@ -66,6 +71,7 @@ impl WorkSource {
                 | Self::InterruptedNotification
                 | Self::ShutdownRejected
                 | Self::RecoveryDrain
+                | Self::AutoContinue
         )
     }
 }
@@ -87,6 +93,7 @@ impl fmt::Display for WorkSource {
             Self::InterruptedNotification => "interrupted_notification",
             Self::ShutdownRejected => "shutdown_rejected",
             Self::RecoveryDrain => "recovery_drain",
+            Self::AutoContinue => "auto_continue",
         };
         formatter.write_str(value)
     }
@@ -128,6 +135,17 @@ mod tests {
             WorkSource::DeliveryFailureNotification.to_string(),
             "delivery_failure_notification"
         );
+    }
+
+    #[test]
+    fn an_automatic_reminder_is_background_mail_that_leaves_a_paused_member_paused() {
+        assert_eq!(WorkSource::AutoContinue.priority(), WorkPriority::Background);
+        assert!(WorkSource::AutoContinue.requires_mailbox_message());
+        assert!(
+            !WorkSource::AutoContinue.resumes_paused_slot(),
+            "a member the user stopped must not be restarted by a reminder"
+        );
+        assert_eq!(WorkSource::AutoContinue.to_string(), "auto_continue");
     }
 
     #[test]
