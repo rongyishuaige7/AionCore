@@ -644,6 +644,18 @@ impl aionui_team::TeamRolePort for RoleServiceTeamPort {
                         updated_day: local_day(progress.updated_at),
                     })
                     .collect(),
+                reported: role
+                    .reported
+                    .iter()
+                    .map(|report| {
+                        format!(
+                            "{} [{}] {}",
+                            local_minute(report.at),
+                            report.outcome.as_str(),
+                            report.summary
+                        )
+                    })
+                    .collect(),
             })),
             // An assistant id that cannot name a role directory is not a role.
             Err(RoleError::InvalidId(_)) => Ok(None),
@@ -723,6 +735,19 @@ impl aionui_cron::executor::CronRolePort for RoleServiceCronPort {
             }
         }
     }
+}
+
+/// The minute of a millisecond timestamp in the user's own time zone
+/// (`YYYY-MM-DD HH:MM`), empty for a timestamp that names no moment.
+fn local_minute(timestamp_ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(timestamp_ms)
+        .map(|moment| {
+            moment
+                .with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_default()
 }
 
 /// The day of a millisecond timestamp in the user's own time zone

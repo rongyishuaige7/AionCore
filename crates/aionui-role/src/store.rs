@@ -8,6 +8,7 @@
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
+use aionui_api_types::RoleReport;
 use serde::{Deserialize, Serialize};
 
 use crate::error::RoleError;
@@ -19,6 +20,7 @@ const ARCHIVE_DIR: &str = "archive";
 const ARCHIVE_PREFIX: &str = "MEMORY-";
 const PROGRESS_DIR: &str = "progress";
 const PROGRESS_EXTENSION: &str = "md";
+const REPORTED_FILE: &str = "reported.jsonl";
 const ID_SEPARATOR: &str = ":";
 const DIR_SEPARATOR: &str = "@";
 
@@ -168,6 +170,30 @@ impl RoleStore {
             }
         }
         Ok(name)
+    }
+
+    /// What the role has told the user, oldest first, one JSON object per line
+    /// of `memory/reported.jsonl`. A line that does not parse is skipped, so a
+    /// hand-edited file costs one entry, not the log.
+    pub(crate) async fn read_reports(&self, id: &str) -> Result<Vec<RoleReport>, RoleError> {
+        let raw = match tokio::fs::read_to_string(self.memory_dir(id).join(REPORTED_FILE)).await {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        Ok(raw
+            .lines()
+            .filter_map(|line| serde_json::from_str::<RoleReport>(line).ok())
+            .collect())
+    }
+
+    pub(crate) async fn write_reports(&self, id: &str, reports: &[RoleReport]) -> Result<(), RoleError> {
+        let mut contents = String::new();
+        for report in reports {
+            contents.push_str(&serde_json::to_string(report).map_err(std::io::Error::other)?);
+            contents.push('\n');
+        }
+        write_atomic(&self.memory_dir(id).join(REPORTED_FILE), contents.as_bytes()).await
     }
 
     fn progress_dir(&self, id: &str) -> PathBuf {

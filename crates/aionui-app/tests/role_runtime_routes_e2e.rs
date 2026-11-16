@@ -338,6 +338,65 @@ async fn a_role_sets_itself_a_follow_up_that_waits_as_a_one_shot_task_for_its_co
 }
 
 #[tokio::test]
+async fn a_run_declares_how_it_ended_and_what_it_told_the_user_is_kept_and_announced() {
+    let fixture = fixture().await;
+    // Kept from its memory: declaring how a run ended is not a memory write.
+    define_role(&fixture, &["team_remember", "team_progress"]).await;
+    let token = conversation_as(&fixture, "conv-role", Some(ROLE)).await;
+    let mut events = fixture.services.event_bus.subscribe();
+    let post = |body: Value| {
+        call(
+            &fixture,
+            "POST",
+            "/api/runtime/role/report",
+            "conv-role",
+            &token,
+            Some(body),
+        )
+    };
+
+    // A quiet run: announced, so that it asks for no attention, and not kept.
+    let (status, silent) = post(json!({ "outcome": "silent" })).await;
+    assert_eq!(status, StatusCode::OK, "{silent}");
+    assert_eq!(silent["data"], json!({ "outcome": "silent", "recorded": false }));
+    let event = events.recv().await.unwrap();
+    assert_eq!(event.name, "role.reported");
+    assert_eq!(event.data["conversation_id"], json!("conv-role"));
+    assert_eq!(event.data["user_id"], json!(USER));
+    assert_eq!(event.data["outcome"], json!("silent"));
+
+    // A question for the user: kept as one line, with where it was asked.
+    let (status, asked) = post(json!({ "outcome": "ask", "summary": "ship it\nto finance too?" })).await;
+    assert_eq!(status, StatusCode::OK, "{asked}");
+    assert_eq!(asked["data"], json!({ "outcome": "ask", "recorded": true }));
+    let event = events.recv().await.unwrap();
+    assert_eq!(event.data["outcome"], json!("ask"));
+    assert_eq!(event.data["summary"], json!("ship it to finance too?"));
+    assert_eq!(event.data["role_id"], json!(ROLE));
+
+    let (_, shown) = call(&fixture, "GET", "/api/runtime/role", "conv-role", &token, None).await;
+    let reported = shown["data"]["reported"].as_array().unwrap();
+    assert_eq!(reported.len(), 1);
+    assert_eq!(reported[0]["outcome"], json!("ask"));
+    assert_eq!(reported[0]["summary"], json!("ship it to finance too?"));
+    assert_eq!(reported[0]["conversation_id"], json!("conv-role"));
+
+    // Something to say needs the line to say, and an outcome has to be one of the three.
+    for body in [
+        json!({ "outcome": "say" }),
+        json!({ "outcome": "say", "summary": "  " }),
+        json!({ "outcome": "shout", "summary": "x" }),
+        json!({ "summary": "x" }),
+    ] {
+        let (status, refused) = post(body.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {refused}");
+        assert_eq!(refused["error"]["code"], json!("schema_validation_failed"));
+    }
+    assert!(events.try_recv().is_err(), "a refused report announces nothing");
+    fixture.services.database.close().await;
+}
+
+#[tokio::test]
 async fn a_conversation_that_is_not_a_role_has_no_role_to_write_to() {
     let fixture = fixture().await;
     define_role(&fixture, &[]).await;

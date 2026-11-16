@@ -24,6 +24,9 @@ const ROLE_HELPER: &str = "\"$AIONUI_HELPER_BIN\" role";
 /// Cap on the tasks in progress listed in the prompt; the rest stay in the directory.
 const MAX_LISTED_TASKS: usize = 20;
 
+/// Cap on the earlier reports listed in the prompt.
+const MAX_LISTED_REPORTS: usize = 10;
+
 /// Cap on the summary shown for one task, in characters.
 const MAX_TASK_SUMMARY_CHARS: usize = 160;
 
@@ -169,6 +172,31 @@ fn render(brief: &TeamRoleBrief, setting: Setting) -> String {
         }
     ));
 
+    // A team member answers to its Lead, who speaks to the user. A run on its
+    // own has nobody between it and the user, so it says itself whether the
+    // user is to be disturbed.
+    if !in_team {
+        out.push_str(&format!(
+            "\n\n### Ending this run\n\n\
+             Nobody is watching this run. Before your final reply, declare how it ended:\n\n\
+             ```\n{ROLE_HELPER} report <<'JSON'\n{{\"outcome\": \"silent\"}}\nJSON\n```\n\n\
+             - `silent`: nothing the user needs to hear, and the run asks for no attention. Use it whenever a \
+             check found nothing new.\n\
+             - `say`: there is something the user should know. Add `\"summary\": \"<the one line they see \
+             first>\"`.\n\
+             - `ask`: you cannot go on without the user's answer. The summary is the question.\n\n\
+             Your reply stays in this conversation either way. A run that ends without declaring is shown to the \
+             user as if it had something to say."
+        ));
+        if !brief.reported.is_empty() {
+            out.push_str("\n\n### Already told to the user\n\n");
+            for line in brief.reported.iter().take(MAX_LISTED_REPORTS) {
+                out.push_str(&format!("- {line}\n"));
+            }
+            out.push_str("\nDo not say these again unless something about them has changed.");
+        }
+    }
+
     if in_team && brief.verifies {
         out.push_str(
             "\n\n### Reviewing\n\n\
@@ -249,6 +277,7 @@ mod tests {
             denied_tools: vec!["team_task_create".into()],
             verifies: false,
             progress: Vec::new(),
+            reported: Vec::new(),
         }
     }
 
@@ -368,6 +397,41 @@ mod tests {
             "{in_team}"
         );
         assert!(in_team.contains("as a message in your mailbox"), "{in_team}");
+    }
+
+    #[test]
+    fn a_run_on_its_own_is_asked_to_declare_whether_the_user_is_to_be_disturbed() {
+        let scheduled = render_scheduled_standing_role(&brief());
+        assert!(scheduled.contains("### Ending this run"));
+        assert!(scheduled.contains("\"$AIONUI_HELPER_BIN\" role report <<'JSON'"));
+        for outcome in ["`silent`", "`say`", "`ask`"] {
+            assert!(scheduled.contains(outcome), "{outcome} is explained");
+        }
+        // Nothing reported yet: no empty list.
+        assert!(!scheduled.contains("### Already told to the user"));
+
+        // In a team the Lead speaks to the user.
+        let in_team = render_standing_role(&brief());
+        assert!(!in_team.contains("role report"));
+        assert!(!in_team.contains("### Ending this run"));
+    }
+
+    #[test]
+    fn a_run_on_its_own_is_shown_the_newest_things_it_already_told_the_user() {
+        let reported: Vec<String> = (0..MAX_LISTED_REPORTS + 2)
+            .map(|n| format!("2026-11-14 09:{n:02} [say] report {n}"))
+            .collect();
+        let section = render_scheduled_standing_role(&TeamRoleBrief {
+            reported: reported.clone(),
+            ..brief()
+        });
+        assert!(section.contains("### Already told to the user"));
+        assert!(section.contains("- 2026-11-14 09:00 [say] report 0\n"));
+        assert!(!section.contains(&reported[MAX_LISTED_REPORTS]));
+        assert!(section.contains("Do not say these again"));
+
+        let in_team = render_standing_role(&TeamRoleBrief { reported, ..brief() });
+        assert!(!in_team.contains("### Already told to the user"));
     }
 
     #[test]

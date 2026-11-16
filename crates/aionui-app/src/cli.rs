@@ -284,6 +284,7 @@ pub(crate) enum RoleCommand {
     Progress,
     #[command(name = "follow-up")]
     FollowUp,
+    Report,
     #[command(external_subcommand)]
     Unknown(Vec<OsString>),
 }

@@ -321,6 +321,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         timers: states.cron.cron_service.clone(),
         conversations: services.conversation_service.conversation_repo().clone(),
         runtime_token_service: services.runtime_token_service.clone(),
+        broadcaster: services.event_bus.clone(),
     });
 
     // Resident-role routes protected by auth middleware

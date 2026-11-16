@@ -12,6 +12,11 @@
 //! note back to this conversation later, so a matter it cannot finish now is
 //! not left to chance.
 //!
+//! And it declares here how a run nobody watched ended: whether the user is to
+//! be told something, asked something, or left alone. What it tells is kept
+//! with the role, and the declaration is announced before the turn completes
+//! so that a client can decide whether the finished run asks for attention.
+//!
 //! Authenticates on the three `x-aionui-*` headers itself, like the other
 //! runtime routes, and is mounted outside the ordinary auth and CSRF middleware.
 
@@ -21,11 +26,13 @@ use aionui_ai_agent::{RuntimeTokenScope, RuntimeTokenService, TEAM_RUNTIME_TOKEN
 use aionui_api_types::{
     RoleCliEnvelope, RoleCliErrorCode, RoleCurateRequest, RoleCurateResponse, RoleFollowUpRequest,
     RoleFollowUpResponse, RoleProgressRequest, RoleProgressResponse, RoleRememberRequest, RoleRememberResponse,
-    RoleResponse, TeamToolName,
+    RoleReportRequest, RoleReportResponse, RoleReportedEvent, RoleResponse, TeamToolName, WebSocketMessage,
 };
+use aionui_common::now_ms;
 use aionui_cron::error::CronError;
 use aionui_cron::service::CronService;
 use aionui_db::IConversationRepository;
+use aionui_realtime::EventBroadcaster;
 use aionui_role::{RoleError, RoleService};
 use axum::extract::State;
 use axum::extract::rejection::JsonRejection;
@@ -46,6 +53,8 @@ pub struct RuntimeRoleState {
     pub timers: Arc<CronService>,
     pub conversations: Arc<dyn IConversationRepository>,
     pub runtime_token_service: Arc<RuntimeTokenService>,
+    /// Where a run's declaration of how it ended is announced.
+    pub broadcaster: Arc<dyn EventBroadcaster>,
 }
 
 pub fn runtime_role_routes(state: RuntimeRoleState) -> Router {
@@ -55,6 +64,7 @@ pub fn runtime_role_routes(state: RuntimeRoleState) -> Router {
         .route("/api/runtime/role/curate", post(curate))
         .route("/api/runtime/role/progress", post(progress))
         .route("/api/runtime/role/follow-up", post(follow_up))
+        .route("/api/runtime/role/report", post(report))
         .with_state(state)
 }
 
@@ -226,6 +236,57 @@ async fn follow_up(
             internal(COMMAND)
         }
     }
+}
+
+/// Declare how the run ended. Open to every role: what it keeps is a record of
+/// what the user was told, not the memory the user may reserve.
+async fn report(
+    State(state): State<RuntimeRoleState>,
+    headers: HeaderMap,
+    body: Result<Json<RoleReportRequest>, JsonRejection>,
+) -> Reply {
+    const COMMAND: &str = "role report";
+    let (caller, role) = match caller_and_role(&state, &headers, COMMAND).await {
+        Ok(found) => found,
+        Err(reply) => return reply,
+    };
+    let request = match parsed(body, COMMAND) {
+        Ok(request) => request,
+        Err(reply) => return *reply,
+    };
+    let at = now_ms();
+    let kept = match state
+        .roles
+        .record_report(&role.id, request.outcome, &request.summary, &caller.conversation_id, at)
+        .await
+    {
+        Ok(kept) => kept,
+        Err(error) => return role_failure(error, COMMAND),
+    };
+    let event = RoleReportedEvent {
+        conversation_id: caller.conversation_id,
+        role_id: role.id,
+        outcome: request.outcome,
+        // As it was kept: one line. A silent run's reason is not passed on.
+        summary: kept.as_ref().map(|report| report.summary.clone()).unwrap_or_default(),
+        at,
+    };
+    match serde_json::to_value(&event) {
+        Ok(mut payload) => {
+            payload["user_id"] = Value::String(caller.user_id);
+            state
+                .broadcaster
+                .broadcast(WebSocketMessage::new("role.reported", payload));
+        }
+        Err(error) => tracing::error!(command = COMMAND, error = %error, "role helper: report not announced"),
+    }
+    success(
+        COMMAND,
+        &RoleReportResponse {
+            outcome: request.outcome,
+            recorded: kept.is_some(),
+        },
+    )
 }
 
 /// The resident role the calling conversation runs as. Refuses a caller whose

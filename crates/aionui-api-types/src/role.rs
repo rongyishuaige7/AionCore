@@ -27,8 +27,47 @@ pub struct RoleResponse {
     /// Work the role has under way, most recently touched first.
     #[serde(default)]
     pub progress: Vec<RoleProgress>,
+    /// What the role last chose to tell the user from runs nobody watched,
+    /// newest first.
+    #[serde(default)]
+    pub reported: Vec<RoleReport>,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+/// How a run nobody watched ended, as the role itself declared it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoleReportOutcome {
+    /// There is something the user should know.
+    Say,
+    /// Nothing the user needs to hear; the run should not ask for attention.
+    Silent,
+    /// The role cannot go on without an answer from the user.
+    Ask,
+}
+
+impl RoleReportOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Say => "say",
+            Self::Silent => "silent",
+            Self::Ask => "ask",
+        }
+    }
+}
+
+/// One thing a role told the user at the end of a run: kept so that the next
+/// run does not say it again, and so that the user finds it when they come back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleReport {
+    pub at: TimestampMs,
+    /// `say` or `ask`; a silent run leaves nothing behind.
+    pub outcome: RoleReportOutcome,
+    /// One line: what the user should know, or the question they are asked.
+    pub summary: String,
+    /// The conversation the run happened in.
+    pub conversation_id: String,
 }
 
 /// Where one piece of a role's ongoing work stands. Each task is a file in the
@@ -208,4 +247,33 @@ pub struct RoleFollowUpResponse {
     pub due_at: TimestampMs,
     /// Follow-ups this conversation now has waiting, this one included.
     pub pending: usize,
+}
+
+/// Stdin of `role report`: how the run ended. `summary` is the one line the
+/// user sees first, and may be left out of a silent run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoleReportRequest {
+    pub outcome: RoleReportOutcome,
+    #[serde(default)]
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleReportResponse {
+    pub outcome: RoleReportOutcome,
+    /// The report was kept among what the role has told the user. `false` for
+    /// a silent run.
+    pub recorded: bool,
+}
+
+/// Payload of the `role.reported` event: a run in `conversation_id` declared
+/// how it ended, before its turn completes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleReportedEvent {
+    pub conversation_id: String,
+    pub role_id: String,
+    pub outcome: RoleReportOutcome,
+    pub summary: String,
+    pub at: TimestampMs,
 }

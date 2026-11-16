@@ -151,6 +151,9 @@ pub struct TeamRoleBrief {
     pub verifies: bool,
     /// Work the role has under way, most recently touched first.
     pub progress: Vec<TeamRoleProgress>,
+    /// What the role last told the user from runs nobody watched, newest
+    /// first, one line each: when, `[say]` or `[ask]`, and the summary.
+    pub reported: Vec<String>,
 }
 
 /// One task a role has under way.

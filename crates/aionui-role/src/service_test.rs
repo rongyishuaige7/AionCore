@@ -559,3 +559,122 @@ async fn only_the_newest_replaced_memories_are_kept() {
         format!("MEMORY-2026-11-15-{:06}.md", MAX_MEMORY_ARCHIVES + 2)
     );
 }
+
+#[tokio::test]
+async fn what_a_role_told_the_user_is_kept_newest_first_with_the_conversation_it_came_from() {
+    let root = tempfile::tempdir().unwrap();
+    let service = service(&root);
+    service.upsert("builtin-office", request("", &[])).await.unwrap();
+
+    let first = service
+        .record_report(
+            "builtin-office",
+            RoleReportOutcome::Say,
+            "  the weekly figures\nare in  ",
+            "conv_1",
+            1_000,
+        )
+        .await
+        .unwrap()
+        .expect("a report that says something is kept");
+    assert_eq!(first.summary, "the weekly figures are in");
+    service
+        .record_report(
+            "builtin-office",
+            RoleReportOutcome::Ask,
+            "send it to finance as well?",
+            "conv_2",
+            2_000,
+        )
+        .await
+        .unwrap();
+
+    let reported = service.get("builtin-office").await.unwrap().reported;
+    assert_eq!(reported.len(), 2);
+    assert_eq!(reported[0].outcome, RoleReportOutcome::Ask);
+    assert_eq!(reported[0].conversation_id, "conv_2");
+    assert_eq!(reported[1], first);
+}
+
+#[tokio::test]
+async fn a_silent_run_leaves_nothing_behind() {
+    let root = tempfile::tempdir().unwrap();
+    let service = service(&root);
+    service.upsert("builtin-office", request("", &[])).await.unwrap();
+
+    let kept = service
+        .record_report(
+            "builtin-office",
+            RoleReportOutcome::Silent,
+            "nothing new",
+            "conv_1",
+            1_000,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(kept, None);
+    assert!(service.get("builtin-office").await.unwrap().reported.is_empty());
+}
+
+#[tokio::test]
+async fn a_report_needs_one_short_line_and_a_role_to_file_it_under() {
+    let root = tempfile::tempdir().unwrap();
+    let service = service(&root);
+    service.upsert("builtin-office", request("", &[])).await.unwrap();
+
+    for outcome in [RoleReportOutcome::Say, RoleReportOutcome::Ask] {
+        assert!(matches!(
+            service
+                .record_report("builtin-office", outcome, " \n ", "conv_1", 1)
+                .await,
+            Err(RoleError::InvalidRequest(_))
+        ));
+    }
+    let long = "x".repeat(MAX_REPORT_SUMMARY_CHARS + 1);
+    assert!(matches!(
+        service
+            .record_report("builtin-office", RoleReportOutcome::Say, &long, "conv_1", 1)
+            .await,
+        Err(RoleError::InvalidRequest(_))
+    ));
+    assert!(matches!(
+        service
+            .record_report("builtin-research", RoleReportOutcome::Say, "done", "conv_1", 1)
+            .await,
+        Err(RoleError::NotFound(_))
+    ));
+}
+
+#[tokio::test]
+async fn only_the_newest_reports_are_kept_and_a_line_that_does_not_parse_costs_only_itself() {
+    let root = tempfile::tempdir().unwrap();
+    let service = service(&root);
+    let role = service.upsert("builtin-office", request("", &[])).await.unwrap();
+
+    for at in 0..(MAX_KEPT_REPORTS as i64 + 3) {
+        service
+            .record_report(
+                "builtin-office",
+                RoleReportOutcome::Say,
+                &format!("report {at}"),
+                "conv_1",
+                at,
+            )
+            .await
+            .unwrap();
+    }
+    let reported = service.get("builtin-office").await.unwrap().reported;
+    assert_eq!(reported.len(), MAX_KEPT_REPORTS);
+    assert_eq!(reported[0].summary, format!("report {}", MAX_KEPT_REPORTS + 2));
+    assert_eq!(reported.last().unwrap().summary, "report 3");
+
+    let file = std::path::Path::new(&role.memory_dir).join("reported.jsonl");
+    let mut raw = std::fs::read_to_string(&file).unwrap();
+    raw.push_str("not json\n");
+    std::fs::write(&file, raw).unwrap();
+    assert_eq!(
+        service.get("builtin-office").await.unwrap().reported.len(),
+        MAX_KEPT_REPORTS
+    );
+}

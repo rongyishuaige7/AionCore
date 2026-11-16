@@ -14,7 +14,7 @@ use serde_json::{Map, Value};
 
 use crate::cli::{RoleArgs, RoleCommand};
 use crate::commands::role_capabilities::{
-    self, CURATE_FIELDS, FOLLOW_UP_FIELDS, Fields, PROGRESS_FIELDS, REMEMBER_FIELDS,
+    self, CURATE_FIELDS, FOLLOW_UP_FIELDS, Fields, PROGRESS_FIELDS, REMEMBER_FIELDS, REPORT_FIELDS,
 };
 
 const ENV_BASE_URL: &str = "AIONUI_BASE_URL";
@@ -41,6 +41,7 @@ async fn run_role_inner(args: RoleArgs) -> Result<(), ExitCode> {
         RoleCommand::Curate => write("role curate", "/api/runtime/role/curate", &CURATE_FIELDS).await,
         RoleCommand::Progress => write("role progress", "/api/runtime/role/progress", &PROGRESS_FIELDS).await,
         RoleCommand::FollowUp => write("role follow-up", "/api/runtime/role/follow-up", &FOLLOW_UP_FIELDS).await,
+        RoleCommand::Report => write("role report", "/api/runtime/role/report", &REPORT_FIELDS).await,
         RoleCommand::Unknown(path) => Err(unknown_command(path)),
     }
 }
@@ -251,6 +252,14 @@ mod tests {
             assert!(env("user_1", broken, "tok_1").headers("role show").is_err());
             assert!(env("user_1", "conv_1", broken).headers("role show").is_err());
         }
+    }
+
+    #[test]
+    fn report_takes_an_outcome_and_an_optional_summary() {
+        assert!(checked_fields(&REPORT_FIELDS, json!({ "outcome": "silent" })).is_ok());
+        assert!(checked_fields(&REPORT_FIELDS, json!({ "outcome": "say", "summary": "figures are in" })).is_ok());
+        assert!(checked_fields(&REPORT_FIELDS, json!({ "summary": "figures are in" })).is_err());
+        assert!(checked_fields(&REPORT_FIELDS, json!({ "outcome": "say", "note": "x" })).is_err());
     }
 
     #[test]

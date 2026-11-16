@@ -164,8 +164,8 @@ pub use response::{ApiResponse, ErrorResponse};
 pub use role::{
     ROLE_CLI_SCHEMA_VERSION, RoleCliEnvelope, RoleCliError, RoleCliErrorCode, RoleCliMeta, RoleCurateRequest,
     RoleCurateResponse, RoleFollowUpRequest, RoleFollowUpResponse, RoleListResponse, RoleProgress, RoleProgressRequest,
-    RoleProgressResponse, RoleRememberRequest, RoleRememberResponse, RoleResponse, UpdateRoleMemoryRequest,
-    UpsertRoleRequest,
+    RoleProgressResponse, RoleRememberRequest, RoleRememberResponse, RoleReport, RoleReportOutcome, RoleReportRequest,
+    RoleReportResponse, RoleReportedEvent, RoleResponse, UpdateRoleMemoryRequest, UpsertRoleRequest,
 };
 pub use runtime::{
     EnsureNodeRuntimeRequest, EnsureNodeRuntimeResponse, RuntimeFailureKind, RuntimeResourceKind, RuntimeStatusPayload,

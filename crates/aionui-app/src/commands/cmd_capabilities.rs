@@ -156,7 +156,7 @@ fn data() -> Value {
             {
                 "name": "role",
                 "mode": "role-memory",
-                "description": "For a conversation run as a resident role: read the role's whole memory and the work it has under way, add a note to the memory, record where a task stands, and set a follow-up that brings a matter back later.",
+                "description": "For a conversation run as a resident role: read the role's whole memory and the work it has under way, add a note to the memory, record where a task stands, set a follow-up that brings a matter back later, and declare whether a run nobody watched has something for the user.",
                 "contract": "agent-facing-role-cli",
                 "contract_command": "role capabilities",
                 "invocation": "aioncore role capabilities",

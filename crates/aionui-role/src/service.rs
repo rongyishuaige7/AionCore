@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use aionui_api_types::{RoleProgress, RoleResponse, TeamToolName, UpsertRoleRequest};
+use aionui_api_types::{RoleProgress, RoleReport, RoleReportOutcome, RoleResponse, TeamToolName, UpsertRoleRequest};
 use aionui_common::now_ms;
 use tokio::sync::Mutex;
 
@@ -25,6 +25,10 @@ pub const MAX_PROGRESS_STATE_CHARS: usize = 4_000;
 pub const MAX_PROGRESS_TASKS: usize = 40;
 /// Cap on a task name, in characters.
 pub const MAX_TASK_NAME_CHARS: usize = 48;
+/// Cap on the one line a role tells the user at the end of a run, in characters.
+pub const MAX_REPORT_SUMMARY_CHARS: usize = 300;
+/// How many of the things a role told the user are kept; older ones are dropped.
+pub const MAX_KEPT_REPORTS: usize = 30;
 const MAX_ROLE_ID_LEN: usize = 128;
 
 /// What [`RoleService::remember`] did with a note.
@@ -278,6 +282,53 @@ impl RoleService {
         Ok(ProgressUpdate { task, closed: false })
     }
 
+    /// Keep what the role told the user at the end of a run that nobody
+    /// watched, so that the next run knows it has been said and the user finds
+    /// it when they come back. A silent run tells the user nothing and leaves
+    /// nothing behind: `None`. The summary is flattened to one line; `say` and
+    /// `ask` need one.
+    pub async fn record_report(
+        &self,
+        id: &str,
+        outcome: RoleReportOutcome,
+        summary: &str,
+        conversation_id: &str,
+        at: i64,
+    ) -> Result<Option<RoleReport>, RoleError> {
+        validate_role_id(id)?;
+        let summary = summary.split_whitespace().collect::<Vec<_>>().join(" ");
+        if summary.chars().count() > MAX_REPORT_SUMMARY_CHARS {
+            return Err(RoleError::InvalidRequest(format!(
+                "a summary exceeds {MAX_REPORT_SUMMARY_CHARS} characters; the detail belongs in your reply"
+            )));
+        }
+        if outcome == RoleReportOutcome::Silent {
+            return Ok(None);
+        }
+        if summary.is_empty() {
+            return Err(RoleError::InvalidRequest(format!(
+                "`{}` needs a summary: the one line the user sees first",
+                outcome.as_str()
+            )));
+        }
+        if self.store.read_definition(id).await?.is_none() {
+            return Err(RoleError::NotFound(id.to_owned()));
+        }
+
+        let report = RoleReport {
+            at,
+            outcome,
+            summary,
+            conversation_id: conversation_id.to_owned(),
+        };
+        let _guard = self.memory_lock.lock().await;
+        let mut reports = self.store.read_reports(id).await?;
+        reports.push(report.clone());
+        let dropped = reports.len().saturating_sub(MAX_KEPT_REPORTS);
+        self.store.write_reports(id, &reports[dropped..]).await?;
+        Ok(Some(report))
+    }
+
     /// Dismiss the role. Its memory directory stays on disk and is picked up
     /// again if the role is defined anew.
     pub async fn remove(&self, id: &str) -> Result<(), RoleError> {
@@ -308,6 +359,11 @@ impl RoleService {
                     updated_at: file.updated_at,
                 })
                 .collect(),
+            reported: {
+                let mut reported = self.store.read_reports(id).await?;
+                reported.reverse();
+                reported
+            },
             created_at: definition.created_at,
             updated_at: definition.updated_at,
         })
