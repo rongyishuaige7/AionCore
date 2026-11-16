@@ -740,6 +740,16 @@ fn asks_first(mode: &str) -> bool {
     mode == ASK_FIRST_RUNTIME_MODE
 }
 
+/// The asking mode under the name `backend` has for it. codex has no `default`
+/// (its catalog is `read-only` / `auto` / `full-access`): the mode it starts in,
+/// where it asks before it reaches outside the workspace, is `auto`.
+fn ask_first_mode_for(backend: Option<&str>) -> &'static str {
+    match backend {
+        Some("codex") => "auto",
+        _ => ASK_FIRST_RUNTIME_MODE,
+    }
+}
+
 /// codex's canonical full-access mode id (migration 021 / `full_auto_mode_id`,
 /// `aionui_common::enums`). What cron's forced full-auto — and a resumed full-access
 /// session — persist as `required_runtime_mode`.
@@ -832,11 +842,15 @@ async fn apply_required_runtime_mode(
     // `yolo_id` it needs is only visible on the ACP manager's metadata.
     //
     // A turn that is to ask first is the one request that is not for full
-    // auto: it is applied as it stands, and an agent that has no such mode
-    // refuses it and fails the turn rather than running unasked.
-    if !asks_first(mode)
-        && let Some(app) = agent.apply_required_full_auto_mode().await?
-    {
+    // auto: it is applied under the name the backend has for it, and an agent
+    // that has no such mode refuses it and fails the turn rather than running
+    // unasked.
+    if asks_first(mode) {
+        let effective = ask_first_mode_for(backend).to_owned();
+        agent.set_config_option("mode", &effective).await?;
+        return Ok(RequiredFullAutoApplication::Applied { effective });
+    }
+    if let Some(app) = agent.apply_required_full_auto_mode().await? {
         return Ok(app);
     }
     // Retained legacy path for non-ACP variants (claude/codex Session, aionrs):
@@ -968,6 +982,14 @@ mod tests {
             normalize_required_mode_for_catalog(Some("codex"), "agent-full-access", &ids),
             "agent-full-access"
         );
+    }
+
+    #[test]
+    fn the_asking_mode_goes_by_the_name_each_backend_has_for_it() {
+        assert_eq!(ask_first_mode_for(Some("claude")), "default");
+        assert_eq!(ask_first_mode_for(None), "default");
+        // codex rejects `default`: its catalog is read-only / auto / full-access.
+        assert_eq!(ask_first_mode_for(Some("codex")), "auto");
     }
 
     #[test]
