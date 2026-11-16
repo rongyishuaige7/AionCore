@@ -2749,7 +2749,11 @@ async fn handle_reverse_rpc(
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(request_id.clone(), "Elicitation".to_string());
-            tracing::info!(session_id, kind = "Elicitation", "codex asks the user to approve a tool");
+            tracing::info!(
+                session_id,
+                kind = "Elicitation",
+                "codex asks the user to approve a tool"
+            );
             emit(
                 event_tx,
                 session_id,
@@ -5690,7 +5694,10 @@ mod tests {
         let captured = fake.captured_stdin();
         let _backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
         let written = captured_str(&captured).await;
-        assert!(written.contains(r#""id":7"#), "answer keyed to the request id, got: {written}");
+        assert!(
+            written.contains(r#""id":7"#),
+            "answer keyed to the request id, got: {written}"
+        );
         assert!(written.contains(r#""action":"accept""#), "accepted, got: {written}");
 
         let events = drive_codex(&[line]).await;
