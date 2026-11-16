@@ -2841,7 +2841,11 @@ async fn a_task_bound_to_a_conversation_with_an_inbox_goes_there_and_keeps_its_s
     assert_eq!(delivered.len(), 1);
     assert_eq!(delivered[0].0, "u1");
     assert_eq!(delivered[0].1, "conv_1");
-    assert!(delivered[0].2.contains("[Scheduled Task Execution]"), "{}", delivered[0].2);
+    assert!(
+        delivered[0].2.contains("[Scheduled Task Execution]"),
+        "{}",
+        delivered[0].2
+    );
     assert!(delivered[0].2.contains("test message"), "{}", delivered[0].2);
     assert!(conv_repo.take_messages().is_empty(), "no turn was started for it");
 
@@ -2859,7 +2863,11 @@ async fn a_task_bound_to_a_conversation_with_an_inbox_goes_there_and_keeps_its_s
         .into_iter()
         .filter(|artifact| artifact.kind == "cron_trigger")
         .collect();
-    assert_eq!(triggers.len(), 1, "the conversation shows which task the note came from");
+    assert_eq!(
+        triggers.len(),
+        1,
+        "the conversation shows which task the note came from"
+    );
     assert_eq!(triggers[0].conversation_id, "conv_1");
     assert_eq!(triggers[0].cron_job_id.as_deref(), Some(recurring.id.as_str()));
 }
