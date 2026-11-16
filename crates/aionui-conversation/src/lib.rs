@@ -45,6 +45,7 @@ pub use service::{
     ConversationAgentTurnStartedCallback, ConversationAgentTurnStatus, ConversationService,
 };
 pub use state::ConversationRouterState;
+pub use turn_orchestrator::ASK_FIRST_RUNTIME_MODE;
 
 #[cfg(test)]
 #[path = "service_test.rs"]

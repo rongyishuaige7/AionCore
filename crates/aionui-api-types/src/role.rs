@@ -20,6 +20,10 @@ pub struct RoleResponse {
     /// member marks completed is held until this role passes it.
     #[serde(default)]
     pub verifies: bool,
+    /// Whether a scheduled run of this role asks the user before it acts,
+    /// instead of running in full auto like any other scheduled task.
+    #[serde(default)]
+    pub asks_when_scheduled: bool,
     /// Contents of the role's `MEMORY.md`.
     pub memory: String,
     /// Absolute path of the role's memory directory on the backend host.
@@ -99,6 +103,8 @@ pub struct UpsertRoleRequest {
     pub denied_tools: Vec<String>,
     #[serde(default)]
     pub verifies: bool,
+    #[serde(default)]
+    pub asks_when_scheduled: bool,
 }
 
 /// Body of `PUT /api/roles/{id}/memory` — replace the role's `MEMORY.md`.

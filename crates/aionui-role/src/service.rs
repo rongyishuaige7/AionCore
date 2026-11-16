@@ -131,6 +131,7 @@ impl RoleService {
             charter,
             denied_tools,
             verifies: request.verifies,
+            asks_when_scheduled: request.asks_when_scheduled,
             created_at: existing.map_or(now, |existing| existing.created_at),
             updated_at: now,
         };
@@ -346,6 +347,7 @@ impl RoleService {
             charter: definition.charter,
             denied_tools: definition.denied_tools,
             verifies: definition.verifies,
+            asks_when_scheduled: definition.asks_when_scheduled,
             memory: self.store.read_memory(id).await?,
             memory_dir: self.store.memory_dir(id).to_string_lossy().into_owned(),
             progress: self

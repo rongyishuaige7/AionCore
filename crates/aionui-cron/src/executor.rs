@@ -8,7 +8,7 @@ use aionui_common::{
     AgentType, ProviderWithModel, WorkspacePathValidationError, now_ms, validate_workspace_path_availability,
 };
 use aionui_conversation::{
-    ConversationAgentTurnOutcome, ConversationAgentTurnRequest, ConversationAgentTurnStarted,
+    ASK_FIRST_RUNTIME_MODE, ConversationAgentTurnOutcome, ConversationAgentTurnRequest, ConversationAgentTurnStarted,
     ConversationAgentTurnStartedCallback, ConversationAgentTurnStatus, ConversationError, ConversationService,
 };
 use aionui_db::models::MessageRow;
@@ -65,6 +65,11 @@ pub trait CronRolePort: Send + Sync {
     /// charter, its memory and the work it left under way. `None` when the
     /// assistant is not a role or the role cannot be read.
     async fn standing_role(&self, assistant_id: &str) -> Option<String>;
+
+    /// Whether a scheduled run of this assistant asks the user before it acts
+    /// instead of running in full auto. `false` when the assistant is not a
+    /// role.
+    async fn asks_when_scheduled(&self, assistant_id: &str) -> bool;
 }
 
 /// Reaches the inbox of a conversation that has one — a team member's
@@ -172,15 +177,7 @@ impl JobExecutor {
         let Some(role_port) = &self.role_port else {
             return prompt;
         };
-        let assistant_id = match build_assistant_request(job) {
-            Some(assistant) => Some(assistant.id),
-            // A task bound to an existing conversation may not name its assistant.
-            None => match self.get_assistant_snapshot(conversation_id).await {
-                Ok(snapshot) => snapshot.map(|snapshot| snapshot.assistant_id),
-                Err(_) => None,
-            },
-        };
-        let Some(assistant_id) = assistant_id else {
+        let Some(assistant_id) = self.job_assistant_id(job, conversation_id).await else {
             return prompt;
         };
         match role_port.standing_role(&assistant_id).await {
@@ -190,6 +187,60 @@ impl JobExecutor {
             }
             None => prompt,
         }
+    }
+
+    /// The assistant a job runs as: the one it names, or failing that the one
+    /// its conversation was started with.
+    async fn job_assistant_id(&self, job: &CronJob, conversation_id: &str) -> Option<String> {
+        match build_assistant_request(job) {
+            Some(assistant) => Some(assistant.id),
+            // A task bound to an existing conversation may not name its assistant.
+            None => self.conversation_assistant_id(conversation_id).await,
+        }
+    }
+
+    async fn conversation_assistant_id(&self, conversation_id: &str) -> Option<String> {
+        match self.get_assistant_snapshot(conversation_id).await {
+            Ok(snapshot) => snapshot.map(|snapshot| snapshot.assistant_id),
+            Err(_) => None,
+        }
+    }
+
+    /// Whether scheduled runs of `assistant_id` ask the user before they act.
+    async fn asks_first(&self, assistant_id: Option<&str>) -> bool {
+        match (&self.role_port, assistant_id) {
+            (Some(role_port), Some(assistant_id)) => role_port.asks_when_scheduled(assistant_id).await,
+            _ => false,
+        }
+    }
+
+    /// Whether the assistant `conversation_id` was started with is a role whose
+    /// scheduled runs ask first.
+    async fn conversation_asks_first(&self, conversation_id: &str) -> bool {
+        if self.role_port.is_none() {
+            return false;
+        }
+        let assistant_id = self.conversation_assistant_id(conversation_id).await;
+        self.asks_first(assistant_id.as_deref()).await
+    }
+
+    /// The mode a run has to be in. A scheduled task runs with nobody there to
+    /// approve anything, so it asks for the full-auto mode it was set up with.
+    /// A role whose scheduled runs are to ask first gets the asking mode
+    /// instead, and its run waits where the agent wants an approval. A
+    /// follow-up keeps the mode of its conversation.
+    async fn required_runtime_mode(&self, job: &CronJob, conversation_id: &str) -> Option<String> {
+        if is_follow_up(job) {
+            return None;
+        }
+        if self.role_port.is_some() {
+            let assistant_id = self.job_assistant_id(job, conversation_id).await;
+            if self.asks_first(assistant_id.as_deref()).await {
+                info!(job_id = %job.id, conversation_id, "cron run asks before it acts, as its role requires");
+                return Some(ASK_FIRST_RUNTIME_MODE.to_owned());
+            }
+        }
+        cron_job_runtime_mode(job).map(ToOwned::to_owned)
     }
 
     pub async fn execute(&self, job: &CronJob) -> ExecutionResult {
@@ -448,6 +499,11 @@ impl JobExecutor {
         };
 
         let session_mode = session_mode.map(str::trim).filter(|value| !value.is_empty());
+        // The mode handed in is the full-auto one of the job. A role that asks
+        // first does not have it kept on its conversation, where the turns
+        // between its runs would find it.
+        let keeps_its_mode = session_mode.is_some() && self.conversation_asks_first(conversation_id).await;
+        let session_mode = if keeps_its_mode { None } else { session_mode };
         // Antigravity included: it too resolves a full-auto mode for scheduled
         // runs, and dropping it here left the job asking for approval nobody is
         // there to give — the run then stalls or, worse, proceeds once the CLI
@@ -702,8 +758,19 @@ impl JobExecutor {
         let model = resolve_model(job);
         let user_id = self.resolve_conversation_owner_user_id(job).await?;
 
-        let extra = build_conversation_extra(&self.agent_registry, job, saved_skill, purpose).await;
+        let mut extra = build_conversation_extra(&self.agent_registry, job, saved_skill, purpose).await;
         let assistant = build_assistant_request(job);
+        // The conversation of a role that asks first is not started in full auto.
+        if self
+            .asks_first(assistant.as_ref().map(|assistant| assistant.id.as_str()))
+            .await
+            && let Some(extra) = extra.as_object_mut()
+        {
+            extra.insert(
+                "session_mode".to_owned(),
+                serde_json::Value::String(ASK_FIRST_RUNTIME_MODE.to_owned()),
+            );
+        }
 
         let req = CreateConversationRequest {
             r#type: if assistant.is_some() { None } else { Some(agent_type) },
@@ -871,7 +938,7 @@ impl JobExecutor {
             content: prompt,
             files: vec![],
             inject_skills: skill_names.clone(),
-            required_runtime_mode: cron_job_runtime_mode(job).map(ToOwned::to_owned),
+            required_runtime_mode: self.required_runtime_mode(job, conversation_id).await,
             persist_user_message: true,
             user_message_hidden: true,
             on_started,
@@ -1260,11 +1327,12 @@ fn build_prompt(job: &CronJob, saved_skill: Option<&SavedSkillContext>) -> Strin
     }
 }
 
-/// The mode a run has to be in. A scheduled task runs with nobody there to
-/// approve anything, so it asks for the full-auto mode it was set up with. A
-/// follow-up is an agent carrying on in its own conversation: it keeps what
-/// that conversation is allowed and never raises it, or setting a timer would
-/// be a way out of the approvals the user asked for.
+/// The mode a job asks for by itself, before the role it runs as is heard. A
+/// scheduled task runs with nobody there to approve anything, so it asks for
+/// the full-auto mode it was set up with. A follow-up is an agent carrying on
+/// in its own conversation: it keeps what that conversation is allowed and
+/// never raises it, or setting a timer would be a way out of the approvals the
+/// user asked for.
 fn cron_job_runtime_mode(job: &CronJob) -> Option<&str> {
     if is_follow_up(job) {
         return None;
@@ -2135,6 +2203,51 @@ mod tests {
         assert_eq!(agent.set_mode_calls(), 0);
     }
 
+    /// A role port that says `assistant-sample` asks before it acts.
+    struct AskingRoles;
+
+    #[async_trait::async_trait]
+    impl CronRolePort for AskingRoles {
+        async fn standing_role(&self, _assistant_id: &str) -> Option<String> {
+            None
+        }
+
+        async fn asks_when_scheduled(&self, assistant_id: &str) -> bool {
+            assistant_id == "assistant-sample"
+        }
+    }
+
+    #[tokio::test]
+    async fn a_run_of_a_role_that_asks_first_takes_its_conversation_out_of_full_auto() {
+        // An earlier run left the conversation in full auto.
+        let agent = Arc::new(RecordingAgent::new("conv_1", "yolo", true));
+        let executor =
+            make_executor_with_agent(AgentInstance::Mock(agent.clone())).with_role_port(Arc::new(AskingRoles));
+        let mut job = sample_job();
+        job.agent_config.as_mut().unwrap().mode = Some("yolo".into());
+
+        let result = executor.execute_inner(&job, "conv_1", None).await;
+
+        assert_eq!(
+            result,
+            ExecutionResult::Success {
+                conversation_id: "conv_1".into()
+            }
+        );
+        wait_for_agent_send(&agent, 1).await;
+        assert_eq!(agent.mode().await, ASK_FIRST_RUNTIME_MODE);
+        assert_eq!(agent.set_mode_calls(), 1);
+
+        // The same task run as an assistant that does not ask stays in full auto.
+        let plain_agent = Arc::new(RecordingAgent::new("conv_1", "default", true));
+        let executor =
+            make_executor_with_agent(AgentInstance::Mock(plain_agent.clone())).with_role_port(Arc::new(AskingRoles));
+        job.agent_config.as_mut().unwrap().assistant_id = Some("assistant-plain".into());
+        executor.execute_inner(&job, "conv_1", None).await;
+        wait_for_agent_send(&plain_agent, 1).await;
+        assert_eq!(plain_agent.mode().await, "yolo");
+    }
+
     #[tokio::test]
     async fn execute_inner_applies_session_mode_to_active_conversation_runtime() {
         let agent = Arc::new(RecordingAgent::new("conv_1", "default", true));
@@ -2327,6 +2440,10 @@ mod tests {
         impl CronRolePort for Roles {
             async fn standing_role(&self, assistant_id: &str) -> Option<String> {
                 (assistant_id == "assistant-sample").then(|| "## Your Standing Role\n\nWatches the news.".to_owned())
+            }
+
+            async fn asks_when_scheduled(&self, _assistant_id: &str) -> bool {
+                false
             }
         }
 

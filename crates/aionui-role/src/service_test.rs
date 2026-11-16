@@ -13,6 +13,7 @@ fn request(charter: &str, denied: &[&str]) -> UpsertRoleRequest {
         charter: charter.to_owned(),
         denied_tools: denied.iter().map(|tool| (*tool).to_owned()).collect(),
         verifies: false,
+        asks_when_scheduled: false,
     }
 }
 
@@ -199,6 +200,42 @@ async fn the_reviewer_flag_is_saved_and_a_role_file_without_it_reads_as_not_revi
     )
     .unwrap();
     assert!(!service.get("old").await.unwrap().verifies);
+}
+
+#[tokio::test]
+async fn asking_when_scheduled_is_saved_and_a_role_file_without_it_reads_as_running_unasked() {
+    let root = tempfile::tempdir().unwrap();
+    let service = service(&root);
+
+    let saved = service
+        .upsert(
+            "careful",
+            UpsertRoleRequest {
+                asks_when_scheduled: true,
+                ..request("Touches production.", &[])
+            },
+        )
+        .await
+        .unwrap();
+    assert!(saved.asks_when_scheduled);
+    assert!(service.get("careful").await.unwrap().asks_when_scheduled);
+
+    // Saving the role again without the flag turns it off.
+    service
+        .upsert("careful", request("Touches production.", &[]))
+        .await
+        .unwrap();
+    assert!(!service.get("careful").await.unwrap().asks_when_scheduled);
+
+    // A role file written before the flag existed.
+    let old_dir = root.path().join("roles").join("old");
+    std::fs::create_dir_all(&old_dir).unwrap();
+    std::fs::write(
+        old_dir.join("role.json"),
+        r#"{"charter":"c","denied_tools":[],"created_at":1,"updated_at":1}"#,
+    )
+    .unwrap();
+    assert!(!service.get("old").await.unwrap().asks_when_scheduled);
 }
 
 #[tokio::test]

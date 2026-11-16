@@ -35,6 +35,10 @@ pub(crate) struct RoleDefinition {
     /// files written before the flag existed.
     #[serde(default)]
     pub verifies: bool,
+    /// Whether a scheduled run of the role asks the user before it acts.
+    /// Absent in role files written before the flag existed.
+    #[serde(default)]
+    pub asks_when_scheduled: bool,
     pub created_at: i64,
     pub updated_at: i64,
 }

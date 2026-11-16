@@ -735,6 +735,20 @@ impl aionui_cron::executor::CronRolePort for RoleServiceCronPort {
             }
         }
     }
+
+    async fn asks_when_scheduled(&self, assistant_id: &str) -> bool {
+        match self.roles.service.find(assistant_id).await {
+            Ok(role) => role.is_some_and(|role| role.asks_when_scheduled),
+            // An id that cannot name a role is an assistant that is not one.
+            Err(RoleError::InvalidId(_)) => false,
+            Err(error) => {
+                // A role that cannot be read may be one that asks: the run asks
+                // rather than acts unasked.
+                tracing::warn!(assistant_id, error = %error, "cron: role unreadable, its run asks before it acts");
+                true
+            }
+        }
+    }
 }
 
 /// The minute of a millisecond timestamp in the user's own time zone

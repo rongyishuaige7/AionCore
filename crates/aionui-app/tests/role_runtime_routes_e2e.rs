@@ -110,6 +110,7 @@ async fn define_role_as(fixture: &Fixture, role: &str, denied_tools: &[&str]) {
                 charter: "Checks work before it is called done.".into(),
                 denied_tools: denied_tools.iter().map(|tool| (*tool).to_owned()).collect(),
                 verifies: false,
+                asks_when_scheduled: false,
             },
         )
         .await

@@ -61,7 +61,7 @@ pub(crate) fn data() -> Value {
             "show": {
                 "runtime_env_required": RUNTIME_ENV,
                 "stdin": "none",
-                "data": "{ id, charter, memory, memory_dir, denied_tools, verifies, progress: [{ task, state, updated_at }], reported: [{ at, outcome, summary, conversation_id }] } — the whole memory, the full state of every task under way, and what the role last told the user"
+                "data": "{ id, charter, memory, memory_dir, denied_tools, verifies, asks_when_scheduled, progress: [{ task, state, updated_at }], reported: [{ at, outcome, summary, conversation_id }] } — the whole memory, the full state of every task under way, and what the role last told the user"
             },
             "remember": {
                 "runtime_env_required": RUNTIME_ENV,

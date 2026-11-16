@@ -731,6 +731,15 @@ fn terminal_is_auth_failure(outcome: &RelayOutcome) -> bool {
     )
 }
 
+/// The mode a turn requires when the user is to approve what it does: the name
+/// AionUi keeps for the mode in which an agent asks before it acts. A turn that
+/// requires any other mode is asking for full auto.
+pub const ASK_FIRST_RUNTIME_MODE: &str = "default";
+
+fn asks_first(mode: &str) -> bool {
+    mode == ASK_FIRST_RUNTIME_MODE
+}
+
 /// codex's canonical full-access mode id (migration 021 / `full_auto_mode_id`,
 /// `aionui_common::enums`). What cron's forced full-auto — and a resumed full-access
 /// session — persist as `required_runtime_mode`.
@@ -821,7 +830,13 @@ async fn apply_required_runtime_mode(
     // resolve cron's full-auto request to the backend-native YOLO id and apply
     // it look-before-leap. This logic is sunk into aionui-ai-agent because the
     // `yolo_id` it needs is only visible on the ACP manager's metadata.
-    if let Some(app) = agent.apply_required_full_auto_mode().await? {
+    //
+    // A turn that is to ask first is the one request that is not for full
+    // auto: it is applied as it stands, and an agent that has no such mode
+    // refuses it and fails the turn rather than running unasked.
+    if !asks_first(mode)
+        && let Some(app) = agent.apply_required_full_auto_mode().await?
+    {
         return Ok(app);
     }
     // Retained legacy path for non-ACP variants (claude/codex Session, aionrs):
