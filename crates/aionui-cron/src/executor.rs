@@ -1260,7 +1260,15 @@ fn build_prompt(job: &CronJob, saved_skill: Option<&SavedSkillContext>) -> Strin
     }
 }
 
+/// The mode a run has to be in. A scheduled task runs with nobody there to
+/// approve anything, so it asks for the full-auto mode it was set up with. A
+/// follow-up is an agent carrying on in its own conversation: it keeps what
+/// that conversation is allowed and never raises it, or setting a timer would
+/// be a way out of the approvals the user asked for.
 fn cron_job_runtime_mode(job: &CronJob) -> Option<&str> {
+    if is_follow_up(job) {
+        return None;
+    }
     job.agent_config
         .as_ref()
         .and_then(|config| config.mode.as_deref())
@@ -2100,6 +2108,31 @@ mod tests {
 
         let error = ExecutionResult::Error { message: "oops".into() };
         assert_eq!(error, ExecutionResult::Error { message: "oops".into() });
+    }
+
+    #[tokio::test]
+    async fn a_follow_up_runs_with_what_its_conversation_is_allowed_and_no_more() {
+        let agent = Arc::new(RecordingAgent::new("conv_1", "default", true));
+        let executor = make_executor_with_agent(AgentInstance::Mock(agent.clone()));
+        let mut job = sample_job();
+        job.agent_config.as_mut().unwrap().mode = Some("yolo".into());
+        job.created_by = CreatedBy::Agent;
+        job.schedule = CronSchedule::At {
+            at_ms: 1,
+            description: None,
+        };
+
+        let result = executor.execute_inner(&job, "conv_1", None).await;
+
+        assert_eq!(
+            result,
+            ExecutionResult::Success {
+                conversation_id: "conv_1".into()
+            }
+        );
+        wait_for_agent_send(&agent, 1).await;
+        assert_eq!(agent.mode().await, "default");
+        assert_eq!(agent.set_mode_calls(), 0);
     }
 
     #[tokio::test]
