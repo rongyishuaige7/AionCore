@@ -181,6 +181,13 @@ pub struct McpServerSpec {
     pub transport: McpTransport,
 }
 
+/// Name of the MCP server that carries a resident role's own tools (how a run
+/// ended, follow-ups, memory). A codex session gets it because codex starts MCP
+/// servers outside the sandbox its shell commands run in, where the role helper
+/// has no network; the codex backend answers that server's approval requests
+/// itself, since they only touch the role's own records.
+pub const ROLE_MCP_SERVER_NAME: &str = "aionui-role";
+
 /// MCP transport variants (SDK-free mirror of the neutral session-snapshot shape).
 #[derive(Debug, Clone, PartialEq)]
 pub enum McpTransport {

@@ -88,6 +88,7 @@ async fn async_main(merged_path: String, cli: Cli) -> Result<ExitCode, MainError
         Some(Command::Role(args)) => Ok(commands::run_role(args).await),
         Some(Command::AntigravityHook) => Ok(commands::run_antigravity_hook().await),
         Some(Command::McpTeamStdio) => Ok(commands::run_team_stdio().await),
+        Some(Command::McpRoleStdio) => Ok(commands::run_role_stdio().await),
         Some(Command::Doctor) => Ok(commands::run_doctor(&cli, &merged_path).await?),
         Some(Command::User(ref args)) => Ok(commands::run_user(&cli, args).await?),
         Some(Command::Secret(ref args)) => Ok(commands::run_secret(&cli, args).await?),

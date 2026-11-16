@@ -2708,6 +2708,29 @@ async fn handle_reverse_rpc(
         // a transparent dispatch-side discriminator. `serverRequest/resolved` already
         // emits the matching PermissionResolved{Tool} on answer.
         "mcpServer/elicitation/request" => {
+            // The resident-role server never asks for a form, so what arrives from
+            // it is codex asking whether a role tool may run. Those tools write
+            // only the role's own records (how the run ended, a follow-up, its
+            // memory), and a run waiting for the user on its own report would turn
+            // the report into a question. Accept at once.
+            let server = frame
+                .get("params")
+                .and_then(|p| p.get("serverName"))
+                .and_then(Value::as_str);
+            if server == Some(crate::backend::ROLE_MCP_SERVER_NAME) {
+                write_reverse_result(stdin, &id, json!({ "action": "accept", "content": {} })).await;
+                tracing::info!(session_id, "codex role tool approved without asking the user");
+                emit(
+                    event_tx,
+                    session_id,
+                    cur,
+                    SessionEvent::AdapterSpecific {
+                        tag: "codex_role_tool_approved".into(),
+                        payload: json!({ "method": method, "id": id }),
+                    },
+                );
+                return;
+            }
             let request_id = format!("{ELICIT_PREFIX}{id}");
             // Carry the elicitation context so the conversation can render a form /
             // approval prompt: the message, the requested schema, and the mode.
@@ -2781,7 +2804,25 @@ async fn write_reverse_error(
     if id.is_null() {
         return; // a notification, not a request — nothing to answer
     }
-    let frame = json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } });
+    write_reverse_frame(
+        stdin,
+        json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } }),
+    )
+    .await;
+}
+
+/// Write a JSON-RPC RESULT response to a reverse-RPC the backend answers on its
+/// own (no human decides). Best-effort, like [`write_reverse_error`].
+async fn write_reverse_result(stdin: &Arc<Mutex<Option<aionui_process::BoxedStdin>>>, id: &Value, result: Value) {
+    if id.is_null() {
+        return; // a notification, not a request — nothing to answer
+    }
+    write_reverse_frame(stdin, json!({ "jsonrpc": "2.0", "id": id, "result": result })).await;
+}
+
+/// Write one line-delimited frame to the shared stdin; a closed stdin means the
+/// process is gone and the turn is ending anyway.
+async fn write_reverse_frame(stdin: &Arc<Mutex<Option<aionui_process::BoxedStdin>>>, frame: Value) {
     let mut guard = stdin.lock().await;
     let Some(w) = guard.as_mut() else { return };
     use tokio::io::AsyncWriteExt;
@@ -2897,7 +2938,12 @@ fn map_notification(method: &str, params: &Value) -> Vec<SessionEvent> {
                 .and_then(Value::as_str)
                 .map(str::to_string)
                 .unwrap_or_default();
-            let phase = match params.get("status").and_then(Value::as_str).unwrap_or("") {
+            let status = params.get("status").and_then(Value::as_str).unwrap_or("");
+            // Whether the role tools reached codex is otherwise visible nowhere.
+            if params.get("name").and_then(Value::as_str) == Some(crate::backend::ROLE_MCP_SERVER_NAME) {
+                tracing::info!(status, error = %reason, "codex role tools server status");
+            }
+            let phase = match status {
                 "starting" => ProvisioningPhase::ToolsWaiting,
                 "ready" => ProvisioningPhase::ToolsReady,
                 "failed" => ProvisioningPhase::LoadFailed { reason },
@@ -5629,6 +5675,25 @@ mod tests {
         assert_eq!(input["message"], "Pick a color");
         assert_eq!(input["mode"], "form");
         assert!(input["requestedSchema"]["properties"].get("color").is_some());
+    }
+
+    #[tokio::test]
+    async fn a_role_tool_approval_is_accepted_without_raising_a_card() {
+        // codex asks whether a tool of the resident-role server may run: the
+        // backend accepts at once, keyed to the request id, and nobody is asked.
+        let line = r#"{"jsonrpc":"2.0","id":7,"method":"mcpServer/elicitation/request","params":{"serverName":"aionui-role","threadId":"th1","mode":"form","message":"Allow role_report?","requestedSchema":{"type":"object","properties":{}}}}"#;
+        let fake = FakeAgentIo::never_exits(format!("{line}\n").into_bytes());
+        let captured = fake.captured_stdin();
+        let _backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        let written = captured_str(&captured).await;
+        assert!(written.contains(r#""id":7"#), "answer keyed to the request id, got: {written}");
+        assert!(written.contains(r#""action":"accept""#), "accepted, got: {written}");
+
+        let events = drive_codex(&[line]).await;
+        assert!(
+            !events.iter().any(|e| matches!(e, SessionEvent::Permission { .. })),
+            "a role tool raises no approval card, got {events:?}"
+        );
     }
 
     #[tokio::test]

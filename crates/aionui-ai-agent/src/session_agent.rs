@@ -1963,6 +1963,17 @@ pub async fn build_session_instance(
         coordination.append(&mut mcp_servers);
         mcp_servers = coordination;
     }
+    // Codex runs an agent's shell commands in a sandbox that has no network in
+    // its workspace tier, so the role helper cannot reach the backend there and
+    // a role run's declaration is lost. Codex starts MCP servers outside that
+    // sandbox, so the role tools ride along as one. A conversation that is not a
+    // role is shown no tools by it.
+    if backend_label == "codex" {
+        mcp_servers.retain(|server| server.name != aionui_session::ROLE_MCP_SERVER_NAME);
+        if let Some(role_tools) = role_mcp_server_spec(runtime_env) {
+            mcp_servers.push(role_tools);
+        }
+    }
 
     // GAP #4 — preset_context + skills carried into the init surface.
     let init = SessionInit {
@@ -2364,6 +2375,44 @@ fn team_mcp_server_spec(cfg: &aionui_api_types::TeamMcpStdioConfig) -> aionui_se
             ],
         },
     }
+}
+
+/// The resident-role tools as a stdio MCP server (`aioncore mcp-role-stdio`),
+/// launched with the same runtime context the role helper reads from its env.
+/// `None` when that context is incomplete: the server could not reach the
+/// backend, so it is better left out.
+fn role_mcp_server_spec(runtime_env: &[(String, String)]) -> Option<aionui_session::McpServerSpec> {
+    use crate::types::{
+        AIONUI_BASE_URL_ENV, AIONUI_CONVERSATION_ID_ENV, AIONUI_HELPER_BIN_ENV, AIONUI_RUNTIME_TOKEN_ENV,
+        AIONUI_USER_ID_ENV,
+    };
+    // The last entry wins, as it does when the env is applied to a process.
+    let value = |name: &str| {
+        runtime_env
+            .iter()
+            .rev()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.clone())
+            .filter(|value| !value.is_empty())
+    };
+    let command = value(AIONUI_HELPER_BIN_ENV)?;
+    let env = [
+        AIONUI_BASE_URL_ENV,
+        AIONUI_USER_ID_ENV,
+        AIONUI_CONVERSATION_ID_ENV,
+        AIONUI_RUNTIME_TOKEN_ENV,
+    ]
+    .into_iter()
+    .map(|name| value(name).map(|value| (name.to_owned(), value)))
+    .collect::<Option<Vec<_>>>()?;
+    Some(aionui_session::McpServerSpec {
+        name: aionui_session::ROLE_MCP_SERVER_NAME.to_owned(),
+        transport: aionui_session::McpTransport::Stdio {
+            command,
+            args: vec!["mcp-role-stdio".to_owned()],
+            env,
+        },
+    })
 }
 
 /// GAP #7 (G5): spawn the one-shot catalog write-back for a session-model
@@ -5530,6 +5579,42 @@ mod build_mapping_tests {
                 "Http+StreamableHttp → Http"
             );
         }
+    }
+
+    #[test]
+    fn the_role_tools_server_carries_the_runtime_context_and_needs_all_of_it() {
+        use aionui_session::McpTransport;
+
+        let full: Vec<(String, String)> = [
+            ("AIONUI_USER_ID", "user-1"),
+            ("AIONUI_CONVERSATION_ID", "conv-1"),
+            ("AIONUI_HELPER_BIN", "/opt/aioncore"),
+            ("AIONUI_BASE_URL", "http://127.0.0.1:25808"),
+            ("AIONUI_RUNTIME_TOKEN", "runtime-token-1"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect();
+        let spec = role_mcp_server_spec(&full).expect("a complete context gives the server");
+        assert_eq!(spec.name, aionui_session::ROLE_MCP_SERVER_NAME);
+        match spec.transport {
+            McpTransport::Stdio { command, args, env } => {
+                assert_eq!(command, "/opt/aioncore");
+                assert_eq!(args, vec!["mcp-role-stdio".to_owned()]);
+                assert_eq!(env.len(), 4);
+                assert!(env.contains(&("AIONUI_RUNTIME_TOKEN".to_owned(), "runtime-token-1".to_owned())));
+                assert!(env.contains(&("AIONUI_CONVERSATION_ID".to_owned(), "conv-1".to_owned())));
+                assert!(!env.iter().any(|(key, _)| key == "AIONUI_HELPER_BIN"));
+            }
+            other => panic!("expected Stdio, got {other:?}"),
+        }
+
+        let without_token: Vec<(String, String)> = full
+            .iter()
+            .filter(|(key, _)| key != "AIONUI_RUNTIME_TOKEN")
+            .cloned()
+            .collect();
+        assert!(role_mcp_server_spec(&without_token).is_none());
     }
 }
 

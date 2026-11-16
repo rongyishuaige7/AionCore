@@ -64,6 +64,13 @@ fn render(brief: &TeamRoleBrief, setting: Setting) -> String {
         "You are a resident role. The charter and memory below stay with you across every scheduled run and \
          every team you join.\n\n"
     });
+    // A codex session carries the helper's commands as MCP tools as well, which
+    // reach the backend from where codex's sandbox keeps the shell offline.
+    out.push_str(&format!(
+        "Where a `{ROLE_HELPER} <command>` call is shown below and your tools include `role_<command>` (a dash \
+         becomes an underscore), call that tool with the same fields instead: it reaches the backend even where \
+         your shell cannot.\n\n"
+    ));
 
     let charter = brief.charter.trim();
     if !charter.is_empty() {
@@ -397,6 +404,16 @@ mod tests {
             "{in_team}"
         );
         assert!(in_team.contains("as a message in your mailbox"), "{in_team}");
+    }
+
+    #[test]
+    fn a_role_is_told_to_use_its_tools_instead_of_the_helper_where_it_has_them() {
+        for section in [render_scheduled_standing_role(&brief()), render_standing_role(&brief())] {
+            assert!(
+                section.contains("your tools include `role_<command>` (a dash becomes an underscore)"),
+                "{section}"
+            );
+        }
     }
 
     #[test]

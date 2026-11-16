@@ -184,6 +184,10 @@ fn data() -> Value {
                 "description": "Internal team MCP stdio server."
             },
             {
+                "name": "mcp-role-stdio",
+                "description": "Internal MCP stdio server carrying the role commands as tools, started by codex outside its sandbox."
+            },
+            {
                 "name": "prepare-managed-resources",
                 "description": "Packaging helper for managed runtime resources."
             },

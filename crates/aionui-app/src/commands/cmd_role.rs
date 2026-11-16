@@ -71,7 +71,10 @@ async fn write(command: &str, path: &str, fields: &Fields) -> Result<(), ExitCod
     print_response(command, response).await
 }
 
-struct RuntimeEnv {
+/// The runtime context a role call is made in. Shared with the role MCP server
+/// (`cmd_role_stdio.rs`), which makes the same calls.
+#[derive(Clone)]
+pub(crate) struct RuntimeEnv {
     base_url: String,
     user_id: String,
     conversation_id: String,
@@ -79,44 +82,51 @@ struct RuntimeEnv {
 }
 
 impl RuntimeEnv {
-    fn url(&self, path: &str) -> String {
+    /// Reads the four runtime variables; on failure, the name of the first one missing.
+    pub(crate) fn from_env() -> Result<Self, &'static str> {
+        let read = |name: &'static str| std::env::var(name).map_err(|_| name);
+        Ok(Self {
+            base_url: read(ENV_BASE_URL)?,
+            user_id: read(ENV_USER_ID)?,
+            conversation_id: read(ENV_CONVERSATION_ID)?,
+            runtime_token: read(ENV_RUNTIME_TOKEN)?,
+        })
+    }
+
+    pub(crate) fn url(&self, path: &str) -> String {
         format!("{}{path}", self.base_url.trim_end_matches('/'))
     }
 
-    /// Fallible on purpose: a malformed `AIONUI_*` value must come back as an
-    /// envelope, not a panic (same reasoning as `cmd_session.rs`).
-    fn headers(&self, command: &str) -> Result<reqwest::header::HeaderMap, ExitCode> {
+    /// The three runtime headers; on failure, the name of the header whose
+    /// value is not a valid header value. Fallible on purpose: a malformed
+    /// `AIONUI_*` value must come back as an error, not a panic (same reasoning
+    /// as `cmd_session.rs`).
+    pub(crate) fn header_map(&self) -> Result<reqwest::header::HeaderMap, &'static str> {
         let mut headers = reqwest::header::HeaderMap::new();
         for (name, value) in [
             ("x-aionui-user-id", &self.user_id),
             ("x-aionui-conversation-id", &self.conversation_id),
             ("x-aionui-runtime-token", &self.runtime_token),
         ] {
-            let parsed = value.parse().map_err(|_| {
-                // The NAME only — a token must never reach stdout or stderr.
-                transport_error(
-                    command,
-                    "ROLE_CLI_HEADER_INVALID",
-                    format!("environment variable for {name} is not a valid header value"),
-                )
-            })?;
-            headers.insert(name, parsed);
+            headers.insert(name, value.parse().map_err(|_| name)?);
         }
         Ok(headers)
+    }
+
+    fn headers(&self, command: &str) -> Result<reqwest::header::HeaderMap, ExitCode> {
+        self.header_map().map_err(|name| {
+            // The NAME only — a token must never reach stdout or stderr.
+            transport_error(
+                command,
+                "ROLE_CLI_HEADER_INVALID",
+                format!("environment variable for {name} is not a valid header value"),
+            )
+        })
     }
 }
 
 fn runtime_env(command: &str) -> Result<RuntimeEnv, ExitCode> {
-    Ok(RuntimeEnv {
-        base_url: required_env(command, ENV_BASE_URL)?,
-        user_id: required_env(command, ENV_USER_ID)?,
-        conversation_id: required_env(command, ENV_CONVERSATION_ID)?,
-        runtime_token: required_env(command, ENV_RUNTIME_TOKEN)?,
-    })
-}
-
-fn required_env(command: &str, name: &'static str) -> Result<String, ExitCode> {
-    std::env::var(name).map_err(|_| {
+    RuntimeEnv::from_env().map_err(|name| {
         transport_error(
             command,
             "ROLE_CLI_ENV_MISSING",
