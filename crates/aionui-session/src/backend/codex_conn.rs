@@ -2675,6 +2675,8 @@ async fn handle_reverse_rpc(
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(request_id.clone(), title.to_string());
+            // The approval class only, never the command (TIO-13).
+            tracing::info!(session_id, kind = title, "codex asks the user to approve a tool");
             emit(
                 event_tx,
                 session_id,
@@ -2747,6 +2749,7 @@ async fn handle_reverse_rpc(
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(request_id.clone(), "Elicitation".to_string());
+            tracing::info!(session_id, kind = "Elicitation", "codex asks the user to approve a tool");
             emit(
                 event_tx,
                 session_id,
@@ -4527,6 +4530,7 @@ impl SessionBackend for CodexSessionBackend {
                     })
                 };
                 self.write_frame(frame).await?;
+                tracing::info!(decision = decision_str, "codex approval answered by the user");
                 // We answered it → drop from the REST-recovery registry so a
                 // subsequent GET /confirmations no longer resurfaces a card the user
                 // already resolved. `request_id` is the exact stored key (raw for
