@@ -2325,6 +2325,18 @@ mod codex_perm {
         profile_id_to_legacy_value(&normalize_to_profile_id(mode))
     }
 
+    /// The approval policy that goes with a built-in tier, the same pairing
+    /// thread/start makes from the mode a thread opens in: full access runs
+    /// unattended (`never`), the other tiers ask when the sandbox stops something
+    /// (`on-request`). `None` for a custom profile, whose policy is left alone.
+    pub(super) fn approval_for_profile_id(profile_id: &str) -> Option<&'static str> {
+        match profile_id {
+            ":danger-full-access" => Some("never"),
+            ":workspace" | ":read-only" => Some("on-request"),
+            _ => None,
+        }
+    }
+
     /// Friendly display `(name, description)` for a built-in codex permission profile.
     ///
     /// codex's `permissionProfile/list` returns the built-in profiles with `description:
@@ -4255,12 +4267,22 @@ impl SessionBackend for CodexSessionBackend {
                     .lock()
                     .await
                     .insert(id, format!("mode\u{2192}{profile_id}"));
+                let mut params = json!({
+                    "threadId": tid,
+                    "permissions": profile_id
+                });
+                // The approval policy is set once at thread/start from the mode the
+                // thread opened in, and `permissions` does not touch it. A thread
+                // opened in full access keeps `never` after a switch to the workspace
+                // tier, so codex refuses what the sandbox stops instead of asking.
+                // The policy travels with the tier (codex 0.156.1 accepts both in
+                // one update; only `sandboxPolicy` excludes `permissions`).
+                if let Some(approval) = codex_perm::approval_for_profile_id(&profile_id) {
+                    params["approvalPolicy"] = json!(approval);
+                }
                 let frame = json!({
                     "jsonrpc": "2.0", "id": id, "method": "thread/settings/update",
-                    "params": {
-                        "threadId": tid,
-                        "permissions": profile_id
-                    }
+                    "params": params
                 });
                 self.write_frame(frame).await?;
                 Ok(CommandReceipt {
@@ -7494,6 +7516,47 @@ mod tests {
         assert!(
             !written.contains(r#""permissions":"danger-full-access""#),
             "must NOT strip the mandatory leading colon, got: {written}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_set_mode_carries_the_approval_policy_of_the_tier() {
+        // A thread opened in full access starts with approvalPolicy `never`, and a
+        // permissions switch alone leaves it there: codex then refuses what the
+        // workspace sandbox stops instead of asking. The policy travels with the tier.
+        for (mode, approval) in [
+            ("auto", "on-request"),
+            (":read-only", "on-request"),
+            ("full-access", "never"),
+        ] {
+            let fake = fake_with_binding("th-6", None);
+            let captured = fake.captured_stdin();
+            let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+            backend
+                .dispatch(Command::SetMode { mode: mode.into() })
+                .await
+                .expect("accepted");
+            let written = captured_str(&captured).await;
+            assert!(
+                written.contains(&format!(r#""approvalPolicy":"{approval}""#)),
+                "mode {mode} carries approvalPolicy {approval}, got: {written}"
+            );
+        }
+
+        // A custom profile's policy is the user's own: nothing is sent for it.
+        let fake = fake_with_binding("th-6", None);
+        let captured = fake.captured_stdin();
+        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        backend
+            .dispatch(Command::SetMode {
+                mode: ":my-profile".into(),
+            })
+            .await
+            .expect("accepted");
+        let written = captured_str(&captured).await;
+        assert!(
+            !written.contains("approvalPolicy"),
+            "a custom profile leaves the approval policy alone, got: {written}"
         );
     }
 
