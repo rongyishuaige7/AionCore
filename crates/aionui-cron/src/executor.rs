@@ -121,20 +121,22 @@ impl JobExecutor {
         }
     }
 
-    /// Wires the inbox a follow-up is delivered to when its conversation has
-    /// one. Without it every follow-up is delivered as a turn. Set once; a
-    /// second call is ignored.
+    /// Wires the inbox a run is delivered to when its conversation has one.
+    /// Without it every run is delivered as a turn. Set once; a second call is
+    /// ignored.
     pub fn set_inbox_port(&self, inbox_port: Arc<dyn CronInboxPort>) {
         let _ = self.inbox_port.set(inbox_port);
     }
 
-    /// Delivers a follow-up that came due through its conversation's inbox,
-    /// when the conversation has one: the note takes its place behind
-    /// whatever is already waiting there, and no run is started here. `None`
-    /// when the job is not a follow-up or the conversation has no inbox, and
-    /// the job then runs as a turn.
-    pub(crate) async fn deliver_follow_up_to_inbox(&self, job: &CronJob) -> Option<ExecutionResult> {
-        if !is_follow_up(job) {
+    /// Delivers a run that came due in an existing conversation through that
+    /// conversation's inbox, when it has one — a follow-up and a scheduled
+    /// task alike. The note takes its place behind whatever is already
+    /// waiting there and runs in the mode the inbox's owner gave the
+    /// conversation; no run is started here, behind its back. `None` when the
+    /// job starts a conversation of its own or the conversation has no inbox,
+    /// and the job then runs as a turn.
+    pub(crate) async fn deliver_to_inbox(&self, job: &CronJob) -> Option<ExecutionResult> {
+        if job.execution_mode != ExecutionMode::Existing {
             return None;
         }
         let inbox = self.inbox_port.get()?;
@@ -142,19 +144,36 @@ impl JobExecutor {
         if conversation_id.is_empty() {
             return None;
         }
+        let kind = if is_follow_up(job) {
+            "follow-up"
+        } else {
+            "scheduled task"
+        };
         match inbox
-            .deliver(&job.user_id, conversation_id, &build_follow_up_prompt(&job.message))
+            .deliver(&job.user_id, conversation_id, &build_prompt(job, None))
             .await
         {
             Ok(true) => {
-                info!(job_id = %job.id, conversation_id, "follow-up delivered to its conversation's inbox");
+                info!(job_id = %job.id, conversation_id, kind, "cron run delivered to its conversation's inbox");
+                // A task stays, so its card links the note to it; a delivered
+                // follow-up is removed and would leave the card pointing nowhere.
+                if !is_follow_up(job) {
+                    record_cron_trigger(
+                        &self.conversation_repo,
+                        &self.broadcaster,
+                        &job.user_id,
+                        conversation_id,
+                        job,
+                    )
+                    .await;
+                }
                 Some(ExecutionResult::Success {
                     conversation_id: conversation_id.to_owned(),
                 })
             }
             Ok(false) => None,
             Err(message) => {
-                warn!(job_id = %job.id, conversation_id, error = %message, "follow-up could not reach its inbox");
+                warn!(job_id = %job.id, conversation_id, kind, error = %message, "cron run could not reach its inbox");
                 // Tried again like a busy conversation; the last failure is kept.
                 Some(match self.handle_busy(job) {
                     ExecutionResult::Skipped => ExecutionResult::Error { message },
@@ -905,28 +924,14 @@ impl JobExecutor {
                 let conversation_repo = Arc::clone(&conversation_repo);
                 let broadcaster = Arc::clone(&broadcaster);
                 let fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> = Box::pin(async move {
-                    let created_at = now_ms();
-                    let row = build_cron_trigger_artifact(&started.conversation_id, &job, created_at);
-                    match conversation_repo.upsert_artifact(&user_id, &row).await {
-                        Ok(row) => {
-                            if let Err(e) = broadcast_artifact(&broadcaster, &user_id, &row) {
-                                warn!(
-                                    job_id = %job.id,
-                                    conversation_id = %started.conversation_id,
-                                    error = %e,
-                                    "Failed to broadcast cron trigger artifact"
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            warn!(
-                                job_id = %job.id,
-                                conversation_id = %started.conversation_id,
-                                error = %e,
-                                "Failed to persist cron trigger artifact"
-                            );
-                        }
-                    }
+                    record_cron_trigger(
+                        &conversation_repo,
+                        &broadcaster,
+                        &user_id,
+                        &started.conversation_id,
+                        &job,
+                    )
+                    .await;
                 });
                 fut
             }) as ConversationAgentTurnStartedCallback)
@@ -1307,6 +1312,28 @@ async fn build_task_extra(registry: &AgentRegistry, job: &CronJob, skills: &[Str
     }
 
     serde_json::Value::Object(extra)
+}
+
+/// Leaves the card that names the task a run came from in its conversation
+/// and tells open clients about it. A failure is logged; the run goes on.
+async fn record_cron_trigger(
+    conversation_repo: &Arc<dyn IConversationRepository>,
+    broadcaster: &Arc<dyn EventBroadcaster>,
+    user_id: &str,
+    conversation_id: &str,
+    job: &CronJob,
+) {
+    let row = build_cron_trigger_artifact(conversation_id, job, now_ms());
+    match conversation_repo.upsert_artifact(user_id, &row).await {
+        Ok(row) => {
+            if let Err(e) = broadcast_artifact(broadcaster, user_id, &row) {
+                warn!(job_id = %job.id, conversation_id, error = %e, "Failed to broadcast cron trigger artifact");
+            }
+        }
+        Err(e) => {
+            warn!(job_id = %job.id, conversation_id, error = %e, "Failed to persist cron trigger artifact");
+        }
+    }
 }
 
 fn build_prompt(job: &CronJob, saved_skill: Option<&SavedSkillContext>) -> String {

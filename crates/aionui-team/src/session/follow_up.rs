@@ -1,4 +1,5 @@
-//! Brings a follow-up back to the member that set it.
+//! Brings a follow-up back to the member that set it, and a scheduled task to
+//! the member whose conversation it is bound to.
 //!
 //! A member's timer never starts a run of its own. When it comes due the note
 //! is put in the member's mailbox like any other message, so it takes its

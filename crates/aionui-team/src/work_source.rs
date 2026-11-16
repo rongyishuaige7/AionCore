@@ -28,9 +28,10 @@ pub(crate) enum WorkSource {
     /// reminded of its share. Never resumes a paused slot: a member the user
     /// stopped stays stopped.
     AutoContinue,
-    /// A timer the member set for itself came due. Takes its turn like a
-    /// teammate's message. Never resumes a paused slot: the note waits for
-    /// the user to resume the member.
+    /// A timer came due: one the member set for itself, or a scheduled task
+    /// bound to its conversation. Takes its turn like a teammate's message.
+    /// Never resumes a paused slot: the note waits for the user to resume the
+    /// member.
     FollowUp,
 }
 

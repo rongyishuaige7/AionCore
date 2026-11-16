@@ -698,8 +698,9 @@ impl aionui_team::TeamRolePort for RoleServiceTeamPort {
 }
 
 /// Adapts the team service to the scheduler's [`aionui_cron::executor::CronInboxPort`]:
-/// a follow-up set from a team member's conversation is put in that member's
-/// mailbox instead of being run as a turn behind the team's back.
+/// a follow-up or a scheduled task that comes due in a team member's
+/// conversation is put in that member's mailbox instead of being run as a turn
+/// behind the team's back.
 struct TeamInboxCronPort {
     team: Arc<aionui_team::TeamSessionService>,
 }

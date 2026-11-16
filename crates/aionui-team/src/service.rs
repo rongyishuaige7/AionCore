@@ -2544,10 +2544,10 @@ impl TeamSessionService {
         session.send_message_to_agent(slot_id, &content, files).await
     }
 
-    /// Brings a follow-up that came due to the member whose conversation set
-    /// it, through the member's mailbox. Answers `false` when the conversation
-    /// is not a member's, or no longer one, so the caller can deliver the
-    /// follow-up some other way.
+    /// Brings a follow-up or a scheduled task that came due in a member's
+    /// conversation to that member, through its mailbox. Answers `false` when
+    /// the conversation is not a member's, or no longer one, so the caller can
+    /// deliver it some other way.
     pub async fn deliver_follow_up(
         &self,
         user_id: &str,

@@ -2821,40 +2821,59 @@ async fn a_follow_up_whose_inbox_cannot_be_reached_is_kept_and_tried_again() {
 }
 
 #[tokio::test]
-async fn only_follow_ups_are_offered_to_the_inbox() {
+async fn a_task_bound_to_a_conversation_with_an_inbox_goes_there_and_keeps_its_schedule() {
+    let (svc, cron_repo, _, conv_repo, conv_service) = setup_with_conv_runtime().await;
+    let inbox = StubInbox::answering(Ok(true));
+    svc.set_inbox_port(inbox.clone());
+    let recurring = svc
+        .add_job("u1", make_create_req("recurring", every_60s()))
+        .await
+        .unwrap();
+    // The member is in the middle of a turn: the inbox takes the task anyway.
+    let _claim = conv_service
+        .runtime_state()
+        .try_claim_turn("conv_1", "turn_in_progress")
+        .expect("claim conversation");
+
+    svc.tick(&recurring.id, now_ms()).await;
+
+    let delivered = inbox.delivered.lock().unwrap().clone();
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(delivered[0].0, "u1");
+    assert_eq!(delivered[0].1, "conv_1");
+    assert!(delivered[0].2.contains("[Scheduled Task Execution]"), "{}", delivered[0].2);
+    assert!(delivered[0].2.contains("test message"), "{}", delivered[0].2);
+    assert!(conv_repo.take_messages().is_empty(), "no turn was started for it");
+
+    let row = cron_repo
+        .get_by_id_system(&recurring.id)
+        .await
+        .unwrap()
+        .expect("a task is kept after delivery");
+    assert!(row.enabled);
+    assert_eq!(row.last_status.as_deref(), Some("ok"));
+    assert_eq!(row.retry_count, 0);
+
+    let triggers: Vec<_> = conv_repo
+        .artifacts()
+        .into_iter()
+        .filter(|artifact| artifact.kind == "cron_trigger")
+        .collect();
+    assert_eq!(triggers.len(), 1, "the conversation shows which task the note came from");
+    assert_eq!(triggers[0].conversation_id, "conv_1");
+    assert_eq!(triggers[0].cron_job_id.as_deref(), Some(recurring.id.as_str()));
+}
+
+#[tokio::test]
+async fn a_task_that_starts_a_conversation_of_its_own_is_not_offered_to_the_inbox() {
     let (svc, _, _, _, _) = setup_with_conv_runtime().await;
     let inbox = StubInbox::answering(Ok(true));
     svc.set_inbox_port(inbox.clone());
-    // A one-shot task the user made, and a recurring one.
-    let once = svc
-        .add_job(
-            "u1",
-            make_create_req(
-                "once",
-                CronScheduleDto::At {
-                    at_ms: now_ms() + 60_000,
-                    description: None,
-                },
-            ),
-        )
-        .await
-        .unwrap();
-    let recurring = svc
-        .add_job(
-            "u1",
-            make_create_req(
-                "recurring",
-                CronScheduleDto::Every {
-                    every_ms: 60_000,
-                    description: None,
-                },
-            ),
-        )
-        .await
-        .unwrap();
+    let mut request = make_create_req("fresh each time", every_60s());
+    request.execution_mode = Some("new_conversation".into());
+    let job = svc.add_job("u1", request).await.unwrap();
 
-    svc.tick(&once.id, now_ms()).await;
-    svc.tick(&recurring.id, now_ms()).await;
+    svc.tick(&job.id, now_ms()).await;
 
     assert!(inbox.delivered.lock().unwrap().is_empty());
 }

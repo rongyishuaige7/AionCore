@@ -792,9 +792,10 @@ impl CronService {
 
         let heartbeat = self.spawn_run_lease_heartbeat(job_id.to_owned(), scheduled_at);
 
-        // A follow-up for a conversation with an inbox is handed to the inbox
-        // and no run is started here, so a busy conversation is no obstacle.
-        if let Some(result) = self.executor.deliver_follow_up_to_inbox(&job).await {
+        // A run for a conversation with an inbox (a team member's) is handed
+        // to the inbox and no run is started here behind its owner's back, so
+        // a busy conversation is no obstacle either.
+        if let Some(result) = self.executor.deliver_to_inbox(&job).await {
             heartbeat.abort();
             self.handle_execution_result(job, scheduled_at, result).await;
             return;
