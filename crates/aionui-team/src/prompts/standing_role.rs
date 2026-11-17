@@ -408,9 +408,15 @@ mod tests {
         assert!(section.contains("the user is talking with you here"), "{section}");
         assert!(section.contains("### Charter\n\nChecks work before it is called done."));
         assert!(section.contains("### Memory\n\n- the user wants tests run, not described"));
-        assert!(section.contains("should outlast this conversation (a preference of the user"), "{section}");
+        assert!(
+            section.contains("should outlast this conversation (a preference of the user"),
+            "{section}"
+        );
         assert!(section.contains("\"$AIONUI_HELPER_BIN\" role remember <<'JSON'"));
-        assert!(section.contains("so that you can pick it up in a later run or conversation"), "{section}");
+        assert!(
+            section.contains("so that you can pick it up in a later run or conversation"),
+            "{section}"
+        );
         assert!(section.contains("wakes you once, in this conversation"), "{section}");
         assert!(!section.contains("### Ending this run"));
         assert!(!section.contains("role report"));

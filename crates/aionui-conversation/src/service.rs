@@ -6449,7 +6449,13 @@ mod standing_role_tests {
 
     #[test]
     fn the_standing_role_follows_the_rules_or_stands_alone() {
-        assert_eq!(with_standing_role("Be brief.\n", "## Your Standing Role"), "Be brief.\n\n## Your Standing Role");
-        assert_eq!(with_standing_role("  ", "## Your Standing Role"), "## Your Standing Role");
+        assert_eq!(
+            with_standing_role("Be brief.\n", "## Your Standing Role"),
+            "Be brief.\n\n## Your Standing Role"
+        );
+        assert_eq!(
+            with_standing_role("  ", "## Your Standing Role"),
+            "## Your Standing Role"
+        );
     }
 }

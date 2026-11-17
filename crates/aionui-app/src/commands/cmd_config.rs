@@ -1051,7 +1051,15 @@ async fn run_role_create(client: &reqwest::Client) -> Result<(), ConfigError> {
     }
     if !id.starts_with(BARE_ROLE_PREFIX) {
         // A role is built on an assistant, which must exist first.
-        request_json(client, &env, Method::GET, &assistant_detail_path(&id, None), None, command).await?;
+        request_json(
+            client,
+            &env,
+            Method::GET,
+            &assistant_detail_path(&id, None),
+            None,
+            command,
+        )
+        .await?;
     }
 
     let path = role_path(&id);
@@ -1067,7 +1075,15 @@ async fn run_role_create(client: &reqwest::Client) -> Result<(), ConfigError> {
             extra.insert("memory_kept_from_before".into(), Value::Bool(true));
         } else {
             let memory_path = format!("{path}/memory");
-            request_json(client, &env, Method::PUT, &memory_path, Some(json!({ "memory": memory })), command).await?;
+            request_json(
+                client,
+                &env,
+                Method::PUT,
+                &memory_path,
+                Some(json!({ "memory": memory })),
+                command,
+            )
+            .await?;
             extra.insert("memory_seeded".into(), Value::Bool(true));
         }
     }
@@ -1116,10 +1132,11 @@ fn role_path(id: &str) -> String {
 }
 
 fn role_listed(roles: &Value, id: &str) -> bool {
-    roles
-        .get("roles")
-        .and_then(Value::as_array)
-        .is_some_and(|roles| roles.iter().any(|role| role.get("id").and_then(Value::as_str) == Some(id)))
+    roles.get("roles").and_then(Value::as_array).is_some_and(|roles| {
+        roles
+            .iter()
+            .any(|role| role.get("id").and_then(Value::as_str) == Some(id))
+    })
 }
 
 /// The definition to send: `base`, the role as it stands, with the definition
@@ -1151,7 +1168,8 @@ fn role_definition(payload: &Value, base: Option<&Value>, command: &str) -> Resu
         }
         if !ROLE_DEFINITION_FIELDS.contains(&key.as_str()) {
             return Err(
-                ConfigError::new(ConfigErrorCode::PayloadInvalid, command, "unknown role field").field("field", key.clone())
+                ConfigError::new(ConfigErrorCode::PayloadInvalid, command, "unknown role field")
+                    .field("field", key.clone()),
             );
         }
         definition.insert(key.clone(), value.clone());
@@ -2048,8 +2066,12 @@ mod tests {
             "asks_when_scheduled": false,
             "memory": "learned"
         });
-        let definition =
-            role_definition(&json!({ "asks_when_scheduled": true }), Some(&base), "config roles update").unwrap();
+        let definition = role_definition(
+            &json!({ "asks_when_scheduled": true }),
+            Some(&base),
+            "config roles update",
+        )
+        .unwrap();
         assert_eq!(
             definition,
             json!({

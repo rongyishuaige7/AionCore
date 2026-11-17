@@ -30,10 +30,9 @@ async fn fake_role_list(State(roles): State<SharedRoles>) -> axum::Json<Value> {
 async fn fake_role_get(State(roles): State<SharedRoles>, Path(id): Path<String>) -> (StatusCode, axum::Json<Value>) {
     let roles = roles.lock().unwrap();
     match &roles.role {
-        Some(role) if role["id"] == id.as_str() => (
-            StatusCode::OK,
-            axum::Json(json!({ "success": true, "data": role })),
-        ),
+        Some(role) if role["id"] == id.as_str() => {
+            (StatusCode::OK, axum::Json(json!({ "success": true, "data": role })))
+        }
         _ => (
             StatusCode::NOT_FOUND,
             axum::Json(json!({ "success": false, "code": "role_not_found" })),
@@ -74,7 +73,10 @@ async fn fake_role_memory_put(
     axum::Json(body): axum::Json<Value>,
 ) -> axum::Json<Value> {
     let mut roles = roles.lock().unwrap();
-    let role = roles.role.as_mut().expect("memory is only seeded after the role is saved");
+    let role = roles
+        .role
+        .as_mut()
+        .expect("memory is only seeded after the role is saved");
     role["memory"] = body["memory"].clone();
     axum::Json(json!({ "success": true, "data": role.clone() }))
 }
@@ -140,17 +142,35 @@ async fn an_agent_hires_a_role_then_changes_one_switch_without_losing_the_rest()
     assert_eq!(created["data"]["role_id"], "asst-1");
     assert_eq!(created["data"]["charter"], "Watch the nightly build");
     assert_eq!(created["data"]["memory_chars"], 6);
-    assert!(created["data"].get("memory").is_none(), "the memory text is not printed");
+    assert!(
+        created["data"].get("memory").is_none(),
+        "the memory text is not printed"
+    );
     assert_eq!(created["meta"]["memory_seeded"], true);
     assert_eq!(created["meta"]["before"], Value::Null);
 
-    let updated = run_config(&base_url, &["roles", "update"], r#"{ "role_id": "asst-1", "verifies": true }"#).await;
+    let updated = run_config(
+        &base_url,
+        &["roles", "update"],
+        r#"{ "role_id": "asst-1", "verifies": true }"#,
+    )
+    .await;
     let updated = stdout_json(&updated, "roles update");
     assert_eq!(updated["meta"]["before"]["verifies"], false);
     assert_eq!(updated["meta"]["after"]["verifies"], true);
 
-    let again = run_config(&base_url, &["roles", "create"], r#"{ "role_id": "asst-1", "charter": "Other" }"#).await;
-    let wiped = run_config(&base_url, &["roles", "update"], r#"{ "role_id": "asst-1", "memory": "" }"#).await;
+    let again = run_config(
+        &base_url,
+        &["roles", "create"],
+        r#"{ "role_id": "asst-1", "charter": "Other" }"#,
+    )
+    .await;
+    let wiped = run_config(
+        &base_url,
+        &["roles", "update"],
+        r#"{ "role_id": "asst-1", "memory": "" }"#,
+    )
+    .await;
 
     handle.abort();
     let roles = roles.lock().unwrap();
