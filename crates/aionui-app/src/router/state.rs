@@ -522,6 +522,12 @@ pub fn build_conversation_state(
     if let Some(dispatcher) = assistant_dispatcher {
         conversation_service.with_assistant_dispatcher(dispatcher);
     }
+    // A conversation started with a resident role opens with who it is.
+    conversation_service.with_role_port(Arc::new(RoleServiceConversationPort {
+        roles: RoleServiceTeamPort {
+            service: role_service(services),
+        },
+    }));
     if let Some(cron_service) = cron_service {
         conversation_service.with_delete_hook(cron_service.clone());
     }
@@ -747,6 +753,30 @@ impl aionui_cron::executor::CronRolePort for RoleServiceCronPort {
                 // rather than acts unasked.
                 tracing::warn!(assistant_id, error = %error, "cron: role unreadable, its run asks before it acts");
                 true
+            }
+        }
+    }
+}
+
+/// Adapts the role service to the conversation service's
+/// [`aionui_conversation::ConversationRolePort`]: a conversation the user starts
+/// with a resident role opens with the role's charter and memory, worded for a
+/// conversation the user takes part in.
+struct RoleServiceConversationPort {
+    roles: RoleServiceTeamPort,
+}
+
+#[async_trait::async_trait]
+impl aionui_conversation::ConversationRolePort for RoleServiceConversationPort {
+    async fn direct_role_section(&self, assistant_id: &str) -> Option<String> {
+        use aionui_team::TeamRolePort;
+
+        match self.roles.role_brief(assistant_id).await {
+            Ok(brief) => brief.map(|brief| aionui_team::prompts::render_direct_standing_role(&brief)),
+            Err(error) => {
+                // The conversation opens without its role rather than not at all.
+                tracing::warn!(assistant_id, error = %error, "conversation: role brief unavailable");
+                None
             }
         }
     }

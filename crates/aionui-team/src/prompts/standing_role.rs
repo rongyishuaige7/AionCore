@@ -38,6 +38,8 @@ enum Setting {
     Team,
     /// Run on its own by a scheduled task, with no team around it.
     Scheduled,
+    /// In a conversation the user started with the role, the user at hand.
+    Direct,
 }
 
 /// Render the standing-role section for a member of a team. No trailing newline.
@@ -53,16 +55,35 @@ pub fn render_scheduled_standing_role(brief: &TeamRoleBrief) -> String {
     render(brief, Setting::Scheduled)
 }
 
+/// Render the standing-role section for a conversation the user started with
+/// the role. Like a scheduled run it has no team tools and writes its memory
+/// with the `role` helper; unlike one, the user is there to read the reply, so
+/// it declares no outcome. No trailing newline.
+pub fn render_direct_standing_role(brief: &TeamRoleBrief) -> String {
+    render(brief, Setting::Direct)
+}
+
 fn render(brief: &TeamRoleBrief, setting: Setting) -> String {
     let in_team = setting == Setting::Team;
     // What a lesson or a piece of work has to outlast to be worth keeping.
-    let here = if in_team { "this team" } else { "this run" };
+    let here = match setting {
+        Setting::Team => "this team",
+        Setting::Scheduled => "this run",
+        Setting::Direct => "this conversation",
+    };
     let mut out = String::from("## Your Standing Role\n\n");
-    out.push_str(if in_team {
-        "You are a resident role. The charter and memory below stay with you across every team you join.\n\n"
-    } else {
-        "You are a resident role. The charter and memory below stay with you across every scheduled run and \
-         every team you join.\n\n"
+    out.push_str(match setting {
+        Setting::Team => {
+            "You are a resident role. The charter and memory below stay with you across every team you join.\n\n"
+        }
+        Setting::Scheduled => {
+            "You are a resident role. The charter and memory below stay with you across every scheduled run and \
+             every team you join.\n\n"
+        }
+        Setting::Direct => {
+            "You are a resident role, and the user is talking with you here. The charter and memory below stay \
+             with you across every conversation, every scheduled run and every team you join.\n\n"
+        }
     });
     // A codex session carries the helper's commands as MCP tools as well, which
     // reach the backend from where codex's sandbox keeps the shell offline.
@@ -100,7 +121,7 @@ fn render(brief: &TeamRoleBrief, setting: Setting) -> String {
         ));
     } else if !in_team {
         out.push_str(&format!(
-            "When you learn something that should outlast this run (a preference of the user, a mistake not to \
+            "When you learn something that should outlast {here} (a preference of the user, a mistake not to \
              repeat, a decision and its reason), record one note:\n\n\
              ```\n{ROLE_HELPER} remember <<'JSON'\n{{\"note\": \"<one line>\"}}\nJSON\n```\n\n\
              The whole memory is kept in `{}`, and `{ROLE_HELPER} show` prints it. To tidy the memory itself \
@@ -157,9 +178,14 @@ fn render(brief: &TeamRoleBrief, setting: Setting) -> String {
              per call, so that you can pick it up in another team."
         ));
     } else if may_record_progress {
+        let later = if setting == Setting::Direct {
+            "you can pick it up in a later run or conversation"
+        } else {
+            "the next run can pick it up"
+        };
         out.push_str(&format!(
-            "\n\nFor work that will outlast this run, record where it stands, one task per call, so that the \
-             next run can pick it up:\n\n{progress_command}"
+            "\n\nFor work that will outlast {here}, record where it stands, one task per call, so that {later}:\
+             \n\n{progress_command}"
         ));
     }
 
@@ -179,10 +205,11 @@ fn render(brief: &TeamRoleBrief, setting: Setting) -> String {
         }
     ));
 
-    // A team member answers to its Lead, who speaks to the user. A run on its
-    // own has nobody between it and the user, so it says itself whether the
-    // user is to be disturbed.
-    if !in_team {
+    // A team member answers to its Lead, who speaks to the user, and in a
+    // conversation the user reads the reply. A run on its own has nobody
+    // between it and the user, so it says itself whether the user is to be
+    // disturbed.
+    if setting == Setting::Scheduled {
         out.push_str(&format!(
             "\n\n### Ending this run\n\n\
              Nobody is watching this run. Before your final reply, declare how it ended:\n\n\
@@ -371,6 +398,23 @@ mod tests {
         assert!(!section.contains("team_"));
         assert!(!section.contains("### Reviewing"));
         assert!(!section.contains("may not call"));
+        assert!(!section.ends_with('\n'));
+    }
+
+    #[test]
+    fn a_conversation_with_the_role_carries_its_charter_and_memory_but_asks_for_no_report() {
+        let section = render_direct_standing_role(&brief());
+
+        assert!(section.contains("the user is talking with you here"), "{section}");
+        assert!(section.contains("### Charter\n\nChecks work before it is called done."));
+        assert!(section.contains("### Memory\n\n- the user wants tests run, not described"));
+        assert!(section.contains("should outlast this conversation (a preference of the user"), "{section}");
+        assert!(section.contains("\"$AIONUI_HELPER_BIN\" role remember <<'JSON'"));
+        assert!(section.contains("so that you can pick it up in a later run or conversation"), "{section}");
+        assert!(section.contains("wakes you once, in this conversation"), "{section}");
+        assert!(!section.contains("### Ending this run"));
+        assert!(!section.contains("role report"));
+        assert!(!section.contains("team_"));
         assert!(!section.ends_with('\n'));
     }
 

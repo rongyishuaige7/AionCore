@@ -138,6 +138,22 @@ struct AssistantSnapshotRules {
     content: String,
 }
 
+/// Gives a conversation the user starts with a resident role that role's
+/// standing section (charter, memory, how to keep both), so that the role knows
+/// who it is when the user talks to it, and not only when a schedule or a team
+/// puts it to work.
+#[async_trait::async_trait]
+pub trait ConversationRolePort: Send + Sync {
+    /// The section for a conversation started with `assistant_id`, or `None`
+    /// when that assistant is not a resident role.
+    async fn direct_role_section(&self, assistant_id: &str) -> Option<String>;
+}
+
+/// `extra` keys of a conversation a schedule or a team creates. Those put the
+/// role to work with their own wording of its section, so such a conversation
+/// is not given the direct one as well.
+const PUT_TO_WORK_EXTRA_KEYS: [&str; 3] = ["cron_job_id", "cronJobId", "teamId"];
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct AssistantSnapshot {
     assistant_definition_id: String,
@@ -162,6 +178,21 @@ pub(crate) struct AssistantSnapshot {
     default_modes: AssistantSnapshotDefaultModes,
     pub(crate) resolved_defaults: AssistantSnapshotResolvedDefaults,
     created_at: i64,
+}
+
+/// Whether a schedule or a team created the conversation `extra` belongs to.
+fn put_to_work(extra: &serde_json::Value) -> bool {
+    PUT_TO_WORK_EXTRA_KEYS.iter().any(|key| extra.get(key).is_some())
+}
+
+/// The assistant's rules followed by a role's standing section.
+fn with_standing_role(rules: &str, section: &str) -> String {
+    let rules = rules.trim_end();
+    if rules.is_empty() {
+        section.to_owned()
+    } else {
+        format!("{rules}\n\n{section}")
+    }
 }
 
 fn deserialize_string_or_null<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -336,6 +367,8 @@ pub struct ConversationService {
     /// aionrs assistant's default model to one of the user's providers.
     provider_repo: Arc<RwLock<Option<Arc<dyn IProviderRepository>>>>,
     assistant_dispatcher: Arc<RwLock<Option<Arc<dyn AssistantRuleDispatcher>>>>,
+    /// Optional: without it no conversation opens with a standing role.
+    role_port: Arc<RwLock<Option<Arc<dyn ConversationRolePort>>>>,
     agent_availability_feedback: Arc<RwLock<Option<Arc<dyn AgentAvailabilityFeedbackPort>>>>,
     /// Project-bind side branch (optional). `None` → binding is a no-op, so
     /// conversation create/read behaves exactly as before.
@@ -428,6 +461,7 @@ impl ConversationService {
             assistant_preference_repo: Arc::new(RwLock::new(None)),
             provider_repo: Arc::new(RwLock::new(None)),
             assistant_dispatcher: Arc::new(RwLock::new(None)),
+            role_port: Arc::new(RwLock::new(None)),
             agent_availability_feedback: Arc::new(RwLock::new(None)),
             project_service: Arc::new(RwLock::new(None)),
             runtime_state: Arc::new(ConversationRuntimeStateService::default()),
@@ -632,6 +666,12 @@ impl ConversationService {
         }
     }
 
+    pub fn with_role_port(&self, port: Arc<dyn ConversationRolePort>) {
+        if let Ok(mut guard) = self.role_port.write() {
+            *guard = Some(port);
+        }
+    }
+
     pub fn with_agent_availability_feedback(&self, feedback: Arc<dyn AgentAvailabilityFeedbackPort>) {
         if let Ok(mut guard) = self.agent_availability_feedback.write() {
             *guard = Some(feedback);
@@ -790,6 +830,27 @@ impl ConversationService {
 
     pub(crate) fn provider_repo(&self) -> Option<Arc<dyn IProviderRepository>> {
         self.provider_repo.read().ok().and_then(|guard| guard.as_ref().cloned())
+    }
+
+    fn role_port(&self) -> Option<Arc<dyn ConversationRolePort>> {
+        self.role_port.read().ok().and_then(|guard| guard.as_ref().cloned())
+    }
+
+    /// Append the standing section of the role the conversation is started
+    /// with to the rules it opens with. The rules are a snapshot, so the memory
+    /// the conversation sees is the memory as it stands now.
+    async fn add_standing_role(&self, snapshot: &mut AssistantSnapshot, extra: &serde_json::Value) {
+        if put_to_work(extra) {
+            return;
+        }
+        let Some(port) = self.role_port() else {
+            return;
+        };
+        let Some(section) = port.direct_role_section(&snapshot.assistant_id).await else {
+            return;
+        };
+        info!(assistant_id = %snapshot.assistant_id, "conversation opens with its resident role");
+        snapshot.rules.content = with_standing_role(&snapshot.rules.content, &section);
     }
 
     fn assistant_dispatcher(&self) -> Option<Arc<dyn AssistantRuleDispatcher>> {
@@ -1082,13 +1143,16 @@ impl ConversationService {
             .and_then(|assistant| assistant.conversation_overrides)
             .map(AssistantConversationOverrides::from)
             .unwrap_or_default();
-        let assistant_snapshot = match assistant_id.as_deref() {
+        let mut assistant_snapshot = match assistant_id.as_deref() {
             Some(id) => {
                 self.resolve_assistant_snapshot(user_id, id, assistant_locale.as_deref(), &assistant_overrides, &extra)
                     .await?
             }
             None => None,
         };
+        if let Some(snapshot) = assistant_snapshot.as_mut() {
+            self.add_standing_role(snapshot, &extra).await;
+        }
         let explicit_type = req.r#type;
         let effective_type = resolve_create_agent_type(explicit_type, assistant_snapshot.as_ref())?;
 
@@ -6368,5 +6432,24 @@ mod tests {
         assert!(policy.http);
         assert!(policy.streamable_http);
         assert!(!policy.sse);
+    }
+}
+
+#[cfg(test)]
+mod standing_role_tests {
+    use super::*;
+
+    #[test]
+    fn a_conversation_from_a_schedule_or_a_team_is_put_to_work() {
+        assert!(put_to_work(&serde_json::json!({ "cron_job_id": "cron_1" })));
+        assert!(put_to_work(&serde_json::json!({ "teamId": "team_1" })));
+        assert!(!put_to_work(&serde_json::json!({ "workspace": "/tmp/w" })));
+        assert!(!put_to_work(&serde_json::Value::Null));
+    }
+
+    #[test]
+    fn the_standing_role_follows_the_rules_or_stands_alone() {
+        assert_eq!(with_standing_role("Be brief.\n", "## Your Standing Role"), "Be brief.\n\n## Your Standing Role");
+        assert_eq!(with_standing_role("  ", "## Your Standing Role"), "## Your Standing Role");
     }
 }
