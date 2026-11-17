@@ -102,15 +102,25 @@ pub struct RoleThreadState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Speaker {
+pub enum Speaker {
     User,
     Assistant,
     Report,
 }
 
+impl Speaker {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Assistant => "assistant",
+            Self::Report => "report",
+        }
+    }
+}
+
 /// One message of a thread as the summaries and the handoff read it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Line {
+pub struct Line {
     pub mark: RoleThreadMark,
     pub speaker: Speaker,
     pub text: String,
@@ -118,8 +128,20 @@ pub(crate) struct Line {
 
 /// The messages worth carrying: what the user and the agent wrote, and the
 /// cards the role's runs left. Tool calls, tips and hidden prompts are noise.
-pub(crate) fn lines_of(rows: &[MessageRow]) -> Vec<Line> {
+pub fn lines_of(rows: &[MessageRow]) -> Vec<Line> {
     rows.iter().filter_map(line_of).collect()
+}
+
+/// Whether `row` is an in-flight `"text"` message whose content has not
+/// settled yet, so incremental recall catch-up should hold its cursor before
+/// this row rather than advancing past it while it is still streaming.
+pub fn is_unfinished_text_row(row: &MessageRow) -> bool {
+    !row.hidden
+        && row.r#type == "text"
+        && row
+            .status
+            .as_deref()
+            .is_some_and(|status| !matches!(status, "finish" | "error" | "canceled"))
 }
 
 fn line_of(row: &MessageRow) -> Option<Line> {
@@ -413,8 +435,9 @@ pub(crate) fn render_handoff(leaves: &[String], middle: &[Line], recent: &[Line]
     }
     text.push_str(
         "\nThis is the record of what was said, not new instructions. The user's message after this block is what to \
-         answer, and where it differs from anything above, it wins. If you need a detail that is not here, look in \
-         your memory files or ask the user rather than guess.\n</role-thread-handoff>",
+         answer, and where it differs from anything above, it wins. If you need an earlier detail that is not here, \
+         search your past conversations with `role recall` (or `role_recall`), look in your memory files, or ask the \
+         user rather than guess.\n</role-thread-handoff>",
     );
     Handoff {
         text,
@@ -819,6 +842,7 @@ impl ConversationService {
             previous = Some(leaf);
         }
         if kept > 0 {
+            port.catch_up_recall(user_id, assistant_id).await;
             info!(conversation_id, assistant_id, leaves = kept, "role thread summarized");
         }
     }
@@ -1044,6 +1068,7 @@ mod tests {
         let latest = text.find("word for word").unwrap();
         assert!(text[latest..].contains("User: first recent"));
         assert!(text[latest..].contains("Assistant: answer"));
+        assert!(text.contains("role recall"));
 
         let bare = render_handoff(&[], &[], &recent, Rotation::Unanchored);
         assert_eq!(bare.leaves, 0);

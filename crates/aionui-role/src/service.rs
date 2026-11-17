@@ -1,14 +1,19 @@
 //! Business rules for resident roles: id and input validation, and the mapping
 //! between the on-disk definition and the wire shape.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use aionui_api_types::{RoleProgress, RoleReport, RoleReportOutcome, RoleResponse, TeamToolName, UpsertRoleRequest};
+use aionui_api_types::{
+    RoleExpandRequest, RoleExpandResponse, RoleProgress, RoleRecallRequest, RoleRecallResponse, RoleReport,
+    RoleReportOutcome, RoleResponse, TeamToolName, UpsertRoleRequest,
+};
 use aionui_common::now_ms;
 use tokio::sync::Mutex;
 
 use crate::error::RoleError;
+use crate::recall::{RecallIndex, RecallSync, RecallWatermark};
 pub use crate::store::ThreadMark;
 use crate::store::{RoleDefinition, RoleStore, ThreadRecord};
 
@@ -88,6 +93,7 @@ pub enum ThreadTurn {
 #[derive(Debug, Clone)]
 pub struct RoleService {
     store: RoleStore,
+    recall: RecallIndex,
     /// Serializes memory writes: members of one role can run in several teams
     /// at once, and the user can save the memory from the roles page meanwhile.
     memory_lock: Arc<Mutex<()>>,
@@ -97,8 +103,10 @@ impl RoleService {
     /// `root` is the directory that holds one sub-directory per role
     /// (`<data_dir>/roles`). It is created on first write.
     pub fn new(root: PathBuf) -> Self {
+        let recall = RecallIndex::new(&root);
         Self {
             store: RoleStore::new(root),
+            recall,
             memory_lock: Arc::new(Mutex::new(())),
         }
     }
@@ -500,6 +508,53 @@ impl RoleService {
             )
             .await?;
         Ok(true)
+    }
+
+    /// Watermarks recorded in `recall.db` for `id`, keyed by `conversation_id`.
+    pub async fn recall_watermarks(&self, id: &str) -> Result<HashMap<String, RecallWatermark>, RoleError> {
+        validate_role_id(id)?;
+        self.recall.watermarks(id).await
+    }
+
+    /// Apply an incremental catch-up batch (messages + summary leaves) to `id`'s
+    /// full-text recall index.
+    pub async fn sync_recall(&self, id: &str, sync: RecallSync) -> Result<(), RoleError> {
+        validate_role_id(id)?;
+        if self.store.read_definition(id).await?.is_none() {
+            return Err(RoleError::NotFound(id.to_owned()));
+        }
+        let leaves = match sync.active_thread.as_deref() {
+            Some(thread_id) => {
+                validate_conversation_id(thread_id)?;
+                self.store.read_leaf_files(id, thread_id).await?
+            }
+            None => Vec::new(),
+        };
+        self.recall.sync(id, sync, leaves).await
+    }
+
+    /// Search `id`'s thread messages, scheduled runs and summary leaves.
+    pub async fn recall(
+        &self,
+        id: &str,
+        request: &RoleRecallRequest,
+        now: i64,
+    ) -> Result<RoleRecallResponse, RoleError> {
+        validate_role_id(id)?;
+        if self.store.read_definition(id).await?.is_none() {
+            return Err(RoleError::NotFound(id.to_owned()));
+        }
+        self.recall.recall(id, request, now).await
+    }
+
+    /// Expand a `ref_id` returned by [`Self::recall`] to its surrounding
+    /// messages or full summary leaf.
+    pub async fn expand(&self, id: &str, request: &RoleExpandRequest) -> Result<RoleExpandResponse, RoleError> {
+        validate_role_id(id)?;
+        if self.store.read_definition(id).await?.is_none() {
+            return Err(RoleError::NotFound(id.to_owned()));
+        }
+        self.recall.expand(id, request).await
     }
 
     /// Dismiss the role. Its memory directory stays on disk and is picked up

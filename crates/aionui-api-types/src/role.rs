@@ -287,3 +287,121 @@ pub struct RoleReportedEvent {
     pub summary: String,
     pub at: TimestampMs,
 }
+
+/// Which conversations of a role `role recall` searches.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoleRecallScope {
+    /// Only the role's one thread with the user (its messages and summaries).
+    Thread,
+    /// Only the role's scheduled runs.
+    Runs,
+    /// Both the thread and the scheduled runs.
+    #[default]
+    All,
+}
+
+/// What a `role recall` hit points at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoleRecallKind {
+    Message,
+    Leaf,
+}
+
+/// Where a recalled message or summary came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoleRecallSource {
+    Thread,
+    Run,
+}
+
+/// A moment on the timeline for `before` or `after` in `role recall`: either
+/// milliseconds since the epoch or a date/time string (`YYYY-MM-DD`,
+/// `YYYY-MM-DD HH:MM`, or RFC 3339).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RoleRecallBound {
+    Millis(i64),
+    Text(String),
+}
+
+/// Body of `POST /api/runtime/role/recall`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoleRecallRequest {
+    pub query: String,
+    #[serde(default)]
+    pub limit: Option<u32>,
+    #[serde(default)]
+    pub scope: Option<RoleRecallScope>,
+    #[serde(default)]
+    pub before: Option<RoleRecallBound>,
+    #[serde(default)]
+    pub after: Option<RoleRecallBound>,
+}
+
+/// One hit returned by `role recall`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleRecallHit {
+    pub ref_id: String,
+    pub kind: RoleRecallKind,
+    pub source: RoleRecallSource,
+    pub conversation_id: String,
+    pub speaker: String,
+    pub at: TimestampMs,
+    /// For a leaf summary: the span header (`YYYY-MM-DD HH:MM → YYYY-MM-DD HH:MM · N messages`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span: Option<String>,
+    pub snippet: String,
+}
+
+/// Response of `POST /api/runtime/role/recall`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleRecallResponse {
+    pub hits: Vec<RoleRecallHit>,
+}
+
+/// Body of `POST /api/runtime/role/expand`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoleExpandRequest {
+    pub ref_id: String,
+    #[serde(default)]
+    pub before: Option<u32>,
+    #[serde(default)]
+    pub after: Option<u32>,
+}
+
+/// One message in the window returned by `role expand`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleExpandMessage {
+    pub ref_id: String,
+    pub speaker: String,
+    pub at: TimestampMs,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hit: bool,
+}
+
+/// Response of `POST /api/runtime/role/expand`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleExpandResponse {
+    pub ref_id: String,
+    pub kind: RoleRecallKind,
+    pub source: RoleRecallSource,
+    pub conversation_id: String,
+    /// For a leaf summary: the span of messages it covers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span: Option<String>,
+    /// For a leaf summary: the whole summary body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leaf: Option<String>,
+    /// For a message: the hit and its surrounding messages, oldest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub messages: Vec<RoleExpandMessage>,
+    /// True when a message or surrounding window was clipped to stay within the size cap.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
+}

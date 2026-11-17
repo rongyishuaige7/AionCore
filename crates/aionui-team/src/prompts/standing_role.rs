@@ -229,6 +229,19 @@ fn render(brief: &TeamRoleBrief, setting: Setting) -> String {
         }
     ));
 
+    // Open to every role: searches only this role's own thread, scheduled runs
+    // and summary leaves, and writes nothing.
+    out.push_str(&format!(
+        "\n\n### Recalling earlier conversations\n\n\
+         When you need what was said or decided in an earlier stretch of your thread with the user or in one of your \
+         scheduled runs, search it instead of guessing:\n\n\
+         ```\n{ROLE_HELPER} recall <<'JSON'\n{{\"query\": \"<keywords>\", \"limit\": 8}}\nJSON\n```\n\n\
+         Optional filters: `\"scope\": \"thread\" | \"runs\" | \"all\"`, `\"after\"` and `\"before\"` (`YYYY-MM-DD`, \
+         `YYYY-MM-DD HH:MM`, RFC 3339 or epoch ms). To read the messages around a hit or the whole body of a summary \
+         leaf, pass its `ref_id` to `expand`:\n\n\
+         ```\n{ROLE_HELPER} expand <<'JSON'\n{{\"ref_id\": \"<ref_id from recall>\", \"before\": 3, \"after\": 3}}\nJSON\n```"
+    ));
+
     // A team member answers to its Lead, who speaks to the user, and in a
     // conversation the user reads the reply. A run on its own has nobody
     // between it and the user, so it says itself whether the user is to be
@@ -660,5 +673,30 @@ mod tests {
         assert!(news.starts_with("<role-news>\n"));
         assert!(news.ends_with("</role-news>"));
         assert!(news.contains("- 2026-11-17 09:00 [say] the weekly figures are in\n- 2026-11-17 10:30 [ask] send"));
+    }
+
+    #[test]
+    fn every_setting_teaches_the_role_how_to_recall_and_expand_past_conversations() {
+        let restricted = TeamRoleBrief {
+            denied_tools: vec![REMEMBER_TOOL.into(), PROGRESS_TOOL.into()],
+            ..brief()
+        };
+        for section in [
+            render_standing_role(&brief()),
+            render_scheduled_standing_role(&brief()),
+            render_direct_standing_role(&brief()),
+            render_scheduled_standing_role(&restricted),
+        ] {
+            assert!(section.contains("### Recalling earlier conversations"), "{section}");
+            assert!(
+                section.contains("\"$AIONUI_HELPER_BIN\" role recall <<'JSON'"),
+                "{section}"
+            );
+            assert!(
+                section.contains("\"$AIONUI_HELPER_BIN\" role expand <<'JSON'"),
+                "{section}"
+            );
+            assert!(!section.ends_with('\n'));
+        }
     }
 }

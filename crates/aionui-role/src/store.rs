@@ -83,6 +83,16 @@ pub(crate) struct ProgressFile {
     pub updated_at: i64,
 }
 
+/// One summary file under `thread-leaves/<conversation_id>/`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LeafFile {
+    /// The file's name without its extension (e.g. `00001`).
+    pub stem: String,
+    pub content: String,
+    /// Last write, in milliseconds since the epoch.
+    pub updated_at: i64,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct RoleStore {
     root: PathBuf,
@@ -176,6 +186,17 @@ impl RoleStore {
     /// The summaries kept for a thread, oldest first. The caller checks that
     /// `conversation_id` is safe as a directory name.
     pub(crate) async fn read_leaves(&self, id: &str, conversation_id: &str) -> Result<Vec<String>, RoleError> {
+        Ok(self
+            .read_leaf_files(id, conversation_id)
+            .await?
+            .into_iter()
+            .map(|leaf| leaf.content)
+            .collect())
+    }
+
+    /// Every summary file kept for a thread, oldest first, with its stem and
+    /// modification time.
+    pub(crate) async fn read_leaf_files(&self, id: &str, conversation_id: &str) -> Result<Vec<LeafFile>, RoleError> {
         let dir = self.leaves_dir(id, conversation_id);
         let mut entries = match tokio::fs::read_dir(&dir).await {
             Ok(entries) => entries,
@@ -187,14 +208,20 @@ impl RoleStore {
             let path = entry.path();
             if path.extension().and_then(|ext| ext.to_str()) == Some(LEAF_EXTENSION)
                 && let Some(name) = path.file_name().and_then(|name| name.to_str())
+                && let Some(stem) = path.file_stem().and_then(|stem| stem.to_str())
             {
-                names.push(name.to_owned());
+                let updated_at = entry.metadata().await.map(|m| modified_ms(&m)).unwrap_or(0);
+                names.push((name.to_owned(), stem.to_owned(), updated_at));
             }
         }
-        names.sort();
+        names.sort_by(|a, b| a.0.cmp(&b.0));
         let mut leaves = Vec::with_capacity(names.len());
-        for name in names {
-            leaves.push(tokio::fs::read_to_string(dir.join(name)).await?);
+        for (name, stem, updated_at) in names {
+            leaves.push(LeafFile {
+                stem,
+                content: tokio::fs::read_to_string(dir.join(name)).await?,
+                updated_at,
+            });
         }
         Ok(leaves)
     }

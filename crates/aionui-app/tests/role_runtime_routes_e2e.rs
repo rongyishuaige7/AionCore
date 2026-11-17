@@ -453,3 +453,281 @@ async fn a_token_opens_only_its_own_conversation_and_a_body_cannot_name_a_role()
     assert_eq!(refused["error"]["code"], json!("schema_validation_failed"));
     fixture.services.database.close().await;
 }
+
+#[tokio::test]
+async fn recall_and_expand_search_only_the_caller_roles_thread_runs_and_leaves() {
+    let fixture = fixture().await;
+    // Even a role kept from writing its memory/progress can recall and expand.
+    define_role(&fixture, &["team_remember", "team_progress"]).await;
+    define_role_as(&fixture, "assistant-other", &[]).await;
+
+    let pool = fixture.services.database.pool();
+    let thread_token = conversation_as(&fixture, "conv-thread", Some(ROLE)).await;
+    let _aside_token = conversation_as(&fixture, "conv-aside", Some(ROLE)).await;
+    let run_token = conversation_as(&fixture, "conv-run", Some(ROLE)).await;
+    let _team_token = conversation_as(&fixture, "conv-team", Some(ROLE)).await;
+    let other_token = conversation_as(&fixture, "conv-other-role", Some("assistant-other")).await;
+
+    // Mark conv-run as a scheduled run and conv-team as a team member session.
+    sqlx::query("UPDATE conversations SET extra = ? WHERE id = 'conv-run'")
+        .bind(r#"{"cron_job_id":"job_daily"}"#)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE conversations SET extra = ? WHERE id = 'conv-team'")
+        .bind(r#"{"cron_job_id":"job_team","teamId":"team_1"}"#)
+        .execute(pool)
+        .await
+        .unwrap();
+
+    // Adopt conv-thread as ROLE's one thread and add one summary leaf.
+    let role_service = aionui_role::RoleService::new(fixture.services.data_dir.join("roles"));
+    role_service
+        .open_thread_turn(ROLE, "conv-thread", false, 1_000)
+        .await
+        .unwrap();
+    role_service
+        .add_thread_leaf(
+            ROLE,
+            "conv-thread",
+            "<!-- 2026-04-12 09:00 → 2026-04-12 09:30 · 6 messages -->\n- 敲定了供应链对账口径与月度阈值",
+            aionui_role::ThreadMark {
+                created_at: 900,
+                id: "m0".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let insert_msg = |id: &'static str,
+                      conv: &'static str,
+                      kind: &'static str,
+                      pos: &'static str,
+                      status: &'static str,
+                      at: i64,
+                      content: Value| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(
+                "INSERT INTO messages (id, conversation_id, type, content, position, status, hidden, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?, 0, ?)",
+            )
+            .bind(id)
+            .bind(conv)
+            .bind(kind)
+            .bind(content.to_string())
+            .bind(pos)
+            .bind(status)
+            .bind(at)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+    };
+
+    // Thread messages + report card + an in-flight streaming message at the tail.
+    insert_msg(
+        "m1",
+        "conv-thread",
+        "text",
+        "right",
+        "finish",
+        1_000,
+        json!({ "content": "请检查周报里的数据源核对逻辑" }),
+    )
+    .await;
+    insert_msg(
+        "m2",
+        "conv-thread",
+        "text",
+        "left",
+        "finish",
+        2_000,
+        json!({ "content": "数据源核对脚本已切换到 v2 分支" }),
+    )
+    .await;
+    insert_msg(
+        "m3",
+        "conv-thread",
+        "role_report",
+        "center",
+        "finish",
+        3_000,
+        json!({ "outcome": "say", "summary": "夜间巡检完成：数据源核对零异常" }),
+    )
+    .await;
+    insert_msg(
+        "m4_stream",
+        "conv-thread",
+        "text",
+        "left",
+        "pending",
+        4_000,
+        json!({ "content": "数据源核对流式半截内容暂未完成" }),
+    )
+    .await;
+
+    // Scheduled run message (included).
+    insert_msg(
+        "r1",
+        "conv-run",
+        "text",
+        "left",
+        "finish",
+        5_000,
+        json!({ "content": "早八点定时任务：数据源核对发现 2 条延迟记录" }),
+    )
+    .await;
+
+    // Aside, team, and other-role conversations (all MUST be excluded for ROLE).
+    insert_msg(
+        "aside1",
+        "conv-aside",
+        "text",
+        "right",
+        "finish",
+        6_000,
+        json!({ "content": "数据源核对旁路对话不应进入索引" }),
+    )
+    .await;
+    insert_msg(
+        "team1",
+        "conv-team",
+        "text",
+        "left",
+        "finish",
+        7_000,
+        json!({ "content": "数据源核对团队内部消息不应进入角色召回" }),
+    )
+    .await;
+    insert_msg(
+        "other1",
+        "conv-other-role",
+        "text",
+        "left",
+        "finish",
+        8_000,
+        json!({ "content": "数据源核对来自另一个常驻角色" }),
+    )
+    .await;
+
+    // 1. Trigram search from the scheduled run finds thread + report + run, excluding pending/aside/team/other.
+    let (status, recalled) = call(
+        &fixture,
+        "POST",
+        "/api/runtime/role/recall",
+        "conv-run",
+        &run_token,
+        Some(json!({ "query": "数据源核对" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{recalled}");
+    let hits = recalled["data"]["hits"].as_array().unwrap();
+    let ref_ids: Vec<&str> = hits.iter().map(|h| h["ref_id"].as_str().unwrap()).collect();
+    assert_eq!(ref_ids.len(), 4, "{ref_ids:?}");
+    for expected in [
+        "msg:conv-thread:m1",
+        "msg:conv-thread:m2",
+        "msg:conv-thread:m3",
+        "msg:conv-run:r1",
+    ] {
+        assert!(ref_ids.contains(&expected), "missing {expected} in {ref_ids:?}");
+    }
+
+    // 2. Once m4_stream finishes, incremental catch-up indexes it without losing watermark continuity!
+    sqlx::query("UPDATE messages SET status = 'finish', content = ? WHERE id = 'm4_stream'")
+        .bind(json!({ "content": "数据源核对第四条已完成落盘" }).to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+    let (status, recalled_after) = call(
+        &fixture,
+        "POST",
+        "/api/runtime/role/recall",
+        "conv-thread",
+        &thread_token,
+        Some(json!({ "query": "已完成落盘" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{recalled_after}");
+    assert_eq!(
+        recalled_after["data"]["hits"][0]["ref_id"],
+        json!("msg:conv-thread:m4_stream")
+    );
+
+    // 3. 2-char Chinese short query falls back to LIKE cleanly.
+    let (status, short) = call(
+        &fixture,
+        "POST",
+        "/api/runtime/role/recall",
+        "conv-thread",
+        &thread_token,
+        Some(json!({ "query": "周报", "scope": "thread" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{short}");
+    assert_eq!(short["data"]["hits"].as_array().unwrap().len(), 1);
+    assert_eq!(short["data"]["hits"][0]["ref_id"], json!("msg:conv-thread:m1"));
+
+    // 4. Expand message window returns chronological neighbors around m2.
+    let (status, expanded_msg) = call(
+        &fixture,
+        "POST",
+        "/api/runtime/role/expand",
+        "conv-thread",
+        &thread_token,
+        Some(json!({ "ref_id": "msg:conv-thread:m2", "before": 1, "after": 1 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{expanded_msg}");
+    let window = expanded_msg["data"]["messages"].as_array().unwrap();
+    assert_eq!(window.len(), 3);
+    assert_eq!(window[0]["ref_id"], json!("msg:conv-thread:m1"));
+    assert_eq!(window[1]["ref_id"], json!("msg:conv-thread:m2"));
+    assert_eq!(window[1]["hit"], json!(true));
+    assert_eq!(window[2]["ref_id"], json!("msg:conv-thread:m3"));
+    assert_eq!(window[2]["speaker"], json!("report"));
+
+    // 5. Recall and expand summary leaf.
+    let (status, leaf_recall) = call(
+        &fixture,
+        "POST",
+        "/api/runtime/role/recall",
+        "conv-thread",
+        &thread_token,
+        Some(json!({ "query": "供应链对账口径" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{leaf_recall}");
+    assert_eq!(
+        leaf_recall["data"]["hits"][0]["ref_id"],
+        json!("leaf:conv-thread:00001")
+    );
+    let (status, expanded_leaf) = call(
+        &fixture,
+        "POST",
+        "/api/runtime/role/expand",
+        "conv-thread",
+        &thread_token,
+        Some(json!({ "ref_id": "leaf:conv-thread:00001" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{expanded_leaf}");
+    assert_eq!(expanded_leaf["data"]["kind"], json!("leaf"));
+    assert_eq!(expanded_leaf["data"]["leaf"], json!("- 敲定了供应链对账口径与月度阈值"));
+
+    // 6. Another role cannot expand ROLE's ref_id.
+    let (status, cross_role) = call(
+        &fixture,
+        "POST",
+        "/api/runtime/role/expand",
+        "conv-other-role",
+        &other_token,
+        Some(json!({ "ref_id": "msg:conv-thread:m2" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{cross_role}");
+    assert_eq!(cross_role["error"]["code"], json!("schema_validation_failed"));
+
+    fixture.services.database.close().await;
+}

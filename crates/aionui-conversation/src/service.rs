@@ -181,6 +181,9 @@ pub trait ConversationRolePort: Send + Sync {
 
     /// Note that the role's thread moved to a fresh session at `at` (ms).
     async fn mark_thread_rotated(&self, _assistant_id: &str, _conversation_id: &str, _at: i64) {}
+
+    /// Catch up the role's recall index after new summary leaves were written.
+    async fn catch_up_recall(&self, _user_id: &str, _assistant_id: &str) {}
 }
 
 /// `extra` keys of a conversation the user opens beside something else: never

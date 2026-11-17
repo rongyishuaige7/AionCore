@@ -894,6 +894,16 @@ impl aionui_conversation::ConversationRolePort for RoleServiceConversationPort {
             tracing::warn!(assistant_id, error = %error, "conversation: role thread move not noted");
         }
     }
+
+    async fn catch_up_recall(&self, user_id: &str, assistant_id: &str) {
+        crate::router::runtime_role::catch_up_role_recall(
+            user_id,
+            assistant_id,
+            &self.roles.service,
+            self.conversations.as_ref(),
+        )
+        .await;
+    }
 }
 
 /// The minute of a millisecond timestamp in the user's own time zone

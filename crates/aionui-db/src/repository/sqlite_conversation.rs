@@ -632,6 +632,26 @@ impl IConversationRepository for SqliteConversationRepository {
         Ok(rows)
     }
 
+    async fn list_scheduled_for_assistant(&self, user_id: &str, assistant_id: &str) -> Result<Vec<String>, DbError> {
+        let ids = sqlx::query_scalar::<_, String>(
+            "SELECT c.id \
+             FROM conversations c \
+             INNER JOIN conversation_assistant_snapshots s ON s.conversation_id = c.id \
+             WHERE c.user_id = ? \
+               AND s.assistant_id = ? \
+               AND (json_extract(c.extra, '$.cron_job_id') IS NOT NULL \
+                    OR json_extract(c.extra, '$.cronJobId') IS NOT NULL) \
+               AND json_extract(c.extra, '$.teamId') IS NULL \
+             ORDER BY c.created_at ASC, c.id ASC",
+        )
+        .bind(user_id)
+        .bind(assistant_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(ids)
+    }
+
     async fn list_all_conversation_ids(&self) -> Result<Vec<(String, String)>, DbError> {
         let rows: Vec<(String, String)> = sqlx::query_as("SELECT user_id, id FROM conversations")
             .fetch_all(&self.pool)
@@ -2219,6 +2239,117 @@ mod tests {
         assert_eq!(result.items.len(), 1);
         assert_eq!(result.total, 1);
         assert_eq!(result.items[0].source.as_deref(), Some("telegram"));
+    }
+
+    #[tokio::test]
+    async fn list_scheduled_for_assistant_includes_cron_runs_and_excludes_team_or_plain() {
+        use crate::models::UpsertAssistantDefinitionParams;
+        use crate::repository::assistant::IAssistantDefinitionRepository;
+        use crate::repository::sqlite_assistant::SqliteAssistantDefinitionRepository;
+
+        let (repo, db) = setup().await;
+        SqliteAssistantDefinitionRepository::new(db.pool().clone())
+            .upsert_for_user(
+                SYSTEM_USER_ID,
+                &UpsertAssistantDefinitionParams {
+                    id: "def_1",
+                    assistant_id: "role-alpha",
+                    source: "user",
+                    owner_type: "user",
+                    source_ref: Some("role-alpha"),
+                    name: "Alpha",
+                    name_i18n: "{}",
+                    description: None,
+                    description_i18n: "{}",
+                    avatar_type: "emoji",
+                    avatar_value: None,
+                    agent_id: "codex",
+                    rule_resource_type: "user_file",
+                    rule_resource_ref: None,
+                    recommended_prompts: "[]",
+                    recommended_prompts_i18n: "{}",
+                    default_model_mode: "auto",
+                    default_model_value: None,
+                    default_permission_mode: "auto",
+                    default_permission_value: None,
+                    default_thought_level_mode: "auto",
+                    default_thought_level_value: None,
+                    default_skills_mode: "auto",
+                    default_skill_ids: "[]",
+                    custom_skill_names: "[]",
+                    default_disabled_builtin_skill_ids: "[]",
+                    default_mcps_mode: "auto",
+                    default_mcp_ids: "[]",
+                },
+            )
+            .await
+            .unwrap();
+
+        let attach_snapshot = |conv_id: String, assistant_id: &'static str| {
+            let pool = db.pool().clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO conversation_assistant_snapshots (
+                        conversation_id, assistant_definition_id, assistant_id, assistant_source,
+                        agent_id, rules_content, default_model_mode, default_permission_mode,
+                        default_thought_level_mode, default_skills_mode, resolved_skill_ids,
+                        resolved_disabled_builtin_skill_ids, default_mcps_mode, resolved_mcp_ids,
+                        created_at, updated_at
+                     ) VALUES (?, 'def_1', ?, 'user', 'codex', '', 'auto', 'auto',
+                        'auto', 'auto', '[]', '[]', 'auto', '[]', 1, 1)",
+                )
+                .bind(conv_id)
+                .bind(assistant_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+        };
+
+        // 1. Scheduled run with snake_case cron_job_id (included)
+        let mut run1 = sample_conversation(SYSTEM_USER_ID);
+        run1.id = "conv_run_1".into();
+        run1.created_at = 1_000;
+        run1.extra = r#"{"cron_job_id":"job_1"}"#.into();
+        repo.create(&run1).await.unwrap();
+        attach_snapshot(run1.id.clone(), "role-alpha").await;
+
+        // 2. Scheduled run with camelCase cronJobId (included)
+        let mut run2 = sample_conversation(SYSTEM_USER_ID);
+        run2.id = "conv_run_2".into();
+        run2.created_at = 2_000;
+        run2.extra = r#"{"cronJobId":"job_2"}"#.into();
+        repo.create(&run2).await.unwrap();
+        attach_snapshot(run2.id.clone(), "role-alpha").await;
+
+        // 3. Plain direct conversation (excluded)
+        let mut plain = sample_conversation(SYSTEM_USER_ID);
+        plain.id = "conv_plain".into();
+        plain.created_at = 3_000;
+        repo.create(&plain).await.unwrap();
+        attach_snapshot(plain.id.clone(), "role-alpha").await;
+
+        // 4. Team-bound conversation even if cron_job_id is present (excluded)
+        let mut team = sample_conversation(SYSTEM_USER_ID);
+        team.id = "conv_team".into();
+        team.created_at = 4_000;
+        team.extra = r#"{"cron_job_id":"job_3","teamId":"team_1"}"#.into();
+        repo.create(&team).await.unwrap();
+        attach_snapshot(team.id.clone(), "role-alpha").await;
+
+        // 5. Scheduled run for a different assistant (excluded)
+        let mut other = sample_conversation(SYSTEM_USER_ID);
+        other.id = "conv_other".into();
+        other.created_at = 5_000;
+        other.extra = r#"{"cron_job_id":"job_4"}"#.into();
+        repo.create(&other).await.unwrap();
+        attach_snapshot(other.id.clone(), "role-beta").await;
+
+        let scheduled = repo
+            .list_scheduled_for_assistant(SYSTEM_USER_ID, "role-alpha")
+            .await
+            .unwrap();
+        assert_eq!(scheduled, vec!["conv_run_1".to_string(), "conv_run_2".to_string()]);
     }
 
     #[tokio::test]

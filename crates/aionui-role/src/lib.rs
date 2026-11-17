@@ -15,12 +15,14 @@
 //! roles/<assistant_id>/memory/progress/<task>.md    where one task under way stands
 //! roles/<assistant_id>/thread.json                  the one conversation the user keeps with it
 //! roles/<assistant_id>/thread-leaves/<conv>/*.md    summaries of that conversation, oldest first
+//! roles/recall.db                                   rebuildable FTS5 index over threads, runs & leaves
 //! ```
 //!
 //! The team runtime consumes roles through `aionui_team::TeamRolePort`; the
 //! composition layer adapts [`RoleService`] to that port.
 
 mod error;
+mod recall;
 mod service;
 mod state;
 mod store;
@@ -28,6 +30,10 @@ mod store;
 pub mod routes;
 
 pub use error::RoleError;
+pub use recall::{
+    DEFAULT_EXPAND_WINDOW, DEFAULT_RECALL_LIMIT, MAX_EXPAND_WINDOW, MAX_RECALL_LIMIT, MAX_RECALL_QUERY_CHARS,
+    RecallConversationSync, RecallMessage, RecallSync, RecallWatermark, leaf_ref_id, message_ref_id,
+};
 pub use routes::role_routes;
 pub use service::{
     CuratedMemory, MAX_CHARTER_CHARS, MAX_MEMORY_ARCHIVES, MAX_MEMORY_BYTES, MAX_NOTE_CHARS, MAX_PROGRESS_STATE_CHARS,

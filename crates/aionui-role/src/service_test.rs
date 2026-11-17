@@ -901,3 +901,369 @@ async fn a_thread_keeps_its_summaries_in_order_and_only_moving_forward() {
         })
     );
 }
+
+#[tokio::test]
+async fn recall_indexes_thread_runs_leaves_and_supports_trigram_and_short_like() {
+    use crate::{RecallConversationSync, RecallMessage, RecallSync, leaf_ref_id, message_ref_id};
+    use aionui_api_types::{RoleRecallBound, RoleRecallKind, RoleRecallScope, RoleRecallSource};
+
+    let root = tempfile::tempdir().unwrap();
+    let service = service(&root);
+    service.upsert("builtin-office", request("", &[])).await.unwrap();
+    service
+        .open_thread_turn("builtin-office", "thread_1", false, 1_000)
+        .await
+        .unwrap();
+    service
+        .add_thread_leaf(
+            "builtin-office",
+            "thread_1",
+            "<!-- 2026-04-10 09:00 → 2026-04-10 10:00 · 12 messages -->\n- 敲定了季度预算与供应商名录",
+            ThreadMark {
+                created_at: 2_000,
+                id: "m_early".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+    service
+        .sync_recall(
+            "builtin-office",
+            RecallSync {
+                active_thread: Some("thread_1".into()),
+                active_runs: vec!["run_1".into()],
+                batches: vec![
+                    RecallConversationSync {
+                        conversation_id: "thread_1".into(),
+                        source: RoleRecallSource::Thread,
+                        messages: vec![
+                            RecallMessage {
+                                id: "m1".into(),
+                                created_at: 10_000,
+                                speaker: "user".into(),
+                                text: "请帮我做数据源核对，特别是 Q3 周报的口径".into(),
+                            },
+                            RecallMessage {
+                                id: "m2".into(),
+                                created_at: 11_000,
+                                speaker: "assistant".into(),
+                                text: "好的，数据源核对已完成，差异率为 100%_verified%".into(),
+                            },
+                        ],
+                        watermark: Some((11_000, "m2".into())),
+                    },
+                    RecallConversationSync {
+                        conversation_id: "run_1".into(),
+                        source: RoleRecallSource::Run,
+                        messages: vec![RecallMessage {
+                            id: "r1".into(),
+                            created_at: 20_000,
+                            speaker: "assistant".into(),
+                            text: "早间巡检发现网关超时告警，数据源核对正常".into(),
+                        }],
+                        watermark: Some((20_000, "r1".into())),
+                    },
+                ],
+            },
+        )
+        .await
+        .unwrap();
+
+    // 3+ char Chinese trigram match across thread + runs.
+    let trigram = service
+        .recall(
+            "builtin-office",
+            &RoleRecallRequest {
+                query: "数据源核对".into(),
+                limit: None,
+                scope: None,
+                before: None,
+                after: None,
+            },
+            25_000,
+        )
+        .await
+        .unwrap();
+    assert_eq!(trigram.hits.len(), 3);
+
+    // Scope filtering separates thread from scheduled runs.
+    let runs_only = service
+        .recall(
+            "builtin-office",
+            &RoleRecallRequest {
+                query: "数据源核对".into(),
+                limit: None,
+                scope: Some(RoleRecallScope::Runs),
+                before: None,
+                after: None,
+            },
+            25_000,
+        )
+        .await
+        .unwrap();
+    assert_eq!(runs_only.hits.len(), 1);
+    assert_eq!(runs_only.hits[0].ref_id, message_ref_id("run_1", "r1"));
+    assert_eq!(runs_only.hits[0].source, RoleRecallSource::Run);
+
+    // 2-char Chinese query falls back to LIKE cleanly.
+    let short = service
+        .recall(
+            "builtin-office",
+            &RoleRecallRequest {
+                query: "周报".into(),
+                limit: None,
+                scope: None,
+                before: None,
+                after: None,
+            },
+            25_000,
+        )
+        .await
+        .unwrap();
+    assert_eq!(short.hits.len(), 1);
+    assert_eq!(short.hits[0].ref_id, message_ref_id("thread_1", "m1"));
+
+    // Short LIKE terms escape SQL wildcards (`%` and `_`): `"%_"` matches only
+    // `m2` (`100%_verified%`), while `"%%"` matches nothing instead of everything.
+    let literal_wildcard = service
+        .recall(
+            "builtin-office",
+            &RoleRecallRequest {
+                query: "%_".into(),
+                limit: None,
+                scope: None,
+                before: None,
+                after: None,
+            },
+            25_000,
+        )
+        .await
+        .unwrap();
+    assert_eq!(literal_wildcard.hits.len(), 1);
+    assert_eq!(literal_wildcard.hits[0].ref_id, message_ref_id("thread_1", "m2"));
+
+    let escaped = service
+        .recall(
+            "builtin-office",
+            &RoleRecallRequest {
+                query: "%%".into(),
+                limit: None,
+                scope: None,
+                before: None,
+                after: None,
+            },
+            25_000,
+        )
+        .await
+        .unwrap();
+    assert!(escaped.hits.is_empty());
+
+    // Summary leaves are indexed with their span header preserved.
+    let leaf_hit = service
+        .recall(
+            "builtin-office",
+            &RoleRecallRequest {
+                query: "供应商名录".into(),
+                limit: None,
+                scope: Some(RoleRecallScope::Thread),
+                before: None,
+                after: None,
+            },
+            25_000,
+        )
+        .await
+        .unwrap();
+    assert_eq!(leaf_hit.hits.len(), 1);
+    assert_eq!(leaf_hit.hits[0].ref_id, leaf_ref_id("thread_1", "00001"));
+    assert_eq!(leaf_hit.hits[0].kind, RoleRecallKind::Leaf);
+    assert_eq!(
+        leaf_hit.hits[0].span.as_deref(),
+        Some("2026-04-10 09:00 → 2026-04-10 10:00 · 12 messages")
+    );
+
+    // Time bounds (`after` / `before`) filter accurately.
+    let bounded = service
+        .recall(
+            "builtin-office",
+            &RoleRecallRequest {
+                query: "数据源核对".into(),
+                limit: None,
+                scope: None,
+                before: Some(RoleRecallBound::Millis(15_000)),
+                after: Some(RoleRecallBound::Millis(10_500)),
+            },
+            25_000,
+        )
+        .await
+        .unwrap();
+    assert_eq!(bounded.hits.len(), 1);
+    assert_eq!(bounded.hits[0].ref_id, message_ref_id("thread_1", "m2"));
+}
+
+#[tokio::test]
+async fn recall_isolates_roles_expands_windows_and_rebuilds_when_db_deleted() {
+    use crate::{RecallConversationSync, RecallMessage, RecallSync, leaf_ref_id, message_ref_id};
+    use aionui_api_types::{RoleRecallKind, RoleRecallSource};
+
+    let root = tempfile::tempdir().unwrap();
+    let service = service(&root);
+    service.upsert("role-a", request("", &[])).await.unwrap();
+    service.upsert("role-b", request("", &[])).await.unwrap();
+    service
+        .open_thread_turn("role-a", "thread_a", false, 1_000)
+        .await
+        .unwrap();
+    service
+        .add_thread_leaf(
+            "role-a",
+            "thread_a",
+            "<!-- 2026-04-11 08:00 → 2026-04-11 09:00 · 4 messages -->\n- 归档结论：采用蓝绿发布方案",
+            ThreadMark {
+                created_at: 500,
+                id: "m0".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let huge = format!("HEAD-{}-TAIL", "x".repeat(5_000));
+    service
+        .sync_recall(
+            "role-a",
+            RecallSync {
+                active_thread: Some("thread_a".into()),
+                active_runs: Vec::new(),
+                batches: vec![RecallConversationSync {
+                    conversation_id: "thread_a".into(),
+                    source: RoleRecallSource::Thread,
+                    messages: vec![
+                        RecallMessage {
+                            id: "m1".into(),
+                            created_at: 1_000,
+                            speaker: "user".into(),
+                            text: "第一条上下文".into(),
+                        },
+                        RecallMessage {
+                            id: "m2".into(),
+                            created_at: 2_000,
+                            speaker: "assistant".into(),
+                            text: "命中核心机密密钥 alpha-secret-token".into(),
+                        },
+                        RecallMessage {
+                            id: "m3".into(),
+                            created_at: 3_000,
+                            speaker: "user".into(),
+                            text: huge,
+                        },
+                    ],
+                    watermark: Some((3_000, "m3".into())),
+                }],
+            },
+        )
+        .await
+        .unwrap();
+
+    // Role B cannot recall or expand Role A's documents.
+    let b_hits = service
+        .recall(
+            "role-b",
+            &RoleRecallRequest {
+                query: "alpha-secret-token".into(),
+                limit: None,
+                scope: None,
+                before: None,
+                after: None,
+            },
+            5_000,
+        )
+        .await
+        .unwrap();
+    assert!(b_hits.hits.is_empty());
+    let b_expand = service
+        .expand(
+            "role-b",
+            &RoleExpandRequest {
+                ref_id: message_ref_id("thread_a", "m2"),
+                before: None,
+                after: None,
+            },
+        )
+        .await;
+    assert!(matches!(b_expand, Err(RoleError::InvalidRequest(_))));
+
+    // Role A expands message window and truncates oversized neighbor cleanly.
+    let expanded = service
+        .expand(
+            "role-a",
+            &RoleExpandRequest {
+                ref_id: message_ref_id("thread_a", "m2"),
+                before: Some(1),
+                after: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(expanded.kind, RoleRecallKind::Message);
+    assert_eq!(expanded.messages.len(), 3);
+    assert!(!expanded.messages[0].hit);
+    assert!(expanded.messages[1].hit);
+    assert!(!expanded.messages[2].hit);
+    assert!(expanded.truncated);
+    assert!(expanded.messages[2].text.contains("characters left out"));
+
+    // Expanding a leaf returns its full body and span.
+    let leaf_expanded = service
+        .expand(
+            "role-a",
+            &RoleExpandRequest {
+                ref_id: leaf_ref_id("thread_a", "00001"),
+                before: None,
+                after: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(leaf_expanded.kind, RoleRecallKind::Leaf);
+    assert_eq!(
+        leaf_expanded.span.as_deref(),
+        Some("2026-04-11 08:00 → 2026-04-11 09:00 · 4 messages")
+    );
+    assert_eq!(leaf_expanded.leaf.as_deref(), Some("- 归档结论：采用蓝绿发布方案"));
+
+    // Watermark idempotency: a no-op sync keeps watermarks and avoids duplicates.
+    let wm = service.recall_watermarks("role-a").await.unwrap();
+    assert_eq!(wm["thread_a"].created_at, 3_000);
+    assert_eq!(wm["thread_a"].id, "m3");
+    assert_eq!(wm["thread_a"].leaves_count, 1);
+
+    // Deleting recall.db resets watermarks and allows clean live rebuild.
+    std::fs::remove_file(root.path().join("roles/recall.db")).unwrap();
+    assert!(service.recall_watermarks("role-a").await.unwrap().is_empty());
+    service
+        .sync_recall(
+            "role-a",
+            RecallSync {
+                active_thread: Some("thread_a".into()),
+                active_runs: Vec::new(),
+                batches: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+    let rebuilt = service
+        .recall(
+            "role-a",
+            &RoleRecallRequest {
+                query: "蓝绿发布方案".into(),
+                limit: None,
+                scope: None,
+                before: None,
+                after: None,
+            },
+            5_000,
+        )
+        .await
+        .unwrap();
+    assert_eq!(rebuilt.hits.len(), 1);
+}

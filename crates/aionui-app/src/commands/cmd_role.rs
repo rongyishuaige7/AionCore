@@ -14,7 +14,8 @@ use serde_json::{Map, Value};
 
 use crate::cli::{RoleArgs, RoleCommand};
 use crate::commands::role_capabilities::{
-    self, CURATE_FIELDS, FOLLOW_UP_FIELDS, Fields, PROGRESS_FIELDS, REMEMBER_FIELDS, REPORT_FIELDS,
+    self, CURATE_FIELDS, EXPAND_FIELDS, FOLLOW_UP_FIELDS, Fields, PROGRESS_FIELDS, RECALL_FIELDS, REMEMBER_FIELDS,
+    REPORT_FIELDS,
 };
 
 const ENV_BASE_URL: &str = "AIONUI_BASE_URL";
@@ -42,6 +43,8 @@ async fn run_role_inner(args: RoleArgs) -> Result<(), ExitCode> {
         RoleCommand::Progress => write("role progress", "/api/runtime/role/progress", &PROGRESS_FIELDS).await,
         RoleCommand::FollowUp => write("role follow-up", "/api/runtime/role/follow-up", &FOLLOW_UP_FIELDS).await,
         RoleCommand::Report => write("role report", "/api/runtime/role/report", &REPORT_FIELDS).await,
+        RoleCommand::Recall => write("role recall", "/api/runtime/role/recall", &RECALL_FIELDS).await,
+        RoleCommand::Expand => write("role expand", "/api/runtime/role/expand", &EXPAND_FIELDS).await,
         RoleCommand::Unknown(path) => Err(unknown_command(path)),
     }
 }
@@ -162,6 +165,10 @@ fn checked_fields(fields: &Fields, value: Value) -> Result<Value, String> {
         if fields.whole_numbers.contains(&key.as_str()) {
             if !field.is_u64() {
                 return Err(format!("stdin field must be a whole number: {key}"));
+            }
+        } else if fields.timestamps.contains(&key.as_str()) {
+            if !field.is_string() && !field.is_i64() && !field.is_u64() {
+                return Err(format!("stdin field must be a timestamp string or epoch ms: {key}"));
             }
         } else if !field.is_string() {
             return Err(format!("stdin field must be a string: {key}"));
@@ -308,5 +315,36 @@ mod tests {
         assert!(checked_fields(&PROGRESS_FIELDS, json!({ "task": "weekly-report", "state": "drafted" })).is_ok());
         assert!(checked_fields(&PROGRESS_FIELDS, json!({ "task": "weekly-report" })).is_ok());
         assert!(checked_fields(&PROGRESS_FIELDS, json!({ "state": "drafted" })).is_err());
+    }
+
+    #[test]
+    fn recall_and_expand_validate_their_fields_and_timestamp_bounds() {
+        assert!(checked_fields(&RECALL_FIELDS, json!({ "query": "周报" })).is_ok());
+        assert!(
+            checked_fields(
+                &RECALL_FIELDS,
+                json!({
+                    "query": "数据源核对",
+                    "limit": 10,
+                    "scope": "thread",
+                    "after": "2026-04-01",
+                    "before": 1_780_000_000_000_i64
+                })
+            )
+            .is_ok()
+        );
+        assert!(checked_fields(&RECALL_FIELDS, json!({ "limit": 5 })).is_err());
+        assert!(checked_fields(&RECALL_FIELDS, json!({ "query": "x", "before": true })).is_err());
+
+        assert!(
+            checked_fields(
+                &EXPAND_FIELDS,
+                json!({ "ref_id": "msg:c1:m1", "before": 3, "after": 3 })
+            )
+            .is_ok()
+        );
+        assert!(checked_fields(&EXPAND_FIELDS, json!({ "ref_id": "leaf:c1:00001" })).is_ok());
+        assert!(checked_fields(&EXPAND_FIELDS, json!({ "before": 3 })).is_err());
+        assert!(checked_fields(&EXPAND_FIELDS, json!({ "ref_id": "msg:c1:m1", "before": -1 })).is_err());
     }
 }

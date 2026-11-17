@@ -13,6 +13,7 @@ pub(crate) const REMEMBER_FIELDS: Fields = Fields {
     required: &["note"],
     optional: &[],
     whole_numbers: &[],
+    timestamps: &[],
 };
 
 /// Stdin fields of `role curate`.
@@ -20,6 +21,7 @@ pub(crate) const CURATE_FIELDS: Fields = Fields {
     required: &["memory"],
     optional: &[],
     whole_numbers: &[],
+    timestamps: &[],
 };
 
 /// Stdin fields of `role progress`.
@@ -27,6 +29,7 @@ pub(crate) const PROGRESS_FIELDS: Fields = Fields {
     required: &["task"],
     optional: &["state"],
     whole_numbers: &[],
+    timestamps: &[],
 };
 
 /// Stdin fields of `role follow-up`.
@@ -34,6 +37,7 @@ pub(crate) const FOLLOW_UP_FIELDS: Fields = Fields {
     required: &["note", "after_minutes"],
     optional: &[],
     whole_numbers: &["after_minutes"],
+    timestamps: &[],
 };
 
 /// Stdin fields of `role report`.
@@ -41,14 +45,32 @@ pub(crate) const REPORT_FIELDS: Fields = Fields {
     required: &["outcome"],
     optional: &["summary"],
     whole_numbers: &[],
+    timestamps: &[],
+};
+
+/// Stdin fields of `role recall`.
+pub(crate) const RECALL_FIELDS: Fields = Fields {
+    required: &["query"],
+    optional: &["limit", "scope", "before", "after"],
+    whole_numbers: &["limit"],
+    timestamps: &["before", "after"],
+};
+
+/// Stdin fields of `role expand`.
+pub(crate) const EXPAND_FIELDS: Fields = Fields {
+    required: &["ref_id"],
+    optional: &["before", "after"],
+    whole_numbers: &["before", "after"],
+    timestamps: &[],
 };
 
 /// The fields a command reads from its stdin JSON object: strings, except the
-/// ones named in `whole_numbers`.
+/// ones named in `whole_numbers` or `timestamps`.
 pub(crate) struct Fields {
     pub required: &'static [&'static str],
     pub optional: &'static [&'static str],
     pub whole_numbers: &'static [&'static str],
+    pub timestamps: &'static [&'static str],
 }
 
 pub(crate) fn data() -> Value {
@@ -101,6 +123,28 @@ pub(crate) fn data() -> Value {
                     "summary": "the one line the user sees first, or the question they are asked; required for say and ask, 300 characters at most"
                 },
                 "data": "{ outcome, recorded }"
+            },
+            "recall": {
+                "runtime_env_required": RUNTIME_ENV,
+                "stdin_json": { "required": RECALL_FIELDS.required, "optional": RECALL_FIELDS.optional },
+                "fields": {
+                    "query": "keywords or phrase to search across your thread with the user, your scheduled runs, and your thread summary leaves",
+                    "limit": "maximum number of hits to return, from 1 to 50 (default 10)",
+                    "scope": "`thread` (your thread and its leaves), `runs` (scheduled runs), or `all` (default)",
+                    "before": "only hits strictly before this moment (YYYY-MM-DD, YYYY-MM-DD HH:MM, RFC 3339, or epoch ms)",
+                    "after": "only hits at or after this moment (YYYY-MM-DD, YYYY-MM-DD HH:MM, RFC 3339, or epoch ms)"
+                },
+                "data": "{ hits: [{ ref_id, kind, source, conversation_id, speaker, at, span?, snippet }] }"
+            },
+            "expand": {
+                "runtime_env_required": RUNTIME_ENV,
+                "stdin_json": { "required": EXPAND_FIELDS.required, "optional": EXPAND_FIELDS.optional },
+                "fields": {
+                    "ref_id": "a `ref_id` returned by `role recall` (`msg:...` or `leaf:...`)",
+                    "before": "preceding messages to include around a message hit, from 0 to 20 (default 3)",
+                    "after": "following messages to include around a message hit, from 0 to 20 (default 3)"
+                },
+                "data": "{ ref_id, kind, source, conversation_id, span?, leaf?, messages?: [{ ref_id, speaker, at, text, hit? }], truncated? }"
             }
         },
         "output_envelope": {
@@ -114,6 +158,7 @@ pub(crate) fn data() -> Value {
             "curation": "curate replaces the whole memory; the version it replaces is kept in the archive directory beside it, and an empty memory is refused",
             "follow_up": "follow-up sets a one-shot timer: the note comes back to this conversation once, after the delay, and the timer is gone once delivered; a conversation holds at most 5 waiting at a time",
             "report": "report declares how a run ended, once, before the final reply: a silent run asks the user for no attention; say and ask are kept, the newest 30, so that the next run does not repeat them; a run that declares nothing is shown to the user as if it had something to say",
+            "recall": "recall searches only this role's own thread, scheduled runs, and summary leaves (never other roles or unrelated conversations); pass a hit's ref_id to expand to read the surrounding messages or the full summary leaf",
             "permission": "a role the user keeps from writing its memory or its task progress is answered permission_denied, and should say in its reply what it would have recorded"
         },
         "errors": [

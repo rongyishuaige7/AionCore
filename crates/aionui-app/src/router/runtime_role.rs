@@ -24,18 +24,19 @@ use std::sync::Arc;
 
 use aionui_ai_agent::{RuntimeTokenScope, RuntimeTokenService, TEAM_RUNTIME_TOKEN_SESSION_GENERATION};
 use aionui_api_types::{
-    RoleCliEnvelope, RoleCliErrorCode, RoleCurateRequest, RoleCurateResponse, RoleFollowUpRequest,
-    RoleFollowUpResponse, RoleProgressRequest, RoleProgressResponse, RoleRememberRequest, RoleRememberResponse,
-    RoleReport, RoleReportRequest, RoleReportResponse, RoleReportedEvent, RoleResponse, TeamToolName, WebSocketMessage,
+    RoleCliEnvelope, RoleCliErrorCode, RoleCurateRequest, RoleCurateResponse, RoleExpandRequest, RoleFollowUpRequest,
+    RoleFollowUpResponse, RoleProgressRequest, RoleProgressResponse, RoleRecallRequest, RoleRecallSource,
+    RoleRememberRequest, RoleRememberResponse, RoleReport, RoleReportRequest, RoleReportResponse, RoleReportedEvent,
+    RoleResponse, TeamToolName, WebSocketMessage,
 };
 use aionui_common::now_ms;
 use aionui_conversation::ConversationService;
 use aionui_cron::error::CronError;
 use aionui_cron::service::CronService;
-use aionui_db::IConversationRepository;
 use aionui_db::models::MessageRow;
+use aionui_db::{IConversationRepository, MessagePageCursor, MessagePageDirection, MessagePageParams};
 use aionui_realtime::EventBroadcaster;
-use aionui_role::{RoleError, RoleService};
+use aionui_role::{RecallConversationSync, RecallMessage, RecallSync, RecallWatermark, RoleError, RoleService};
 use axum::extract::State;
 use axum::extract::rejection::JsonRejection;
 use axum::http::{HeaderMap, StatusCode};
@@ -72,6 +73,8 @@ pub fn runtime_role_routes(state: RuntimeRoleState) -> Router {
         .route("/api/runtime/role/progress", post(progress))
         .route("/api/runtime/role/follow-up", post(follow_up))
         .route("/api/runtime/role/report", post(report))
+        .route("/api/runtime/role/recall", post(recall))
+        .route("/api/runtime/role/expand", post(expand))
         .with_state(state)
 }
 
@@ -297,6 +300,220 @@ async fn report(
             recorded: kept.is_some(),
         },
     )
+}
+
+/// Search this role's own thread, scheduled runs, and summary leaves. Open to
+/// every role: it reads only this role's own past conversations and writes
+/// nothing the user reserves.
+async fn recall(
+    State(state): State<RuntimeRoleState>,
+    headers: HeaderMap,
+    body: Result<Json<RoleRecallRequest>, JsonRejection>,
+) -> Reply {
+    const COMMAND: &str = "role recall";
+    let (caller, role) = match caller_and_role(&state, &headers, COMMAND).await {
+        Ok(found) => found,
+        Err(reply) => return reply,
+    };
+    let request = match parsed(body, COMMAND) {
+        Ok(request) => request,
+        Err(reply) => return *reply,
+    };
+    catch_up_role_recall(&caller.user_id, &role.id, &state.roles, state.conversations.as_ref()).await;
+    match state.roles.recall(&role.id, &request, now_ms()).await {
+        Ok(found) => success(COMMAND, &found),
+        Err(error) => role_failure(error, COMMAND),
+    }
+}
+
+/// Expand a `ref_id` returned by `role recall` into its surrounding message
+/// window or full summary leaf.
+async fn expand(
+    State(state): State<RuntimeRoleState>,
+    headers: HeaderMap,
+    body: Result<Json<RoleExpandRequest>, JsonRejection>,
+) -> Reply {
+    const COMMAND: &str = "role expand";
+    let (caller, role) = match caller_and_role(&state, &headers, COMMAND).await {
+        Ok(found) => found,
+        Err(reply) => return reply,
+    };
+    let request = match parsed(body, COMMAND) {
+        Ok(request) => request,
+        Err(reply) => return *reply,
+    };
+    catch_up_role_recall(&caller.user_id, &role.id, &state.roles, state.conversations.as_ref()).await;
+    match state.roles.expand(&role.id, &request).await {
+        Ok(expanded) => success(COMMAND, &expanded),
+        Err(error) => role_failure(error, COMMAND),
+    }
+}
+
+const RECALL_PAGE_ROWS: u32 = 500;
+const RECALL_MAX_PAGES: usize = 200;
+const STALE_STREAMING_MS: i64 = 60 * 60 * 1000;
+
+/// Incrementally catch up `role_id`'s full-text recall index from its live
+/// thread, scheduled-run conversations, and on-disk summary leaves.
+pub(crate) async fn catch_up_role_recall(
+    user_id: &str,
+    role_id: &str,
+    roles: &RoleService,
+    conversations: &dyn IConversationRepository,
+) {
+    let recorded_thread = match roles.thread(role_id).await {
+        Ok(recorded) => recorded,
+        Err(error) => {
+            tracing::warn!(role_id, error = %error, "role recall: thread unreadable");
+            return;
+        }
+    };
+    let active_thread = match recorded_thread {
+        Some(tid) => match conversations.get(user_id, &tid).await {
+            Ok(Some(_)) => Some(tid),
+            Ok(None) => None,
+            Err(error) => {
+                tracing::warn!(role_id, conversation_id = %tid, error = %error, "role recall: thread lookup failed");
+                return;
+            }
+        },
+        None => None,
+    };
+    let mut active_runs = match conversations.list_scheduled_for_assistant(user_id, role_id).await {
+        Ok(runs) => runs,
+        Err(error) => {
+            tracing::warn!(role_id, error = %error, "role recall: scheduled runs lookup failed");
+            return;
+        }
+    };
+    if let Some(ref tid) = active_thread {
+        active_runs.retain(|id| id != tid);
+    }
+
+    let watermarks = match roles.recall_watermarks(role_id).await {
+        Ok(watermarks) => watermarks,
+        Err(error) => {
+            tracing::warn!(role_id, error = %error, "role recall: watermarks unreadable");
+            return;
+        }
+    };
+
+    let mut targets = Vec::with_capacity(active_runs.len() + usize::from(active_thread.is_some()));
+    if let Some(ref tid) = active_thread {
+        targets.push((tid.clone(), RoleRecallSource::Thread));
+    }
+    for run_id in &active_runs {
+        targets.push((run_id.clone(), RoleRecallSource::Run));
+    }
+
+    let mut batches = Vec::new();
+    for (conv_id, source) in targets {
+        match scan_conversation_after(user_id, &conv_id, source, watermarks.get(&conv_id), conversations).await {
+            Ok(Some(batch)) => batches.push(batch),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    role_id,
+                    conversation_id = %conv_id,
+                    error = %error,
+                    "role recall: conversation messages unreadable"
+                );
+            }
+        }
+    }
+
+    if let Err(error) = roles
+        .sync_recall(
+            role_id,
+            RecallSync {
+                active_thread,
+                active_runs,
+                batches,
+            },
+        )
+        .await
+    {
+        tracing::warn!(role_id, error = %error, "role recall: index sync failed");
+    }
+}
+
+async fn scan_conversation_after(
+    user_id: &str,
+    conversation_id: &str,
+    source: RoleRecallSource,
+    watermark: Option<&RecallWatermark>,
+    conversations: &dyn IConversationRepository,
+) -> Result<Option<RecallConversationSync>, aionui_db::DbError> {
+    let mut cursor = watermark.map_or(
+        MessagePageCursor {
+            created_at: 0,
+            id: String::new(),
+        },
+        |wm| MessagePageCursor {
+            created_at: wm.created_at,
+            id: wm.id.clone(),
+        },
+    );
+    let mut rows = Vec::new();
+    for _ in 0..RECALL_MAX_PAGES {
+        let page = conversations
+            .list_messages_page(
+                user_id,
+                conversation_id,
+                &MessagePageParams {
+                    limit: RECALL_PAGE_ROWS,
+                    direction: MessagePageDirection::After { cursor: cursor.clone() },
+                },
+            )
+            .await?;
+        let Some(last) = page.items.last() else {
+            break;
+        };
+        cursor = MessagePageCursor::from(last);
+        let more = page.has_more_after;
+        rows.extend(page.items);
+        if !more {
+            break;
+        }
+    }
+    if rows.is_empty() {
+        return Ok(None);
+    }
+
+    let latest_finished_at = rows
+        .iter()
+        .rev()
+        .find(|row| !row.hidden && row.r#type == "text" && row.status.as_deref() == Some("finish"))
+        .map_or(0, |row| row.created_at);
+    let cutoff = rows
+        .iter()
+        .position(|row| {
+            aionui_conversation::is_unfinished_text_row(row)
+                && latest_finished_at.saturating_sub(row.created_at) < STALE_STREAMING_MS
+        })
+        .unwrap_or(rows.len());
+    let settled = &rows[..cutoff];
+    if settled.is_empty() {
+        return Ok(None);
+    }
+
+    let messages = aionui_conversation::lines_of(settled)
+        .into_iter()
+        .map(|line| RecallMessage {
+            id: line.mark.id,
+            created_at: line.mark.created_at,
+            speaker: line.speaker.as_str().to_owned(),
+            text: line.text,
+        })
+        .collect();
+    let new_watermark = settled.last().map(|last| (last.created_at, last.id.clone()));
+
+    Ok(Some(RecallConversationSync {
+        conversation_id: conversation_id.to_owned(),
+        source,
+        messages,
+        watermark: new_watermark,
+    }))
 }
 
 /// Leave what the role told the user as a card in the role's one thread with

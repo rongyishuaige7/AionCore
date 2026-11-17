@@ -102,6 +102,16 @@ pub trait IConversationRepository: Send + Sync {
     /// Lists conversations whose `extra.cronJobId` matches.
     async fn list_by_cron_job(&self, user_id: &str, cron_job_id: &str) -> Result<Vec<ConversationRow>, DbError>;
 
+    /// Lists scheduled-run conversation IDs (`extra.cron_job_id` or
+    /// `extra.cronJobId` set, excluding team-bound conversations) belonging to
+    /// `assistant_id` for `user_id`, oldest first.
+    ///
+    /// Defaults to an empty list so test doubles that do not exercise role
+    /// recall need no body.
+    async fn list_scheduled_for_assistant(&self, _user_id: &str, _assistant_id: &str) -> Result<Vec<String>, DbError> {
+        Ok(Vec::new())
+    }
+
     /// Lists conversations sharing the same `extra.workspace` value.
     /// The conversation identified by `conversation_id` is excluded.
     async fn list_associated(&self, user_id: &str, conversation_id: &str) -> Result<Vec<ConversationRow>, DbError>;

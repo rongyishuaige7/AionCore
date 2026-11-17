@@ -126,6 +126,63 @@ struct CurateParams {
     memory: String,
 }
 
+// No doc comment on the variants: schemars would turn the plain string enum
+// into a `oneOf`, a shape agents read less reliably.
+#[derive(Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum RecallScope {
+    Thread,
+    Runs,
+    All,
+}
+
+fn deserialize_bound_opt<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value: Option<Value> = Option::deserialize(deserializer)?;
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => Ok(Some(text)),
+        Some(Value::Number(num)) => Ok(Some(num.to_string())),
+        Some(_) => Err(serde::de::Error::custom(
+            "expected timestamp string or epoch ms integer",
+        )),
+    }
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct RecallParams {
+    /// Keywords or phrase to search across your thread with the user, your scheduled runs, and your thread summary leaves.
+    query: String,
+    /// Maximum hits to return, from 1 to 50 (default 10).
+    #[serde(default)]
+    limit: Option<u32>,
+    /// thread: only your thread with the user and its leaves. runs: only scheduled runs. all: both (default).
+    #[serde(default)]
+    scope: Option<RecallScope>,
+    /// Only hits strictly earlier than this moment (YYYY-MM-DD, YYYY-MM-DD HH:MM, RFC 3339, or epoch ms).
+    #[serde(default, deserialize_with = "deserialize_bound_opt")]
+    before: Option<String>,
+    /// Only hits at or after this moment (YYYY-MM-DD, YYYY-MM-DD HH:MM, RFC 3339, or epoch ms).
+    #[serde(default, deserialize_with = "deserialize_bound_opt")]
+    after: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ExpandParams {
+    /// A ref_id returned by role_recall (msg:... or leaf:...).
+    ref_id: String,
+    /// Preceding messages to include around a message hit, from 0 to 20 (default 3).
+    #[serde(default)]
+    before: Option<u32>,
+    /// Following messages to include around a message hit, from 0 to 20 (default 3).
+    #[serde(default)]
+    after: Option<u32>,
+}
+
 #[tool_router]
 impl RoleStdioServer {
     #[tool(
@@ -194,6 +251,44 @@ impl RoleStdioServer {
     )]
     async fn show(&self) -> CallToolResult {
         self.send(self.client.get(self.env.url("/api/runtime/role"))).await
+    }
+
+    #[tool(
+        name = "role_recall",
+        description = "Search your resident role's past conversations: your one thread with the user, its summary leaves, and your scheduled runs. Returns compact snippets with ref_id handles you can pass to role_expand.",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn recall(&self, Parameters(params): Parameters<RecallParams>) -> CallToolResult {
+        let mut body = json!({ "query": params.query });
+        if let Some(limit) = params.limit {
+            body["limit"] = json!(limit);
+        }
+        if let Some(scope) = params.scope {
+            body["scope"] = json!(scope);
+        }
+        if let Some(before) = params.before {
+            body["before"] = json!(before);
+        }
+        if let Some(after) = params.after {
+            body["after"] = json!(after);
+        }
+        self.post("/api/runtime/role/recall", body).await
+    }
+
+    #[tool(
+        name = "role_expand",
+        description = "Expand a ref_id returned by role_recall: reads the surrounding messages in order for a message hit, or the whole body and span of a summary leaf.",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn expand(&self, Parameters(params): Parameters<ExpandParams>) -> CallToolResult {
+        let mut body = json!({ "ref_id": params.ref_id });
+        if let Some(before) = params.before {
+            body["before"] = json!(before);
+        }
+        if let Some(after) = params.after {
+            body["after"] = json!(after);
+        }
+        self.post("/api/runtime/role/expand", body).await
     }
 }
 
@@ -280,10 +375,25 @@ mod tests {
             "role_progress",
             "role_curate",
             "role_show",
+            "role_recall",
+            "role_expand",
         ] {
             assert!(names.iter().any(|n| n == name), "{name} missing from {names:?}");
         }
-        assert_eq!(names.len(), 6);
+        assert_eq!(names.len(), 8);
+    }
+
+    #[test]
+    fn recall_params_accept_string_or_integer_bounds() {
+        let p: RecallParams = serde_json::from_value(json!({
+            "query": "数据源核对",
+            "scope": "runs",
+            "after": "2026-04-01",
+            "before": 1_780_000_000_000_i64
+        }))
+        .unwrap();
+        assert_eq!(p.after.as_deref(), Some("2026-04-01"));
+        assert_eq!(p.before.as_deref(), Some("1780000000000"));
     }
 
     #[test]
