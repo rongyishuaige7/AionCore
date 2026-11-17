@@ -444,6 +444,23 @@ pub(crate) enum ConfigCommand {
     Agents(ConfigAgentsArgs),
     /// Manage scheduled tasks.
     Cron(ConfigCronArgs),
+    /// Manage resident roles built on assistants.
+    Roles(ConfigRolesArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct ConfigRolesArgs {
+    #[command(subcommand)]
+    pub command: ConfigRolesCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum ConfigRolesCommand {
+    List,
+    Get,
+    Create,
+    Update,
+    Delete,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -1082,6 +1099,11 @@ mod tests {
             &["aioncore", "config", "cron", "jobs", "skill", "get"],
             &["aioncore", "config", "cron", "jobs", "skill", "save"],
             &["aioncore", "config", "cron", "jobs", "skill", "delete"],
+            &["aioncore", "config", "roles", "list"],
+            &["aioncore", "config", "roles", "get"],
+            &["aioncore", "config", "roles", "create"],
+            &["aioncore", "config", "roles", "update"],
+            &["aioncore", "config", "roles", "delete"],
             &["aioncore", "config", "skills", "external-paths", "list"],
             &["aioncore", "config", "skills", "external-paths", "add"],
             &["aioncore", "config", "skills", "external-paths", "remove"],

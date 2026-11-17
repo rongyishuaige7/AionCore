@@ -1,6 +1,6 @@
 ---
 name: aionui-config
-description: Configure AionUi itself with the bundled aioncore CLI. Use when asked to set up or change assistants, assistant rules, skills, MCP servers, model providers, agents, scheduled tasks, or settings.
+description: Configure AionUi itself with the bundled aioncore CLI. Use when asked to set up or change assistants, assistant rules, skills, MCP servers, model providers, agents, scheduled tasks, resident roles, or settings, or when the user describes someone they want working for them.
 ---
 
 # AionUi Config
@@ -611,6 +611,118 @@ JSON
 }
 JSON
 ```
+
+## Resident Roles
+
+A resident role is an assistant that works for the user on its own: it runs on
+a schedule, keeps its own memory, reports what it found, and can join teams.
+Who it is lives in the role's **charter**: what it owns, what it delivers and
+where, what it never does, when it stays silent. The assistant underneath is
+only a shell: name, description, avatar and agent.
+
+### Hiring a role
+
+When the user describes someone they want working for them ("I need someone
+who checks X every morning and tells me what changed"), hire a role. Do not
+send the user to forms.
+
+1. Work out the role, asking only what you cannot infer:
+   - what it owns and what it must never do;
+   - which agent runs it (`config agents list`);
+   - when it works and what each run should do;
+   - whether a scheduled run asks the user before acting
+     (`asks_when_scheduled`): on when runs change things beyond the role's own
+     records (files, messages, pushes), off for roles that only read and report;
+   - whether it reviews other members' work in teams (`verifies`);
+   - team tools it must not call (`denied_tools`).
+2. Show the user **one hiring sheet** in plain language: name, agent, charter,
+   each scheduled run (when, and its instruction), the switches, and the
+   starting memory. Create nothing until the user agrees. When they change
+   something, revise the sheet and show it again.
+3. Create the assistant shell with `config assistants create`: `name`, a short
+   `description`, `agent_id`. Write no assistant rule; the charter goes on the
+   role.
+4. Make it a role with `config roles create`, `role_id` being the new
+   assistant's id.
+5. Schedule its runs with `config cron jobs create`. Each run then starts a
+   fresh conversation as the role, carrying its charter and memory.
+6. Read back with `config roles get` and `config cron jobs list`, then tell the
+   user in plain words what now exists and when it first runs.
+
+Make it a role:
+
+```bash
+"$AIONUI_HELPER_BIN" config roles create <<'JSON'
+{
+  "role_id": "<assistant id>",
+  "charter": "You watch the nightly build of the shop app. Each morning you read last night's results and report failures with the failing step and the most likely cause. You never change code or settings. When everything passed, you stay silent.",
+  "denied_tools": [],
+  "verifies": false,
+  "asks_when_scheduled": false,
+  "memory": "- The build log lives in /absolute/path/to/logs"
+}
+JSON
+```
+
+Schedule one of its runs:
+
+```bash
+"$AIONUI_HELPER_BIN" config cron jobs create <<'JSON'
+{
+  "name": "Morning build check",
+  "schedule": { "kind": "cron", "expr": "0 8 * * *", "tz": "Asia/Shanghai" },
+  "message": "Check last night's build and report as your charter says.",
+  "conversation_id": "",
+  "created_by": "agent",
+  "execution_mode": "new_conversation",
+  "agent_config": { "name": "<assistant name>", "assistant_id": "<assistant id>" }
+}
+JSON
+```
+
+Writing the charter:
+
+- Address the role as "you". Be concrete: what it owns, what it delivers and
+  where, what it never does, and when it has nothing to say.
+- Keep it under 4000 characters.
+- Seed `memory` only with facts the user gave (paths, accounts, preferences),
+  never with instructions; those belong in the charter. The role adds its own
+  experience to its memory as it works.
+
+`denied_tools` takes team tool names: `team_members`, `team_read_messages`,
+`team_send_message`, `team_interrupt_agent`, `team_task_create`,
+`team_task_update`, `team_task_list`, `team_remember`, `team_progress`,
+`team_list_assistants`, `team_describe_assistant`, `team_spawn_agent`,
+`team_rename_agent`, `team_clear_agent_context`, `team_shutdown_agent`.
+
+### Looking after roles
+
+List roles in brief, or read one with its memory, progress and reports:
+
+```bash
+"$AIONUI_HELPER_BIN" config roles list
+```
+
+```bash
+"$AIONUI_HELPER_BIN" config roles get <<'JSON'
+{ "role_id": "<assistant id>" }
+JSON
+```
+
+Change a role: `update` changes only the fields you name and keeps the rest.
+
+```bash
+"$AIONUI_HELPER_BIN" config roles update <<'JSON'
+{ "role_id": "<assistant id>", "asks_when_scheduled": true }
+JSON
+```
+
+A role's memory is its own. `update` refuses `memory`, and `create` seeds it
+only for a new role: a role dismissed before keeps what it had learned.
+
+Dismiss a role with `config roles delete`. Its assistant and memory stay. Its
+scheduled runs stay too: delete them with `config cron jobs delete` when the
+user wants the role gone.
 
 ## Safety
 

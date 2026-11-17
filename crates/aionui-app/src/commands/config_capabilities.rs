@@ -144,6 +144,13 @@ pub(crate) fn data() -> Value {
                 stdin(&["cron", "current", "create"], "Create the scheduled task for the current conversation.", &["name", "schedule", "schedule_description", "message"], &["conversation_id"], true, false),
                 stdin(&["cron", "current", "update"], "Update the scheduled task for the current conversation.", &["job_id"], &["conversation_id"], true, false),
             ]),
+            domain("roles", &[
+                no_input(&["roles", "list"], "List resident roles in brief.", false),
+                stdin(&["roles", "get"], "Read one role with its memory, progress and reports.", &["role_id"], &[], false, false),
+                stdin(&["roles", "create"], "Make an existing assistant a resident role; refuses a role that exists.", &["role_id", "charter", "denied_tools", "verifies", "asks_when_scheduled", "memory"], &[], true, false),
+                stdin(&["roles", "update"], "Change the named fields of a role's definition and keep the rest; never its memory.", &["role_id", "charter", "denied_tools", "verifies", "asks_when_scheduled"], &[], true, false),
+                stdin(&["roles", "delete"], "Dismiss a role; its assistant and memory stay.", &["role_id"], &[], true, true),
+            ]),
         ]
     })
 }

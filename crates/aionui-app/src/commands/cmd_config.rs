@@ -13,8 +13,9 @@ use crate::cli::{
     ConfigConversationCommand, ConfigCronArgs, ConfigCronCommand, ConfigCronCurrentArgs, ConfigCronCurrentCommand,
     ConfigCronJobSkillCommand, ConfigCronJobsArgs, ConfigCronJobsCommand, ConfigMcpArgs, ConfigMcpCommand,
     ConfigMcpOauthCommand, ConfigMcpServersCommand, ConfigProviderModelsCommand, ConfigProvidersArgs,
-    ConfigProvidersCommand, ConfigSettingsArgs, ConfigSettingsClientCommand, ConfigSettingsCommand, ConfigSkillsArgs,
-    ConfigSkillsCommand, ConfigSkillsExternalPathsCommand, ConfigSkillsMarketCommand,
+    ConfigProvidersCommand, ConfigRolesArgs, ConfigRolesCommand, ConfigSettingsArgs, ConfigSettingsClientCommand,
+    ConfigSettingsCommand, ConfigSkillsArgs, ConfigSkillsCommand, ConfigSkillsExternalPathsCommand,
+    ConfigSkillsMarketCommand,
 };
 use crate::commands::config_capabilities;
 
@@ -47,6 +48,7 @@ async fn run(args: ConfigArgs) -> Result<(), ConfigError> {
         ConfigCommand::Settings(args) => run_settings(&client, args).await,
         ConfigCommand::Agents(args) => run_agents(&client, args).await,
         ConfigCommand::Cron(args) => run_cron(&client, args).await,
+        ConfigCommand::Roles(args) => run_roles(&client, args).await,
     }
 }
 
@@ -984,6 +986,203 @@ async fn run_cron_current_update(client: &reqwest::Client) -> Result<(), ConfigE
     print_envelope(data, meta_from_map(extra), command)
 }
 
+/// Fields of a role's definition, as `PUT /api/roles/{id}` takes them. That
+/// route replaces the whole definition, so an update lays the fields it names
+/// over the role as it stands.
+const ROLE_DEFINITION_FIELDS: [&str; 4] = ["charter", "denied_tools", "verifies", "asks_when_scheduled"];
+
+/// Id prefix of a role built on a bare agent rather than on an assistant.
+const BARE_ROLE_PREFIX: &str = "bare:";
+
+async fn run_roles(client: &reqwest::Client, args: ConfigRolesArgs) -> Result<(), ConfigError> {
+    match args.command {
+        ConfigRolesCommand::List => run_role_list(client).await,
+        ConfigRolesCommand::Get => {
+            run_id_no_body_request(
+                client,
+                "config roles get",
+                Method::GET,
+                "/api/roles",
+                "",
+                "role_id",
+                false,
+            )
+            .await
+        }
+        ConfigRolesCommand::Create => run_role_create(client).await,
+        ConfigRolesCommand::Update => run_role_update(client).await,
+        ConfigRolesCommand::Delete => run_role_delete(client).await,
+    }
+}
+
+/// Every role in brief: its definition and how much it keeps, not the text of
+/// its memory, which `config roles get` shows for one role.
+async fn run_role_list(client: &reqwest::Client) -> Result<(), ConfigError> {
+    let command = "config roles list";
+    let env = ConfigEnv::from_env(command)?;
+    let data = request_json(client, &env, Method::GET, "/api/roles", None, command).await?;
+    let roles = data
+        .get("roles")
+        .and_then(Value::as_array)
+        .map(|roles| roles.iter().map(role_summary).collect::<Vec<_>>())
+        .unwrap_or_default();
+    print_envelope(json!({ "roles": roles }), meta(None), command)
+}
+
+/// Make the assistant `role_id` a resident role. A role that already exists is
+/// refused rather than overwritten. `memory`, when given, seeds the role's
+/// memory, unless the role was dismissed before and kept what it had learned.
+async fn run_role_create(client: &reqwest::Client) -> Result<(), ConfigError> {
+    let command = "config roles create";
+    let env = ConfigEnv::from_env(command)?;
+    let mut payload = read_stdin_payload(command)?;
+    let id = take_required_string_field(&mut payload, "role_id", command)?;
+    let memory = take_optional_string_field(&mut payload, "memory");
+    let definition = role_definition(&payload, None, command)?;
+
+    let roles = request_json(client, &env, Method::GET, "/api/roles", None, command).await?;
+    if role_listed(&roles, &id) {
+        return Err(ConfigError::new(
+            ConfigErrorCode::PayloadInvalid,
+            command,
+            "role already exists; change it with config roles update",
+        )
+        .field("field", "role_id"));
+    }
+    if !id.starts_with(BARE_ROLE_PREFIX) {
+        // A role is built on an assistant, which must exist first.
+        request_json(client, &env, Method::GET, &assistant_detail_path(&id, None), None, command).await?;
+    }
+
+    let path = role_path(&id);
+    let saved = request_json(client, &env, Method::PUT, &path, Some(definition), command).await?;
+    let kept_memory = saved
+        .get("memory")
+        .and_then(Value::as_str)
+        .is_some_and(|kept| !kept.trim().is_empty());
+    let mut extra = Map::new();
+    if let Some(memory) = memory {
+        if kept_memory {
+            extra.insert("memory_seeded".into(), Value::Bool(false));
+            extra.insert("memory_kept_from_before".into(), Value::Bool(true));
+        } else {
+            let memory_path = format!("{path}/memory");
+            request_json(client, &env, Method::PUT, &memory_path, Some(json!({ "memory": memory })), command).await?;
+            extra.insert("memory_seeded".into(), Value::Bool(true));
+        }
+    }
+    let after = request_json(client, &env, Method::GET, &path, None, command).await?;
+    extra.insert("before".into(), Value::Null);
+    extra.insert("after".into(), role_summary(&after));
+    print_envelope(role_summary(&after), meta_from_map(extra), command)
+}
+
+/// Change the fields of a role's definition the payload names and keep the
+/// rest. A role's memory is its own and is not changed here.
+async fn run_role_update(client: &reqwest::Client) -> Result<(), ConfigError> {
+    let command = "config roles update";
+    let env = ConfigEnv::from_env(command)?;
+    let mut payload = read_stdin_payload(command)?;
+    let id = take_required_string_field(&mut payload, "role_id", command)?;
+    let path = role_path(&id);
+    let before = request_json(client, &env, Method::GET, &path, None, command).await?;
+    let definition = role_definition(&payload, Some(&before), command)?;
+    request_json(client, &env, Method::PUT, &path, Some(definition), command).await?;
+    let after = request_json(client, &env, Method::GET, &path, None, command).await?;
+    let mut extra = Map::new();
+    extra.insert("before".into(), role_summary(&before));
+    extra.insert("after".into(), role_summary(&after));
+    print_envelope(role_summary(&after), meta_from_map(extra), command)
+}
+
+/// Dismiss a role. Its assistant stays, and so does its memory on disk, which
+/// a later `config roles create` for the same assistant picks back up.
+async fn run_role_delete(client: &reqwest::Client) -> Result<(), ConfigError> {
+    let command = "config roles delete";
+    let env = ConfigEnv::from_env(command)?;
+    let payload = read_stdin_payload(command)?;
+    let id = required_string_field(&payload, "role_id", command)?;
+    let path = role_path(&id);
+    let before = request_json(client, &env, Method::GET, &path, None, command).await?;
+    let data = request_json(client, &env, Method::DELETE, &path, None, command).await?;
+    let mut extra = Map::new();
+    extra.insert("before".into(), role_summary(&before));
+    extra.insert("after".into(), Value::Null);
+    print_envelope(data, meta_from_map(extra), command)
+}
+
+fn role_path(id: &str) -> String {
+    id_path("/api/roles", id, "")
+}
+
+fn role_listed(roles: &Value, id: &str) -> bool {
+    roles
+        .get("roles")
+        .and_then(Value::as_array)
+        .is_some_and(|roles| roles.iter().any(|role| role.get("id").and_then(Value::as_str) == Some(id)))
+}
+
+/// The definition to send: `base`, the role as it stands, with the definition
+/// fields the payload names laid over it. Any other field is refused so that a
+/// misspelt one is not silently dropped.
+fn role_definition(payload: &Value, base: Option<&Value>, command: &str) -> Result<Value, ConfigError> {
+    let object = payload.as_object().ok_or_else(|| {
+        ConfigError::new(
+            ConfigErrorCode::PayloadInvalid,
+            command,
+            "JSON payload must be an object",
+        )
+        .field("field", "stdin")
+    })?;
+    let mut definition = Map::new();
+    for field in ROLE_DEFINITION_FIELDS {
+        if let Some(value) = base.and_then(|base| base.get(field)) {
+            definition.insert(field.into(), value.clone());
+        }
+    }
+    for (key, value) in object {
+        if key == "memory" {
+            return Err(ConfigError::new(
+                ConfigErrorCode::PayloadInvalid,
+                command,
+                "a role keeps its own memory; only config roles create may seed it",
+            )
+            .field("field", "memory"));
+        }
+        if !ROLE_DEFINITION_FIELDS.contains(&key.as_str()) {
+            return Err(
+                ConfigError::new(ConfigErrorCode::PayloadInvalid, command, "unknown role field").field("field", key.clone())
+            );
+        }
+        definition.insert(key.clone(), value.clone());
+    }
+    Ok(Value::Object(definition))
+}
+
+/// A role as the config CLI prints it: its definition and how much it keeps,
+/// without the text of its memory, its progress or its reports.
+fn role_summary(role: &Value) -> Value {
+    let mut summary = Map::new();
+    if let Some(id) = role.get("id") {
+        summary.insert("role_id".into(), id.clone());
+    }
+    for field in ROLE_DEFINITION_FIELDS {
+        if let Some(value) = role.get(field) {
+            summary.insert(field.into(), value.clone());
+        }
+    }
+    let memory_chars = role
+        .get("memory")
+        .and_then(Value::as_str)
+        .map_or(0, |memory| memory.chars().count());
+    summary.insert("memory_chars".into(), json!(memory_chars));
+    for (field, count) in [("progress", "progress_count"), ("reported", "reported_count")] {
+        let len = role.get(field).and_then(Value::as_array).map_or(0, Vec::len);
+        summary.insert(count.into(), json!(len));
+    }
+    Value::Object(summary)
+}
+
 async fn run_no_input_request(
     client: &reqwest::Client,
     command: &'static str,
@@ -1837,5 +2036,57 @@ mod tests {
 
         assert_eq!(payload["user_id"], "user-current");
         assert_eq!(selectors.into_map()["resolved_selectors"]["user_id"], "user-current");
+    }
+
+    #[test]
+    fn a_role_update_keeps_the_fields_it_does_not_name() {
+        let base = json!({
+            "id": "a1",
+            "charter": "Watch the build",
+            "denied_tools": ["team_spawn_agent"],
+            "verifies": true,
+            "asks_when_scheduled": false,
+            "memory": "learned"
+        });
+        let definition =
+            role_definition(&json!({ "asks_when_scheduled": true }), Some(&base), "config roles update").unwrap();
+        assert_eq!(
+            definition,
+            json!({
+                "charter": "Watch the build",
+                "denied_tools": ["team_spawn_agent"],
+                "verifies": true,
+                "asks_when_scheduled": true
+            })
+        );
+    }
+
+    #[test]
+    fn a_role_definition_refuses_memory_and_unknown_fields() {
+        let memory = role_definition(&json!({ "memory": "x" }), None, "config roles update").unwrap_err();
+        assert_eq!(memory.fields.get("field").map(String::as_str), Some("memory"));
+        let typo = role_definition(&json!({ "charte": "x" }), None, "config roles create").unwrap_err();
+        assert_eq!(typo.fields.get("field").map(String::as_str), Some("charte"));
+    }
+
+    #[test]
+    fn a_role_summary_counts_what_the_role_keeps_without_its_text() {
+        let summary = role_summary(&json!({
+            "id": "a1",
+            "charter": "c",
+            "denied_tools": [],
+            "verifies": false,
+            "asks_when_scheduled": true,
+            "memory": "四个字符",
+            "memory_dir": "/data/roles/a1/memory",
+            "progress": [{ "task": "t" }],
+            "reported": []
+        }));
+        assert_eq!(summary["role_id"], "a1");
+        assert_eq!(summary["memory_chars"], 4);
+        assert_eq!(summary["progress_count"], 1);
+        assert_eq!(summary["reported_count"], 0);
+        assert!(summary.get("memory").is_none());
+        assert!(summary.get("memory_dir").is_none());
     }
 }

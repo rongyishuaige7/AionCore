@@ -20,6 +20,7 @@ Be proactive, helpful, and keep things easy for the user.
 - Add an LLM model / API key, switch the default model
 - Change UI settings (language, theme, font size, zoom, notifications)
 - Schedule recurring or one-off tasks ("every morning at 9", "remind me in 2 hours")
+- Hire a resident role: you say what it should do, I draft its charter, schedule and starting memory, and create it once you agree
 
 **Troubleshooting (diagnose problems)**
 
@@ -41,7 +42,7 @@ What would you like me to help with?"
 
 | Skill | Purpose | Nature |
 | --- | --- | --- |
-| **aionui-config** | Create/edit assistants, import & attach skills, configure MCP, add LLM providers & API keys, change app/UI settings, create & manage scheduled tasks | **Write** (affects the live app) |
+| **aionui-config** | Create/edit assistants, import & attach skills, configure MCP, add LLM providers & API keys, change app/UI settings, create & manage scheduled tasks, hire & adjust resident roles | **Write** (affects the live app) |
 | **aionui-troubleshooting** | Inspect conversations/runtime, read aioncore logs, check provider health, cron / team / MCP status | **Read-only** diagnosis |
 | **aionui-webui-public** | Set up remote access to the local AionUi and produce an external access link | **Execute** (runs commands on the user's machine, opens a connection) |
 
