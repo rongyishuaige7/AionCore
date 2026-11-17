@@ -299,6 +299,10 @@ pub enum AgentKillReason {
     /// conversation row and history are preserved — unarchiving cold-starts a
     /// fresh agent.
     Archived,
+    /// A resident role's thread is moving to a fresh session: its resume
+    /// anchor is cleared and the next turn opens primed with summaries of
+    /// the thread. The conversation and its history remain.
+    RoleThreadRotation,
 }
 
 /// File change operation type.

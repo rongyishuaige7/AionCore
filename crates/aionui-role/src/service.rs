@@ -9,6 +9,7 @@ use aionui_common::now_ms;
 use tokio::sync::Mutex;
 
 use crate::error::RoleError;
+pub use crate::store::ThreadMark;
 use crate::store::{RoleDefinition, RoleStore, ThreadRecord};
 
 /// Cap on a charter, in characters.
@@ -48,6 +49,18 @@ pub struct CuratedMemory {
     pub archived_as: Option<String>,
     pub bytes_before: usize,
     pub bytes_after: usize,
+}
+
+/// Where the summaries of a role's thread stand, as
+/// [`RoleService::thread_upkeep`] reads them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadUpkeep {
+    /// The last message the summaries cover; `None` before the first one.
+    pub summarized_to: Option<ThreadMark>,
+    /// When the thread last moved to a fresh session (ms), 0 if never.
+    pub rotated_at: i64,
+    /// Every summary of the thread, oldest first.
+    pub leaves: Vec<String>,
 }
 
 /// What [`RoleService::set_progress`] did with a task.
@@ -371,6 +384,8 @@ impl RoleService {
         let adopt = || ThreadRecord {
             conversation_id: conversation_id.to_owned(),
             delivered_at: now,
+            summarized_to: None,
+            rotated_at: 0,
         };
         let record = match self.store.read_thread(id).await? {
             Some(record) if record.conversation_id == conversation_id => record,
@@ -407,6 +422,84 @@ impl RoleService {
             reports,
             adopted: false,
         })
+    }
+
+    /// Where the summaries of the role's thread stand, when `conversation_id`
+    /// is that thread; `None` for any other conversation.
+    pub async fn thread_upkeep(&self, id: &str, conversation_id: &str) -> Result<Option<ThreadUpkeep>, RoleError> {
+        validate_role_id(id)?;
+        validate_conversation_id(conversation_id)?;
+        let Some(record) = self.store.read_thread(id).await? else {
+            return Ok(None);
+        };
+        if record.conversation_id != conversation_id {
+            return Ok(None);
+        }
+        Ok(Some(ThreadUpkeep {
+            summarized_to: record.summarized_to,
+            rotated_at: record.rotated_at,
+            leaves: self.store.read_leaves(id, conversation_id).await?,
+        }))
+    }
+
+    /// Keep `leaf` as the next summary of the role's thread, covering the
+    /// messages up to and including `through`. Returns `false`, keeping
+    /// nothing, when `conversation_id` is no longer the thread or the
+    /// summaries already reach as far.
+    pub async fn add_thread_leaf(
+        &self,
+        id: &str,
+        conversation_id: &str,
+        leaf: &str,
+        through: ThreadMark,
+    ) -> Result<bool, RoleError> {
+        validate_role_id(id)?;
+        validate_conversation_id(conversation_id)?;
+        let _guard = self.memory_lock.lock().await;
+        let Some(record) = self.store.read_thread(id).await? else {
+            return Ok(false);
+        };
+        let behind = record
+            .summarized_to
+            .as_ref()
+            .is_none_or(|mark| (mark.created_at, mark.id.as_str()) < (through.created_at, through.id.as_str()));
+        if record.conversation_id != conversation_id || !behind || leaf.trim().is_empty() {
+            return Ok(false);
+        }
+        self.store.append_leaf(id, conversation_id, leaf).await?;
+        self.store
+            .write_thread(
+                id,
+                &ThreadRecord {
+                    summarized_to: Some(through),
+                    ..record
+                },
+            )
+            .await?;
+        Ok(true)
+    }
+
+    /// Note that the role's thread moved to a fresh session at `at` (ms).
+    /// Returns `false` when `conversation_id` is no longer the thread.
+    pub async fn mark_thread_rotated(&self, id: &str, conversation_id: &str, at: i64) -> Result<bool, RoleError> {
+        validate_role_id(id)?;
+        let _guard = self.memory_lock.lock().await;
+        let Some(record) = self.store.read_thread(id).await? else {
+            return Ok(false);
+        };
+        if record.conversation_id != conversation_id {
+            return Ok(false);
+        }
+        self.store
+            .write_thread(
+                id,
+                &ThreadRecord {
+                    rotated_at: at,
+                    ..record
+                },
+            )
+            .await?;
+        Ok(true)
     }
 
     /// Dismiss the role. Its memory directory stays on disk and is picked up
@@ -449,6 +542,22 @@ impl RoleService {
             created_at: definition.created_at,
             updated_at: definition.updated_at,
         })
+    }
+}
+
+/// A thread's summaries live in a directory named after its conversation, so
+/// the id is held to what conversation ids are made of.
+fn validate_conversation_id(id: &str) -> Result<(), RoleError> {
+    let safe = !id.is_empty()
+        && id.len() <= MAX_ROLE_ID_LEN
+        && !id.starts_with('.')
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    if safe {
+        Ok(())
+    } else {
+        Err(RoleError::InvalidId(id.to_owned()))
     }
 }
 

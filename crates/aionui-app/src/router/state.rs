@@ -835,6 +835,65 @@ impl aionui_conversation::ConversationRolePort for RoleServiceConversationPort {
             }
         }
     }
+
+    async fn thread_state(
+        &self,
+        assistant_id: &str,
+        conversation_id: &str,
+    ) -> Option<aionui_conversation::RoleThreadState> {
+        match self.roles.service.thread_upkeep(assistant_id, conversation_id).await {
+            Ok(upkeep) => upkeep.map(|upkeep| aionui_conversation::RoleThreadState {
+                summarized_to: upkeep.summarized_to.map(|mark| aionui_conversation::RoleThreadMark {
+                    created_at: mark.created_at,
+                    id: mark.id,
+                }),
+                rotated_at: upkeep.rotated_at,
+                leaves: upkeep.leaves,
+            }),
+            // Not a role, or an id no role directory could carry.
+            Err(RoleError::InvalidId(_) | RoleError::NotFound(_)) => None,
+            Err(error) => {
+                tracing::warn!(assistant_id, error = %error, "conversation: role thread summaries unreadable");
+                None
+            }
+        }
+    }
+
+    async fn add_thread_leaf(
+        &self,
+        assistant_id: &str,
+        conversation_id: &str,
+        leaf: &str,
+        through: aionui_conversation::RoleThreadMark,
+    ) -> bool {
+        let through = aionui_role::ThreadMark {
+            created_at: through.created_at,
+            id: through.id,
+        };
+        match self
+            .roles
+            .service
+            .add_thread_leaf(assistant_id, conversation_id, leaf, through)
+            .await
+        {
+            Ok(kept) => kept,
+            Err(error) => {
+                tracing::warn!(assistant_id, error = %error, "conversation: role thread summary not kept");
+                false
+            }
+        }
+    }
+
+    async fn mark_thread_rotated(&self, assistant_id: &str, conversation_id: &str, at: i64) {
+        if let Err(error) = self
+            .roles
+            .service
+            .mark_thread_rotated(assistant_id, conversation_id, at)
+            .await
+        {
+            tracing::warn!(assistant_id, error = %error, "conversation: role thread move not noted");
+        }
+    }
 }
 
 /// The minute of a millisecond timestamp in the user's own time zone

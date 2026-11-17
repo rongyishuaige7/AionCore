@@ -674,6 +674,8 @@ impl ConversationTurnOrchestrator {
         // otherwise our own completion would invalidate every slow summary.
         if !was_deleting && let Some(generator) = title_generator {
             self.service
+                .schedule_thread_upkeep(&input.user_id, &conv_id, Arc::clone(&generator));
+            self.service
                 .titles
                 .schedule(&input.user_id, &conv_id, &turn_id, generator)
                 .await;

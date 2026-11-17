@@ -67,6 +67,9 @@ impl CloseReason {
                 }
                 Some(AgentKillReason::SessionRevoked) => "Agent killed: session revoked".to_owned(),
                 Some(AgentKillReason::Archived) => "Agent killed: archived".to_owned(),
+                Some(AgentKillReason::RoleThreadRotation) => {
+                    "Agent restarted: role thread moved to a fresh session".to_owned()
+                }
                 None => "Agent killed".to_owned(),
             },
             CloseReason::ProcessExited {

@@ -6,7 +6,9 @@ use aionui_process::Spawner;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use super::wire::{AgyEvent, AgyStepType, parse_line};
-use crate::{AgentIo, BackendError, ManagedProcessIo, TITLE_INSTRUCTIONS, TitleGenerator};
+use crate::{
+    AgentIo, BackendError, ManagedProcessIo, SUMMARY_MAX_BYTES, SUMMARY_TIMEOUT, TITLE_INSTRUCTIONS, TitleGenerator,
+};
 
 pub(super) struct AgyTitleGenerator {
     pub spawner: Arc<dyn Spawner>,
@@ -17,10 +19,29 @@ pub(super) struct AgyTitleGenerator {
 #[async_trait::async_trait]
 impl TitleGenerator for AgyTitleGenerator {
     async fn generate(&self, description: &str) -> Result<String, BackendError> {
+        self.ask(
+            format!("{TITLE_INSTRUCTIONS}\n\n{description}"),
+            std::time::Duration::from_secs(60),
+        )
+        .await
+    }
+
+    async fn summarize(&self, prompt: &str) -> Result<String, BackendError> {
+        let answer = self.ask(prompt.to_owned(), SUMMARY_TIMEOUT).await?;
+        if answer.len() > SUMMARY_MAX_BYTES {
+            return Err(failure());
+        }
+        Ok(answer)
+    }
+}
+
+impl AgyTitleGenerator {
+    /// One plan-mode, sandboxed `agy -p` call in a new project.
+    async fn ask(&self, prompt: String, timeout: std::time::Duration) -> Result<String, BackendError> {
         let mut command = self.command.clone();
         command.args = vec![
             "-p".into(),
-            format!("{TITLE_INSTRUCTIONS}\n\n{description}"),
+            prompt,
             "--output-format".into(),
             "stream-json".into(),
             "--mode".into(),
@@ -29,7 +50,7 @@ impl TitleGenerator for AgyTitleGenerator {
             "--disable-slash-commands".into(),
             "--new-project".into(),
             "--print-timeout".into(),
-            "60s".into(),
+            format!("{}s", timeout.as_secs()),
         ];
         if let Some(model) = &self.model {
             command.args.extend(["--model".into(), model.clone()]);
@@ -40,8 +61,7 @@ impl TitleGenerator for AgyTitleGenerator {
             .await
             .map_err(|_| failure())?;
         let io = ManagedProcessIo::new(process);
-        let result =
-            tokio::time::timeout(std::time::Duration::from_secs(60), exchange(&io, self.model.as_deref())).await;
+        let result = tokio::time::timeout(timeout, exchange(&io, self.model.as_deref())).await;
         io.terminate().await;
         result.map_err(|_| failure())?
     }

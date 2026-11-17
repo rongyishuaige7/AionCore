@@ -8,7 +8,7 @@ use agent_client_protocol::schema::v1::{
     SetSessionConfigOptionRequest, TextContent,
 };
 use aionui_common::CommandSpec;
-use aionui_session::{BackendError, TITLE_INSTRUCTIONS, TitleGenerator};
+use aionui_session::{BackendError, SUMMARY_MAX_BYTES, SUMMARY_TIMEOUT, TITLE_INSTRUCTIONS, TitleGenerator};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -41,14 +41,52 @@ impl TitleGenerator for AcpTitleGenerator {
         let (stdin, stdout) = process.0.take_stdio().await.ok_or_else(failure)?;
         exchange(stdin, stdout, &self.command, self.model.as_deref(), description).await
     }
+
+    async fn summarize(&self, prompt: &str) -> Result<String, BackendError> {
+        let process = TitleProcess(
+            CliAgentProcess::spawn_for_title(self.command.clone())
+                .await
+                .map_err(|_| failure())?,
+        );
+        let (stdin, stdout) = process.0.take_stdio().await.ok_or_else(failure)?;
+        let answer = exchange_prompt(
+            stdin,
+            stdout,
+            &self.command,
+            self.model.as_deref(),
+            prompt,
+            SUMMARY_MAX_BYTES,
+        );
+        tokio::time::timeout(SUMMARY_TIMEOUT, answer)
+            .await
+            .map_err(|_| BackendError::Transport("ACP summary timed out".into()))?
+    }
 }
 
 async fn exchange<W, R>(
-    mut stdin: W,
+    stdin: W,
     stdout: R,
     command: &CommandSpec,
     model: Option<&str>,
     description: &str,
+) -> Result<String, BackendError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let prompt = format!("{TITLE_INSTRUCTIONS}\n\n{description}");
+    exchange_prompt(stdin, stdout, command, model, &prompt, 4096).await
+}
+
+/// One prompt in a fresh session with no client tools, answered in at most
+/// `max_bytes` of text.
+async fn exchange_prompt<W, R>(
+    mut stdin: W,
+    stdout: R,
+    command: &CommandSpec,
+    model: Option<&str>,
+    prompt_text: &str,
+    max_bytes: usize,
 ) -> Result<String, BackendError>
 where
     W: tokio::io::AsyncWrite + Unpin,
@@ -92,9 +130,7 @@ where
     }
     let prompt = PromptRequest::new(
         session.session_id.clone(),
-        vec![ContentBlock::Text(TextContent::new(format!(
-            "{TITLE_INSTRUCTIONS}\n\n{description}"
-        )))],
+        vec![ContentBlock::Text(TextContent::new(prompt_text.to_owned()))],
     );
     send(&mut stdin, 4, "session/prompt", &prompt).await?;
     let mut title = String::new();
@@ -123,7 +159,7 @@ where
                     if let ContentBlock::Text(text) = chunk.content {
                         title.push_str(&text.text);
                     }
-                    if title.len() > 4096 {
+                    if title.len() > max_bytes {
                         return Err(failure());
                     }
                 }

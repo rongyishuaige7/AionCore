@@ -41,7 +41,7 @@ mod reducer;
 mod state;
 mod title;
 
-pub use title::{TITLE_INSTRUCTIONS, TitleGenerator};
+pub use title::{SUMMARY_MAX_BYTES, SUMMARY_TIMEOUT, TITLE_INSTRUCTIONS, TitleGenerator};
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing;

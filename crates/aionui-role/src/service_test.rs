@@ -821,3 +821,83 @@ async fn a_role_keeps_one_thread_and_hands_it_what_its_runs_told_the_user_once()
         Err(RoleError::NotFound(_))
     ));
 }
+
+#[tokio::test]
+async fn a_thread_keeps_its_summaries_in_order_and_only_moving_forward() {
+    let root = tempfile::tempdir().unwrap();
+    let service = service(&root);
+    service.upsert("builtin-office", request("", &[])).await.unwrap();
+    let mark = |created_at, id: &str| ThreadMark {
+        created_at,
+        id: id.to_owned(),
+    };
+
+    // No thread yet: nothing to summarize, nothing kept.
+    assert_eq!(service.thread_upkeep("builtin-office", "chat_1").await.unwrap(), None);
+    assert!(
+        !service
+            .add_thread_leaf("builtin-office", "chat_1", "early", mark(10, "m1"))
+            .await
+            .unwrap()
+    );
+
+    service
+        .open_thread_turn("builtin-office", "chat_1", false, 1_000)
+        .await
+        .unwrap();
+    assert!(
+        service
+            .add_thread_leaf("builtin-office", "chat_1", "first stretch", mark(10, "m1"))
+            .await
+            .unwrap()
+    );
+    // A summary that reaches no further than the last one is not kept.
+    assert!(
+        !service
+            .add_thread_leaf("builtin-office", "chat_1", "again", mark(10, "m1"))
+            .await
+            .unwrap()
+    );
+    assert!(
+        service
+            .add_thread_leaf("builtin-office", "chat_1", "second stretch", mark(20, "m2"))
+            .await
+            .unwrap()
+    );
+    assert!(
+        service
+            .mark_thread_rotated("builtin-office", "chat_1", 3_000)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        service.thread_upkeep("builtin-office", "chat_1").await.unwrap(),
+        Some(ThreadUpkeep {
+            summarized_to: Some(mark(20, "m2")),
+            rotated_at: 3_000,
+            leaves: vec!["first stretch".to_owned(), "second stretch".to_owned()],
+        })
+    );
+
+    // Another conversation is not the thread, and an id that could leave the
+    // role's directory is refused outright.
+    assert_eq!(service.thread_upkeep("builtin-office", "chat_2").await.unwrap(), None);
+    assert!(matches!(
+        service.thread_upkeep("builtin-office", "../escape").await,
+        Err(RoleError::InvalidId(_))
+    ));
+
+    // A thread that takes over starts with no summaries of its own.
+    service
+        .open_thread_turn("builtin-office", "chat_2", true, 4_000)
+        .await
+        .unwrap();
+    assert_eq!(
+        service.thread_upkeep("builtin-office", "chat_2").await.unwrap(),
+        Some(ThreadUpkeep {
+            summarized_to: None,
+            rotated_at: 0,
+            leaves: Vec::new(),
+        })
+    );
+}

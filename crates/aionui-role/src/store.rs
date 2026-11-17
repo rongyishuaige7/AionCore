@@ -22,6 +22,8 @@ const PROGRESS_DIR: &str = "progress";
 const PROGRESS_EXTENSION: &str = "md";
 const REPORTED_FILE: &str = "reported.jsonl";
 const THREAD_FILE: &str = "thread.json";
+const THREAD_LEAVES_DIR: &str = "thread-leaves";
+const LEAF_EXTENSION: &str = "md";
 const ID_SEPARATOR: &str = ":";
 const DIR_SEPARATOR: &str = "@";
 
@@ -54,6 +56,21 @@ pub(crate) struct ThreadRecord {
     /// Reports made at or before this moment, in milliseconds since the epoch,
     /// have been handed to the thread.
     pub delivered_at: i64,
+    /// The last message the thread's summaries cover. Absent until the first
+    /// summary, and in files written before summaries existed.
+    #[serde(default)]
+    pub summarized_to: Option<ThreadMark>,
+    /// When the agent last moved the thread to a fresh session, in
+    /// milliseconds since the epoch; 0 when it never has.
+    #[serde(default)]
+    pub rotated_at: i64,
+}
+
+/// A message in a thread, by the keys messages are ordered on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThreadMark {
+    pub created_at: i64,
+    pub id: String,
 }
 
 /// One task file under `memory/progress/`.
@@ -150,6 +167,45 @@ impl RoleStore {
     pub(crate) async fn write_thread(&self, id: &str, record: &ThreadRecord) -> Result<(), RoleError> {
         let raw = serde_json::to_vec_pretty(record).map_err(|error| RoleError::Corrupt(format!("{id}: {error}")))?;
         write_atomic(&self.role_dir(id).join(THREAD_FILE), &raw).await
+    }
+
+    fn leaves_dir(&self, id: &str, conversation_id: &str) -> PathBuf {
+        self.role_dir(id).join(THREAD_LEAVES_DIR).join(conversation_id)
+    }
+
+    /// The summaries kept for a thread, oldest first. The caller checks that
+    /// `conversation_id` is safe as a directory name.
+    pub(crate) async fn read_leaves(&self, id: &str, conversation_id: &str) -> Result<Vec<String>, RoleError> {
+        let dir = self.leaves_dir(id, conversation_id);
+        let mut entries = match tokio::fs::read_dir(&dir).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut names = Vec::new();
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) == Some(LEAF_EXTENSION)
+                && let Some(name) = path.file_name().and_then(|name| name.to_str())
+            {
+                names.push(name.to_owned());
+            }
+        }
+        names.sort();
+        let mut leaves = Vec::with_capacity(names.len());
+        for name in names {
+            leaves.push(tokio::fs::read_to_string(dir.join(name)).await?);
+        }
+        Ok(leaves)
+    }
+
+    /// Keep `leaf` as the thread's next summary, numbered after the last one.
+    pub(crate) async fn append_leaf(&self, id: &str, conversation_id: &str, leaf: &str) -> Result<(), RoleError> {
+        let next = self.read_leaves(id, conversation_id).await?.len() + 1;
+        let path = self
+            .leaves_dir(id, conversation_id)
+            .join(format!("{next:05}.{LEAF_EXTENSION}"));
+        write_atomic(&path, leaf.as_bytes()).await
     }
 
     pub(crate) async fn read_memory(&self, id: &str) -> Result<String, RoleError> {

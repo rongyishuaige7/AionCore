@@ -3,7 +3,7 @@ use std::sync::Arc;
 use aion_providers::{LlmProvider, create_provider};
 use aion_types::llm::{LlmEvent, LlmRequest};
 use aion_types::message::{ContentBlock, Message, Role, StopReason};
-use aionui_session::{BackendError, TITLE_INSTRUCTIONS, TitleGenerator};
+use aionui_session::{BackendError, SUMMARY_MAX_BYTES, SUMMARY_TIMEOUT, TITLE_INSTRUCTIONS, TitleGenerator};
 
 /// Reuses the fully resolved transport, including per-model compatibility.
 pub(crate) struct ProviderTitleGenerator {
@@ -23,17 +23,30 @@ impl ProviderTitleGenerator {
 #[async_trait::async_trait]
 impl TitleGenerator for ProviderTitleGenerator {
     async fn generate(&self, description: &str) -> Result<String, BackendError> {
+        self.ask(TITLE_INSTRUCTIONS, description, 256, 4096).await
+    }
+
+    async fn summarize(&self, prompt: &str) -> Result<String, BackendError> {
+        let answer = self.ask(SUMMARY_SYSTEM, prompt, 8192, SUMMARY_MAX_BYTES);
+        tokio::time::timeout(SUMMARY_TIMEOUT, answer)
+            .await
+            .map_err(|_| BackendError::Transport("Summary provider request timed out".into()))?
+    }
+}
+
+/// The summary prompt carries its own instructions; the system turn only frames it.
+const SUMMARY_SYSTEM: &str =
+    "You write faithful digests of conversation transcripts. Follow the user's instructions exactly and use no tools.";
+
+impl ProviderTitleGenerator {
+    /// One tool-less request with no history, answered in at most `max_bytes`.
+    async fn ask(&self, system: &str, text: &str, max_tokens: u32, max_bytes: usize) -> Result<String, BackendError> {
         let request = LlmRequest {
             model: self.model.clone(),
-            system: TITLE_INSTRUCTIONS.into(),
-            messages: vec![Message::new(
-                Role::User,
-                vec![ContentBlock::Text {
-                    text: description.into(),
-                }],
-            )],
+            system: system.into(),
+            messages: vec![Message::new(Role::User, vec![ContentBlock::Text { text: text.into() }])],
             tools: Vec::new(),
-            max_tokens: Some(256),
+            max_tokens: Some(max_tokens),
             thinking: None,
             reasoning_effort: None,
         };
@@ -55,7 +68,7 @@ impl TitleGenerator for ProviderTitleGenerator {
             match event {
                 LlmEvent::TextDelta(text) => {
                     title.push_str(&text);
-                    if title.len() > 4096 {
+                    if title.len() > max_bytes {
                         return Err(BackendError::Transport("Title provider output exceeded limit".into()));
                     }
                 }

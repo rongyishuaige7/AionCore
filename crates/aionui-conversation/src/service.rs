@@ -61,6 +61,7 @@ use crate::convert::{
     row_to_message_response_compact, row_to_response, row_to_response_with_extra, search_row_to_item, string_to_enum,
 };
 use crate::error::ConversationError;
+use crate::role_thread::{RoleThreadMark, RoleThreadState};
 use crate::session_context::{AionrsRuntimePermissionSeed, SessionContextBuilder};
 use crate::session_mentions;
 use crate::skill_resolver::SkillResolver;
@@ -156,6 +157,30 @@ pub trait ConversationRolePort: Send + Sync {
     async fn thread_news(&self, _user_id: &str, _assistant_id: &str, _conversation_id: &str) -> Option<String> {
         None
     }
+
+    /// Where the summaries of the role's thread stand, when `conversation_id`
+    /// is the thread of the role `assistant_id`; `None` for any other
+    /// conversation.
+    async fn thread_state(&self, _assistant_id: &str, _conversation_id: &str) -> Option<RoleThreadState> {
+        None
+    }
+
+    /// Keep `leaf` as the next summary of the role's thread, covering the
+    /// messages up to and including `through`. `false` when it was not kept:
+    /// the conversation is no longer the thread, or the summaries already
+    /// reach that far.
+    async fn add_thread_leaf(
+        &self,
+        _assistant_id: &str,
+        _conversation_id: &str,
+        _leaf: &str,
+        _through: RoleThreadMark,
+    ) -> bool {
+        false
+    }
+
+    /// Note that the role's thread moved to a fresh session at `at` (ms).
+    async fn mark_thread_rotated(&self, _assistant_id: &str, _conversation_id: &str, _at: i64) {}
 }
 
 /// `extra` keys of a conversation the user opens beside something else: never
@@ -400,6 +425,8 @@ pub struct ConversationService {
         Arc<std::sync::Mutex<std::collections::HashMap<String, crate::background_stream::BackgroundWatcherHandle>>>,
 
     pub(crate) titles: crate::title_service::ConversationTitles,
+    /// Role threads seen this run, and their pending summary jobs.
+    pub(crate) role_threads: crate::role_thread::RoleThreads,
 
     // Repos for conversation, acp_session and agent_metadata access.
     conversation_repo: Arc<dyn IConversationRepository>,
@@ -462,6 +489,7 @@ impl ConversationService {
         let titles = crate::title_service::ConversationTitles::new(conversation_repo.clone(), broadcaster.clone());
         Self {
             titles,
+            role_threads: crate::role_thread::RoleThreads::default(),
             workspace_root,
             broadcaster,
             skill_resolver,
@@ -845,7 +873,7 @@ impl ConversationService {
         self.provider_repo.read().ok().and_then(|guard| guard.as_ref().cloned())
     }
 
-    fn role_port(&self) -> Option<Arc<dyn ConversationRolePort>> {
+    pub(crate) fn role_port(&self) -> Option<Arc<dyn ConversationRolePort>> {
         self.role_port.read().ok().and_then(|guard| guard.as_ref().cloned())
     }
 
@@ -868,9 +896,18 @@ impl ConversationService {
 
     /// The content the agent is handed for a turn the user takes: what they
     /// wrote, preceded in a resident role's thread by what the role told them
-    /// from its runs elsewhere since the thread last heard. Only the agent sees
-    /// that part; the message as kept and shown is what the user wrote.
-    async fn with_thread_news(&self, user_id: &str, row: &ConversationRow, content: String) -> String {
+    /// from its runs elsewhere since the thread last heard, and, when the
+    /// thread just moved to a fresh session, by the handoff that session opens
+    /// with. Only the agent sees those parts; the message as kept and shown is
+    /// what the user wrote. A move rewrites the conversation's opening rules,
+    /// so `row` is updated in place.
+    async fn with_thread_news(
+        &self,
+        user_id: &str,
+        row: &mut ConversationRow,
+        user_msg_id: &str,
+        content: String,
+    ) -> String {
         let Some(port) = self.role_port() else {
             return content;
         };
@@ -891,13 +928,18 @@ impl ConversationService {
                 return content;
             }
         };
-        match port.thread_news(user_id, &assistant_id, &row.id).await {
-            Some(news) => {
-                info!(conversation_id = %row.id, assistant_id = %assistant_id, "turn brings the role's news to its thread");
-                format!("{news}\n\n{content}")
-            }
-            None => content,
+        let news = port.thread_news(user_id, &assistant_id, &row.id).await;
+        if news.is_some() {
+            info!(conversation_id = %row.id, assistant_id = %assistant_id, "turn brings the role's news to its thread");
         }
+        let handoff = self
+            .rotate_thread_if_due(&port, user_id, row, &assistant_id, user_msg_id)
+            .await;
+        [handoff, news, Some(content)]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("\n\n")
     }
 
     fn assistant_dispatcher(&self) -> Option<Arc<dyn AssistantRuleDispatcher>> {
@@ -4129,6 +4171,13 @@ impl ConversationService {
             ));
         }
 
+        // A role's thread may move to a fresh session here, which clears the
+        // resume anchor and refreshes the opening rules the options read.
+        let mut row = row;
+        let content = self
+            .with_thread_news(user_id, &mut row, &user_msg_id, resolved.content)
+            .await;
+
         // Build task options from conversation row
         let mut build_opts = match self.build_task_options(&row).await {
             Ok(opts) => opts,
@@ -4160,7 +4209,6 @@ impl ConversationService {
         let stored_workspace = build_opts.context.workspace.stored_path.clone();
 
         let user_msg_id_ret = user_msg_id.clone();
-        let content = self.with_thread_news(user_id, &row, resolved.content).await;
         ConversationTurnOrchestrator::new(self.clone(), Arc::clone(task_manager)).spawn_user_turn(TurnStartInput {
             user_id: user_id.to_owned(),
             conversation: row,
