@@ -9,7 +9,7 @@ use aionui_common::now_ms;
 use tokio::sync::Mutex;
 
 use crate::error::RoleError;
-use crate::store::{RoleDefinition, RoleStore};
+use crate::store::{RoleDefinition, RoleStore, ThreadRecord};
 
 /// Cap on a charter, in characters.
 pub const MAX_CHARTER_CHARS: usize = 4_000;
@@ -57,6 +57,19 @@ pub struct ProgressUpdate {
     pub task: String,
     /// `true` when the task was closed and its file removed.
     pub closed: bool,
+}
+
+/// What a turn the user takes with the role outside any schedule or team
+/// brings along, as [`RoleService::open_thread_turn`] decides it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThreadTurn {
+    /// The conversation is a side conversation, not the role's thread.
+    Aside,
+    /// The conversation is the role's thread. `reports` are what the role told
+    /// the user from its runs elsewhere since the thread last heard, oldest
+    /// first. `adopted` is set on the turn that made the conversation the
+    /// thread.
+    Thread { reports: Vec<RoleReport>, adopted: bool },
 }
 
 #[derive(Debug, Clone)]
@@ -330,6 +343,72 @@ impl RoleService {
         Ok(Some(report))
     }
 
+    /// The conversation that is the role's thread with the user, if it has one.
+    pub async fn thread(&self, id: &str) -> Result<Option<String>, RoleError> {
+        validate_role_id(id)?;
+        Ok(self.store.read_thread(id).await?.map(|record| record.conversation_id))
+    }
+
+    /// Open a turn the user takes in `conversation_id`, a conversation with the
+    /// role outside any schedule or team. A role keeps one thread with the
+    /// user: the first such conversation to take a turn becomes it, and so
+    /// does the next one once the recorded thread is gone (`thread_gone`, which
+    /// the caller checks against the conversations it knows). In the thread,
+    /// the turn takes along what the role told the user from its runs
+    /// elsewhere since the thread last heard, and those count as handed over.
+    pub async fn open_thread_turn(
+        &self,
+        id: &str,
+        conversation_id: &str,
+        thread_gone: bool,
+        now: i64,
+    ) -> Result<ThreadTurn, RoleError> {
+        validate_role_id(id)?;
+        if self.store.read_definition(id).await?.is_none() {
+            return Err(RoleError::NotFound(id.to_owned()));
+        }
+        let _guard = self.memory_lock.lock().await;
+        let adopt = || ThreadRecord {
+            conversation_id: conversation_id.to_owned(),
+            delivered_at: now,
+        };
+        let record = match self.store.read_thread(id).await? {
+            Some(record) if record.conversation_id == conversation_id => record,
+            Some(_) if !thread_gone => return Ok(ThreadTurn::Aside),
+            // A new thread starts from the standing section, which already
+            // lists what the role last told the user.
+            _ => {
+                self.store.write_thread(id, &adopt()).await?;
+                return Ok(ThreadTurn::Thread {
+                    reports: Vec::new(),
+                    adopted: true,
+                });
+            }
+        };
+        let reports: Vec<RoleReport> = self
+            .store
+            .read_reports(id)
+            .await?
+            .into_iter()
+            .filter(|report| report.at > record.delivered_at && report.conversation_id != conversation_id)
+            .collect();
+        if !reports.is_empty() {
+            self.store
+                .write_thread(
+                    id,
+                    &ThreadRecord {
+                        delivered_at: now,
+                        ..record
+                    },
+                )
+                .await?;
+        }
+        Ok(ThreadTurn::Thread {
+            reports,
+            adopted: false,
+        })
+    }
+
     /// Dismiss the role. Its memory directory stays on disk and is picked up
     /// again if the role is defined anew.
     pub async fn remove(&self, id: &str) -> Result<(), RoleError> {
@@ -366,6 +445,7 @@ impl RoleService {
                 reported.reverse();
                 reported
             },
+            thread_conversation_id: self.store.read_thread(id).await?.map(|record| record.conversation_id),
             created_at: definition.created_at,
             updated_at: definition.updated_at,
         })

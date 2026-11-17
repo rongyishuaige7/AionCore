@@ -147,7 +147,20 @@ pub trait ConversationRolePort: Send + Sync {
     /// The section for a conversation started with `assistant_id`, or `None`
     /// when that assistant is not a resident role.
     async fn direct_role_section(&self, assistant_id: &str) -> Option<String>;
+
+    /// What a turn the user takes in `conversation_id`, a conversation with
+    /// `assistant_id`, brings along for the agent: when the conversation is the
+    /// role's one thread with the user, what the role told the user from its
+    /// runs elsewhere since the thread last heard. `None` when there is nothing
+    /// to bring, or the assistant is not a resident role.
+    async fn thread_news(&self, _user_id: &str, _assistant_id: &str, _conversation_id: &str) -> Option<String> {
+        None
+    }
 }
+
+/// `extra` keys of a conversation the user opens beside something else: never
+/// a role's thread.
+const THREAD_ASIDE_KEYS: [&str; 2] = ["companion_of", "jot_trial"];
 
 /// `extra` keys of a conversation a schedule or a team creates. Those put the
 /// role to work with their own wording of its section, so such a conversation
@@ -851,6 +864,40 @@ impl ConversationService {
         };
         info!(assistant_id = %snapshot.assistant_id, "conversation opens with its resident role");
         snapshot.rules.content = with_standing_role(&snapshot.rules.content, &section);
+    }
+
+    /// The content the agent is handed for a turn the user takes: what they
+    /// wrote, preceded in a resident role's thread by what the role told them
+    /// from its runs elsewhere since the thread last heard. Only the agent sees
+    /// that part; the message as kept and shown is what the user wrote.
+    async fn with_thread_news(&self, user_id: &str, row: &ConversationRow, content: String) -> String {
+        let Some(port) = self.role_port() else {
+            return content;
+        };
+        let extra = serde_json::from_str::<serde_json::Value>(&row.extra).unwrap_or_default();
+        // Nor is a companion beside another conversation, or a jot card's trial
+        // run, the user's own talk with the role.
+        let aside = THREAD_ASIDE_KEYS
+            .iter()
+            .any(|key| extra.get(*key).is_some_and(|v| !v.is_null()));
+        if put_to_work(&extra) || aside {
+            return content;
+        }
+        let assistant_id = match self.conversation_repo.get_assistant_snapshot(user_id, &row.id).await {
+            Ok(Some(snapshot)) => snapshot.assistant_id,
+            Ok(None) => return content,
+            Err(error) => {
+                warn!(conversation_id = %row.id, error = %error, "thread news skipped: assistant lookup failed");
+                return content;
+            }
+        };
+        match port.thread_news(user_id, &assistant_id, &row.id).await {
+            Some(news) => {
+                info!(conversation_id = %row.id, assistant_id = %assistant_id, "turn brings the role's news to its thread");
+                format!("{news}\n\n{content}")
+            }
+            None => content,
+        }
     }
 
     fn assistant_dispatcher(&self) -> Option<Arc<dyn AssistantRuleDispatcher>> {
@@ -4113,10 +4160,11 @@ impl ConversationService {
         let stored_workspace = build_opts.context.workspace.stored_path.clone();
 
         let user_msg_id_ret = user_msg_id.clone();
+        let content = self.with_thread_news(user_id, &row, resolved.content).await;
         ConversationTurnOrchestrator::new(self.clone(), Arc::clone(task_manager)).spawn_user_turn(TurnStartInput {
             user_id: user_id.to_owned(),
             conversation: row,
-            content: resolved.content,
+            content,
             files: resolved.files,
             inject_skills: req.inject_skills,
             required_runtime_mode: None,

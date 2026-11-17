@@ -63,6 +63,30 @@ pub fn render_direct_standing_role(brief: &TeamRoleBrief) -> String {
     render(brief, Setting::Direct)
 }
 
+/// Render what a turn in a role's one thread with the user brings along: the
+/// lines the role told the user from its runs elsewhere since the user last
+/// wrote there (`<local minute> [<outcome>] <summary>`, oldest first). `None`
+/// when there is nothing to bring. No trailing newline.
+pub fn render_thread_news(reports: &[String]) -> Option<String> {
+    if reports.is_empty() {
+        return None;
+    }
+    let mut out = String::from(
+        "<role-news>\nSince the user last wrote in this conversation, your runs elsewhere (scheduled tasks) told \
+         them:\n",
+    );
+    for line in reports {
+        out.push_str("- ");
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str(
+        "The user has seen these as cards in this conversation. Treat them as context you already shared: their \
+         message below may answer an [ask]; reply to what they wrote.\n</role-news>",
+    );
+    Some(out)
+}
+
 fn render(brief: &TeamRoleBrief, setting: Setting) -> String {
     let in_team = setting == Setting::Team;
     // What a lesson or a piece of work has to outlast to be worth keeping.
@@ -623,5 +647,18 @@ mod tests {
         assert_eq!(newest_memory("- a\n- b\n- cd", 4), Some("- cd"));
         // Five do not reach the start of "- b", so that note is dropped.
         assert_eq!(newest_memory("- a\n- b\n- cd", 5), Some("- cd"));
+    }
+
+    #[test]
+    fn thread_news_lists_what_runs_told_the_user_and_is_absent_when_there_is_none() {
+        assert_eq!(render_thread_news(&[]), None);
+        let news = render_thread_news(&[
+            "2026-11-17 09:00 [say] the weekly figures are in".to_owned(),
+            "2026-11-17 10:30 [ask] send them to finance?".to_owned(),
+        ])
+        .unwrap();
+        assert!(news.starts_with("<role-news>\n"));
+        assert!(news.ends_with("</role-news>"));
+        assert!(news.contains("- 2026-11-17 09:00 [say] the weekly figures are in\n- 2026-11-17 10:30 [ask] send"));
     }
 }

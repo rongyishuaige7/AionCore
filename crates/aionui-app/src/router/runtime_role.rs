@@ -26,12 +26,14 @@ use aionui_ai_agent::{RuntimeTokenScope, RuntimeTokenService, TEAM_RUNTIME_TOKEN
 use aionui_api_types::{
     RoleCliEnvelope, RoleCliErrorCode, RoleCurateRequest, RoleCurateResponse, RoleFollowUpRequest,
     RoleFollowUpResponse, RoleProgressRequest, RoleProgressResponse, RoleRememberRequest, RoleRememberResponse,
-    RoleReportRequest, RoleReportResponse, RoleReportedEvent, RoleResponse, TeamToolName, WebSocketMessage,
+    RoleReport, RoleReportRequest, RoleReportResponse, RoleReportedEvent, RoleResponse, TeamToolName, WebSocketMessage,
 };
 use aionui_common::now_ms;
+use aionui_conversation::ConversationService;
 use aionui_cron::error::CronError;
 use aionui_cron::service::CronService;
 use aionui_db::IConversationRepository;
+use aionui_db::models::MessageRow;
 use aionui_realtime::EventBroadcaster;
 use aionui_role::{RoleError, RoleService};
 use axum::extract::State;
@@ -45,6 +47,11 @@ use serde_json::Value;
 const HEADER_USER_ID: &str = "x-aionui-user-id";
 const HEADER_CONVERSATION_ID: &str = "x-aionui-conversation-id";
 const HEADER_RUNTIME_TOKEN: &str = "x-aionui-runtime-token";
+
+/// Message type of the card a run's report leaves in the role's thread.
+const ROLE_REPORT_MESSAGE: &str = "role_report";
+/// Announces a card left in a role's thread, carrying the message as stored.
+const ROLE_THREAD_CARD_EVENT: &str = "role.thread_card";
 
 #[derive(Clone)]
 pub struct RuntimeRoleState {
@@ -263,6 +270,9 @@ async fn report(
         Ok(kept) => kept,
         Err(error) => return role_failure(error, COMMAND),
     };
+    if let Some(report) = kept.as_ref() {
+        card_in_thread(&state, &caller.user_id, &role.id, report).await;
+    }
     let event = RoleReportedEvent {
         conversation_id: caller.conversation_id,
         role_id: role.id,
@@ -287,6 +297,61 @@ async fn report(
             recorded: kept.is_some(),
         },
     )
+}
+
+/// Leave what the role told the user as a card in the role's one thread with
+/// the user, when it was told from a run elsewhere, and show it to open
+/// clients. The thread's next turn hands the same report to the agent. A
+/// failure is logged; the report stands either way.
+async fn card_in_thread(state: &RuntimeRoleState, user_id: &str, role_id: &str, report: &RoleReport) {
+    let thread = match state.roles.thread(role_id).await {
+        Ok(Some(thread)) if thread != report.conversation_id => thread,
+        Ok(_) => return,
+        Err(error) => {
+            tracing::warn!(role_id, error = %error, "role report: thread unreadable, no card left");
+            return;
+        }
+    };
+    let content = serde_json::json!({
+        "role_id": role_id,
+        "outcome": report.outcome,
+        "summary": report.summary,
+        "run_conversation_id": report.conversation_id,
+        "at": report.at,
+    });
+    let row = MessageRow {
+        id: ConversationService::mint_msg_id(),
+        conversation_id: thread.clone(),
+        msg_id: None,
+        r#type: ROLE_REPORT_MESSAGE.into(),
+        content: content.to_string(),
+        position: Some("center".into()),
+        status: Some("finish".into()),
+        hidden: false,
+        created_at: report.at,
+        backend_turn_id: None,
+    };
+    if let Err(error) = state.conversations.insert_message(user_id, &row).await {
+        // The thread may be gone; the user's next conversation with the role takes its place.
+        tracing::warn!(role_id, conversation_id = %thread, error = %error, "role report: card not left in the thread");
+        return;
+    }
+    tracing::info!(role_id, conversation_id = %thread, "role report: card left in the thread");
+    // Its own event rather than a stream frame: a card is no turn, and the
+    // conversation's turn tracking must not take it for one.
+    state.broadcaster.broadcast(WebSocketMessage::new(
+        ROLE_THREAD_CARD_EVENT,
+        serde_json::json!({
+            "user_id": user_id,
+            "id": row.id,
+            "conversation_id": thread,
+            "type": row.r#type,
+            "content": content,
+            "position": row.position,
+            "status": row.status,
+            "created_at": row.created_at,
+        }),
+    ));
 }
 
 /// The resident role the calling conversation runs as. Refuses a caller whose

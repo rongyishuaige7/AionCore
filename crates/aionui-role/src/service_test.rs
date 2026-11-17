@@ -715,3 +715,109 @@ async fn only_the_newest_reports_are_kept_and_a_line_that_does_not_parse_costs_o
         MAX_KEPT_REPORTS
     );
 }
+
+#[tokio::test]
+async fn a_role_keeps_one_thread_and_hands_it_what_its_runs_told_the_user_once() {
+    let root = tempfile::tempdir().unwrap();
+    let service = service(&root);
+    service.upsert("builtin-office", request("", &[])).await.unwrap();
+    service
+        .record_report(
+            "builtin-office",
+            RoleReportOutcome::Say,
+            "before the thread",
+            "run_0",
+            500,
+        )
+        .await
+        .unwrap();
+
+    // The first conversation to take a turn becomes the thread, and starts from
+    // the standing section rather than from old reports.
+    assert_eq!(
+        service
+            .open_thread_turn("builtin-office", "chat_1", false, 1_000)
+            .await
+            .unwrap(),
+        ThreadTurn::Thread {
+            reports: Vec::new(),
+            adopted: true
+        }
+    );
+    assert_eq!(
+        service
+            .get("builtin-office")
+            .await
+            .unwrap()
+            .thread_conversation_id
+            .as_deref(),
+        Some("chat_1")
+    );
+    // Another conversation is a side conversation while the thread lives.
+    assert_eq!(
+        service
+            .open_thread_turn("builtin-office", "chat_2", false, 1_100)
+            .await
+            .unwrap(),
+        ThreadTurn::Aside
+    );
+
+    let ask = service
+        .record_report(
+            "builtin-office",
+            RoleReportOutcome::Ask,
+            "send it to finance?",
+            "run_1",
+            2_000,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    // A report from the thread itself was seen there; it is not brought again.
+    service
+        .record_report(
+            "builtin-office",
+            RoleReportOutcome::Say,
+            "said in the thread",
+            "chat_1",
+            2_100,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        service
+            .open_thread_turn("builtin-office", "chat_1", false, 3_000)
+            .await
+            .unwrap(),
+        ThreadTurn::Thread {
+            reports: vec![ask],
+            adopted: false
+        }
+    );
+    assert_eq!(
+        service
+            .open_thread_turn("builtin-office", "chat_1", false, 4_000)
+            .await
+            .unwrap(),
+        ThreadTurn::Thread {
+            reports: Vec::new(),
+            adopted: false
+        }
+    );
+
+    // Once the thread is gone, the next conversation takes its place.
+    assert_eq!(
+        service
+            .open_thread_turn("builtin-office", "chat_2", true, 5_000)
+            .await
+            .unwrap(),
+        ThreadTurn::Thread {
+            reports: Vec::new(),
+            adopted: true
+        }
+    );
+    assert!(matches!(
+        service.open_thread_turn("builtin-gone", "chat_9", false, 5_000).await,
+        Err(RoleError::NotFound(_))
+    ));
+}

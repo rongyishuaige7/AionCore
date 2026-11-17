@@ -193,6 +193,8 @@ pub enum MessageType {
     AvailableCommands,
     SkillSuggest,
     CronTrigger,
+    /// What a resident role's run elsewhere told the user, left in the role's thread.
+    RoleReport,
 }
 
 /// Display position of a message in the chat UI.

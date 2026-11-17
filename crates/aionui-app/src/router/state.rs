@@ -527,6 +527,7 @@ pub fn build_conversation_state(
         roles: RoleServiceTeamPort {
             service: role_service(services),
         },
+        conversations: conversation_service.conversation_repo().clone(),
     }));
     if let Some(cron_service) = cron_service {
         conversation_service.with_delete_hook(cron_service.clone());
@@ -764,6 +765,8 @@ impl aionui_cron::executor::CronRolePort for RoleServiceCronPort {
 /// conversation the user takes part in.
 struct RoleServiceConversationPort {
     roles: RoleServiceTeamPort,
+    /// Where a role's recorded thread is looked up, to tell whether it still exists.
+    conversations: Arc<dyn aionui_db::IConversationRepository>,
 }
 
 #[async_trait::async_trait]
@@ -776,6 +779,58 @@ impl aionui_conversation::ConversationRolePort for RoleServiceConversationPort {
             Err(error) => {
                 // The conversation opens without its role rather than not at all.
                 tracing::warn!(assistant_id, error = %error, "conversation: role brief unavailable");
+                None
+            }
+        }
+    }
+
+    async fn thread_news(&self, user_id: &str, assistant_id: &str, conversation_id: &str) -> Option<String> {
+        let roles = &self.roles.service;
+        let recorded = match roles.thread(assistant_id).await {
+            Ok(recorded) => recorded,
+            // An assistant id that cannot name a role directory is not a role.
+            Err(RoleError::InvalidId(_)) => return None,
+            Err(error) => {
+                tracing::warn!(assistant_id, error = %error, "conversation: role thread unreadable");
+                return None;
+            }
+        };
+        let thread_gone = match recorded.as_deref() {
+            Some(thread) if thread != conversation_id => {
+                matches!(self.conversations.get(user_id, thread).await, Ok(None))
+            }
+            _ => false,
+        };
+        match roles
+            .open_thread_turn(assistant_id, conversation_id, thread_gone, aionui_common::now_ms())
+            .await
+        {
+            Ok(aionui_role::ThreadTurn::Thread { reports, adopted }) => {
+                if adopted {
+                    tracing::info!(
+                        assistant_id,
+                        conversation_id,
+                        "role takes this conversation as its thread"
+                    );
+                }
+                let lines: Vec<String> = reports
+                    .iter()
+                    .map(|report| {
+                        format!(
+                            "{} [{}] {}",
+                            local_minute(report.at),
+                            report.outcome.as_str(),
+                            report.summary
+                        )
+                    })
+                    .collect();
+                aionui_team::prompts::render_thread_news(&lines)
+            }
+            Ok(aionui_role::ThreadTurn::Aside) => None,
+            // Not a role: its conversations have no thread.
+            Err(RoleError::NotFound(_) | RoleError::InvalidId(_)) => None,
+            Err(error) => {
+                tracing::warn!(assistant_id, error = %error, "conversation: role thread not opened");
                 None
             }
         }

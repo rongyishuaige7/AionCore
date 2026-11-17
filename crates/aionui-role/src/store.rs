@@ -21,6 +21,7 @@ const ARCHIVE_PREFIX: &str = "MEMORY-";
 const PROGRESS_DIR: &str = "progress";
 const PROGRESS_EXTENSION: &str = "md";
 const REPORTED_FILE: &str = "reported.jsonl";
+const THREAD_FILE: &str = "thread.json";
 const ID_SEPARATOR: &str = ":";
 const DIR_SEPARATOR: &str = "@";
 
@@ -41,6 +42,18 @@ pub(crate) struct RoleDefinition {
     pub asks_when_scheduled: bool,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+/// Contents of `thread.json`: the one conversation the user keeps with the
+/// role, and how far what the role told the user from its runs elsewhere has
+/// been handed to it. Kept beside `role.json`, out of the memory directory the
+/// role itself writes in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ThreadRecord {
+    pub conversation_id: String,
+    /// Reports made at or before this moment, in milliseconds since the epoch,
+    /// have been handed to the thread.
+    pub delivered_at: i64,
 }
 
 /// One task file under `memory/progress/`.
@@ -121,6 +134,22 @@ impl RoleStore {
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
             Err(error) => Err(error.into()),
         }
+    }
+
+    pub(crate) async fn read_thread(&self, id: &str) -> Result<Option<ThreadRecord>, RoleError> {
+        let raw = match tokio::fs::read_to_string(self.role_dir(id).join(THREAD_FILE)).await {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        serde_json::from_str(&raw)
+            .map(Some)
+            .map_err(|error| RoleError::Corrupt(format!("{id} thread: {error}")))
+    }
+
+    pub(crate) async fn write_thread(&self, id: &str, record: &ThreadRecord) -> Result<(), RoleError> {
+        let raw = serde_json::to_vec_pretty(record).map_err(|error| RoleError::Corrupt(format!("{id}: {error}")))?;
+        write_atomic(&self.role_dir(id).join(THREAD_FILE), &raw).await
     }
 
     pub(crate) async fn read_memory(&self, id: &str) -> Result<String, RoleError> {

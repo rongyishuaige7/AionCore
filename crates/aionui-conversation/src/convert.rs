@@ -445,6 +445,25 @@ mod tests {
     }
 
     #[test]
+    fn a_role_card_left_in_a_thread_reads_back_as_a_message() {
+        let row = MessageRow {
+            id: "m1".into(),
+            conversation_id: "thread".into(),
+            msg_id: None,
+            r#type: "role_report".into(),
+            content: json!({ "outcome": "ask", "summary": "ship it?" }).to_string(),
+            position: Some("center".into()),
+            status: Some("finish".into()),
+            hidden: false,
+            created_at: 1,
+            backend_turn_id: None,
+        };
+        let message = row_to_message_response(row).unwrap();
+        assert_eq!(message.r#type, MessageType::RoleReport);
+        assert_eq!(message.content["summary"], json!("ship it?"));
+    }
+
+    #[test]
     fn string_to_enum_invalid() {
         let err = string_to_enum::<AgentType>("not_valid").unwrap_err();
         assert!(matches!(err, ConversationError::Internal { .. }));

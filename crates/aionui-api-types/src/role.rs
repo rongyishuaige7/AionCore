@@ -35,6 +35,10 @@ pub struct RoleResponse {
     /// newest first.
     #[serde(default)]
     pub reported: Vec<RoleReport>,
+    /// The one conversation the user keeps with the role, where what it tells
+    /// from runs elsewhere is brought. Absent until the user has talked to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_conversation_id: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
