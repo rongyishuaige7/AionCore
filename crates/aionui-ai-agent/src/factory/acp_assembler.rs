@@ -1,8 +1,13 @@
 use crate::shared_kernel::PersistedSessionState;
+use crate::types::{
+    AIONUI_BASE_URL_ENV, AIONUI_CONVERSATION_ID_ENV, AIONUI_HELPER_BIN_ENV, AIONUI_RUNTIME_TOKEN_ENV,
+    AIONUI_USER_ID_ENV,
+};
 use agent_client_protocol::schema::v1::{EnvVariable, McpServer, McpServerStdio, NewSessionRequest};
 use aionui_api_types::AgentMetadata;
 use aionui_api_types::{AcpBuildExtra, TEAM_MCP_SERVER_NAME, TeamMcpStdioConfig};
-use aionui_common::CommandSpec;
+use aionui_common::{CommandSpec, EnvVar};
+use aionui_session::ROLE_MCP_SERVER_NAME;
 use std::path::PathBuf;
 
 /// Pre-computed workspace information.
@@ -70,7 +75,7 @@ pub async fn assemble_acp_params(
     data_dir: PathBuf,
     dump_prompts: bool,
 ) -> AcpSessionParams {
-    let mcp_servers = resolve_mcp_servers(&config, user_mcp_servers);
+    let mcp_servers = resolve_mcp_servers(&config, &command_spec.env, user_mcp_servers);
     let preset_context = compose_preset_context(config.preset_context.as_deref());
 
     AcpSessionParams {
@@ -90,16 +95,58 @@ pub async fn assemble_acp_params(
 
 /// Determine which MCP servers to inject into `session/new`.
 ///
-/// Layout: `[team?, ...user_mcp_servers]`. The user's
+/// Layout: `[team?, ...user_mcp_servers, role?]`. The user's
 /// own enabled MCP servers are always appended on top so a team
-/// session still gets the operator's tools.
-fn resolve_mcp_servers(config: &AcpBuildExtra, user_mcp_servers: Vec<McpServer>) -> Vec<McpServer> {
+/// session still gets the operator's tools, and generic ACP vendors (such as
+/// `dsh`, which scrubs `*TOKEN*` env vars from shell subprocesses) receive the
+/// `aionui-role` stdio MCP server whenever the complete runtime context is
+/// available (`tools/list` hides role tools when the conversation is not a role).
+fn resolve_mcp_servers(
+    config: &AcpBuildExtra,
+    spawn_env: &[EnvVar],
+    user_mcp_servers: Vec<McpServer>,
+) -> Vec<McpServer> {
     let mut servers: Vec<McpServer> = Vec::new();
     if let Some(cfg) = config.team_mcp_stdio_config.as_ref() {
         servers.push(team_mcp_server(cfg));
     }
-    servers.extend(user_mcp_servers);
+    servers.extend(
+        user_mcp_servers
+            .into_iter()
+            .filter(|server| !matches!(server, McpServer::Stdio(stdio) if stdio.name == ROLE_MCP_SERVER_NAME)),
+    );
+    if let Some(role_tools) = role_mcp_server(spawn_env) {
+        servers.push(role_tools);
+    }
     servers
+}
+
+/// Build the resident-role stdio MCP server (`aioncore mcp-role-stdio`) from
+/// the ACP process spawn environment when all five runtime variables are set.
+fn role_mcp_server(spawn_env: &[EnvVar]) -> Option<McpServer> {
+    let value = |name: &str| {
+        spawn_env
+            .iter()
+            .rev()
+            .find(|entry| entry.name == name)
+            .map(|entry| entry.value.clone())
+            .filter(|val| !val.is_empty())
+    };
+    let command = value(AIONUI_HELPER_BIN_ENV)?;
+    let env = [
+        AIONUI_BASE_URL_ENV,
+        AIONUI_USER_ID_ENV,
+        AIONUI_CONVERSATION_ID_ENV,
+        AIONUI_RUNTIME_TOKEN_ENV,
+    ]
+    .into_iter()
+    .map(|name| value(name).map(|val| EnvVariable::new(name.to_owned(), val)))
+    .collect::<Option<Vec<_>>>()?;
+
+    let stdio = McpServerStdio::new(ROLE_MCP_SERVER_NAME, command)
+        .args(vec!["mcp-role-stdio".to_owned()])
+        .env(env);
+    Some(McpServer::Stdio(stdio))
 }
 
 /// Compose first-message preset context.
@@ -235,7 +282,7 @@ mod tests {
             backend: Some("claude".into()),
             ..Default::default()
         };
-        let servers = resolve_mcp_servers(&config, vec![user_stdio("mcp-docs")]);
+        let servers = resolve_mcp_servers(&config, &[], vec![user_stdio("mcp-docs")]);
         assert_eq!(servers.len(), 1);
         match &servers[0] {
             McpServer::Stdio(s) => assert_eq!(s.name, "mcp-docs"),
@@ -250,7 +297,7 @@ mod tests {
             team_mcp_stdio_config: Some(team_cfg()),
             ..Default::default()
         };
-        let servers = resolve_mcp_servers(&config, vec![user_stdio("mcp-docs")]);
+        let servers = resolve_mcp_servers(&config, &[], vec![user_stdio("mcp-docs")]);
         assert_eq!(servers.len(), 2);
         match &servers[0] {
             McpServer::Stdio(s) => {
@@ -325,7 +372,62 @@ mod tests {
             backend: Some("claude".into()),
             ..Default::default()
         };
-        let servers = resolve_mcp_servers(&config, Vec::new());
+        let servers = resolve_mcp_servers(&config, &[], Vec::new());
         assert!(servers.is_empty());
+    }
+
+    #[test]
+    fn resolve_mcp_servers_attaches_role_mcp_when_runtime_env_is_complete() {
+        let config = AcpBuildExtra {
+            backend: Some("custom-acp".into()),
+            ..Default::default()
+        };
+        let env = vec![
+            EnvVar {
+                name: AIONUI_HELPER_BIN_ENV.into(),
+                value: "/bin/aioncore".into(),
+            },
+            EnvVar {
+                name: AIONUI_BASE_URL_ENV.into(),
+                value: "http://127.0.0.1:25820".into(),
+            },
+            EnvVar {
+                name: AIONUI_USER_ID_ENV.into(),
+                value: "u1".into(),
+            },
+            EnvVar {
+                name: AIONUI_CONVERSATION_ID_ENV.into(),
+                value: "c1".into(),
+            },
+            EnvVar {
+                name: AIONUI_RUNTIME_TOKEN_ENV.into(),
+                value: "rt-secret".into(),
+            },
+        ];
+
+        // Deduplicates any stale user entry carrying the reserved role server name.
+        let servers = resolve_mcp_servers(
+            &config,
+            &env,
+            vec![user_stdio(ROLE_MCP_SERVER_NAME), user_stdio("mcp-docs")],
+        );
+        assert_eq!(servers.len(), 2);
+        match &servers[0] {
+            McpServer::Stdio(s) => assert_eq!(s.name, "mcp-docs"),
+            _ => panic!("expected user stdio"),
+        }
+        match &servers[1] {
+            McpServer::Stdio(s) => {
+                assert_eq!(s.name, ROLE_MCP_SERVER_NAME);
+                assert_eq!(s.command.to_string_lossy(), "/bin/aioncore");
+                assert_eq!(s.args, vec!["mcp-role-stdio".to_owned()]);
+            }
+            _ => panic!("expected role stdio"),
+        }
+
+        // Without runtime token, role MCP is omitted.
+        let without_token = &env[..4];
+        let servers_without = resolve_mcp_servers(&config, without_token, Vec::new());
+        assert!(servers_without.is_empty());
     }
 }

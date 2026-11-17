@@ -233,12 +233,12 @@ pub(super) async fn build(
     };
     let mut session_mcp_servers = user_mcp_servers;
     for server in &config.session_mcp_servers {
-        // Reserved name defense: the team coordination MCP must win.
-        if server.name == TEAM_MCP_SERVER_NAME {
+        // Reserved name defense: built-in team and role MCP servers must win.
+        if server.name == TEAM_MCP_SERVER_NAME || server.name == aionui_session::ROLE_MCP_SERVER_NAME {
             warn!(
                 ctx.conversation_id,
                 server_name = %server.name,
-                "session_mcp: reserved team MCP name in snapshot; skipping"
+                "session_mcp: reserved builtin MCP name in snapshot; skipping"
             );
             continue;
         }

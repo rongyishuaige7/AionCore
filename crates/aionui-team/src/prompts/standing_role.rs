@@ -148,7 +148,9 @@ fn render(brief: &TeamRoleBrief, setting: Setting) -> String {
             "When you learn something that should outlast {here} (a preference of the user, a mistake not to \
              repeat, a decision and its reason), record one note:\n\n\
              ```\n{ROLE_HELPER} remember <<'JSON'\n{{\"note\": \"<one line>\"}}\nJSON\n```\n\n\
-             The whole memory is kept in `{}`, and `{ROLE_HELPER} show` prints it. To tidy the memory itself \
+             Each note is dated for you (do not write a leading date), and only the newest 8,000 characters of \
+             `{}` are shown above — keep durable facts here and put routine run-by-run state in `progress` \
+             instead. `{ROLE_HELPER} show` prints it. To tidy the memory itself \
              (merge what repeats, drop what no longer holds), replace it whole with `{ROLE_HELPER} curate`, which \
              takes `{{\"memory\": \"<the whole new memory>\"}}` the same way and archives the version it replaces.",
             memory_file.display()
@@ -156,8 +158,8 @@ fn render(brief: &TeamRoleBrief, setting: Setting) -> String {
     } else {
         out.push_str(&format!(
             "When you learn something that should outlast this team (a preference of the user, a mistake not to \
-             repeat, a decision and its reason), call `{REMEMBER_TOOL}` with one note. The whole memory is kept \
-             in `{}`.",
+             repeat, a decision and its reason), call `{REMEMBER_TOOL}` with one note (it is dated for you; only \
+             the newest 8,000 characters are shown above). The whole memory is kept in `{}`.",
             memory_file.display()
         ));
     }
@@ -251,8 +253,8 @@ fn render(brief: &TeamRoleBrief, setting: Setting) -> String {
             "\n\n### Ending this run\n\n\
              Nobody is watching this run. Before your final reply, declare how it ended:\n\n\
              ```\n{ROLE_HELPER} report <<'JSON'\n{{\"outcome\": \"silent\"}}\nJSON\n```\n\n\
-             - `silent`: nothing the user needs to hear, and the run asks for no attention. Use it whenever a \
-             check found nothing new.\n\
+             - `silent`: nothing the user needs to hear, and the run asks for no attention (`recorded: false` is \
+             expected). Use it whenever a check found nothing new.\n\
              - `say`: there is something the user should know. Add `\"summary\": \"<the one line they see \
              first>\"`.\n\
              - `ask`: you cannot go on without the user's answer. The summary is the question.\n\n\

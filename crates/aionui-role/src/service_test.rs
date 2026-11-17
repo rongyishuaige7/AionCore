@@ -297,6 +297,32 @@ async fn remember_does_not_write_the_same_note_twice() {
 }
 
 #[tokio::test]
+async fn remember_strips_a_leading_bullet_and_day_when_the_caller_already_wrote_them() {
+    let root = tempfile::tempdir().unwrap();
+    let service = service(&root);
+    service.upsert("reviewer", request("", &[])).await.unwrap();
+
+    let first = service
+        .remember("reviewer", "2026-11-17 keep exits pinned", "2026-11-17")
+        .await
+        .unwrap();
+    assert_eq!(first.line, "- 2026-11-17 keep exits pinned");
+    assert!(!first.already_recorded);
+
+    let second = service
+        .remember("reviewer", "- 2026-11-18 keep exits pinned", "2026-11-18")
+        .await
+        .unwrap();
+    assert!(second.already_recorded);
+    assert_eq!(second.line, "- 2026-11-17 keep exits pinned");
+
+    assert!(matches!(
+        service.remember("reviewer", "- 2026-11-17", "2026-11-17").await,
+        Err(RoleError::InvalidRequest(_))
+    ));
+}
+
+#[tokio::test]
 async fn remember_refuses_bad_notes_a_full_memory_and_an_assistant_that_is_no_role() {
     let root = tempfile::tempdir().unwrap();
     let service = service(&root);

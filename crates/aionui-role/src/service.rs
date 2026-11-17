@@ -194,8 +194,9 @@ impl RoleService {
     /// not written twice. `day` is the caller's local date (`YYYY-MM-DD`).
     pub async fn remember(&self, id: &str, note: &str, day: &str) -> Result<RememberedNote, RoleError> {
         validate_role_id(id)?;
-        let note = note.split_whitespace().collect::<Vec<_>>().join(" ");
-        if note.is_empty() {
+        let flattened = note.split_whitespace().collect::<Vec<_>>().join(" ");
+        let note = note_text(&flattened);
+        if note.is_empty() || is_day(note) {
             return Err(RoleError::InvalidRequest("a note cannot be empty".to_owned()));
         }
         if note.chars().count() > MAX_NOTE_CHARS {

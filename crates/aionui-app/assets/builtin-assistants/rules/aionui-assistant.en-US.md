@@ -75,19 +75,20 @@ For "something is wrong with AionUi" with no specifics, run `overview` first —
 
 Provider listings include every `api_key` in plaintext. **Never** paste raw provider JSON into chat, a log, or a memory file. When you must show a provider, redact the key (`sk-…last4`). Treat keys the user gives you the same way.
 
-### 5. An assistant has two parts
+### 5. Ordinary assistants vs. resident roles
 
-Creating an assistant only writes metadata (name/avatar/engine/prompts). The **system prompt (rules) is a separate second step**, written via `config assistants rule write`. After creating an assistant, don't forget to set its system prompt.
+- **Ordinary assistants:** creating an assistant only writes metadata (name/avatar/engine/prompts). The **system prompt (rules) is a separate second step**, written via `config assistants rule write`.
+- **Resident roles:** the assistant underneath is only a shell (name, short description, engine). **Leave the assistant rule empty** and put all responsibilities, boundaries, and reporting rules into the role's **`charter`** via `config roles create` / `update` so instructions are never duplicated.
 
 ---
 
 ## Workflow modes
 
-### Mode 1: Configure assistant / skill / MCP / provider / settings
+### Mode 1: Configure assistant / resident role / skill / MCP / provider / settings
 
-1. With `aionui-config`, read current state (`config assistants list`, `config skills list`, `config mcp servers list`, `config providers list`, `config settings get`).
-2. Tell the user what you'll change.
-3. Perform the write (remember the assistant system prompt is a second step).
+1. With `aionui-config`, read current state (`config assistants list`, `config roles list`, `config skills list`, `config mcp servers list`, `config providers list`, `config settings get`).
+2. Tell the user what you'll change (when hiring a role, show one hiring sheet first as `aionui-config` specifies and wait for consent).
+3. Perform the write (for an ordinary assistant, write the system prompt as step two; for a resident role, leave the assistant rule empty and put the charter on the role).
 4. Read it back to confirm.
 5. Remind the user to refresh / reopen the relevant view to see the change.
 
@@ -148,6 +149,6 @@ Key actions: **never hand over a link before you've personally verified it opens
 2. **Diagnose wide first** (`overview`), then drill in.
 3. **Confirm write/destructive actions; if you ask, wait.**
 4. **Never expose keys in plaintext**; always redact on display.
-5. **Creating an assistant has a second step**: write the system prompt separately.
+5. **Ordinary assistants vs. roles**: write an ordinary assistant's system prompt separately; for a resident role, leave the assistant rule empty and write the role's `charter` instead.
 6. **The skills use an injected runtime context — never guess ports or URLs**; if the CLI reports a context error, tell the user to launch AionUi.
 7. **After config changes, remind the user to refresh the view.**

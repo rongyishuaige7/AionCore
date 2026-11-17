@@ -75,19 +75,20 @@
 
 Provider 列表包含每个 `api_key` 的明文。**永远不要**把 Provider 原始 JSON 贴进对话、日志或记忆文件。必须展示 Provider 时，把 key 脱敏成 `sk-…后四位`。对待用户给你的 key 同样如此。
 
-### 5. 助手有两部分
+### 5. 普通助手与常驻角色的分工边界
 
-创建助手只写了元数据（名称、头像、引擎、快捷提示），**系统提示词（rules）是单独的第二步**，通过 `config assistants rule write` 写入。建完助手别忘了设置它的系统提示词。
+- **普通助手**：创建助手只写了元数据（名称、头像、引擎、快捷提示），**系统提示词（rules）是单独的第二步**，通过 `config assistants rule write` 写入。
+- **常驻角色（Resident Role）**：底层的助手只是一个空壳（名称、简短描述、引擎），**不要写助手系统提示词（rules 留空）**！角色的职责、禁区与汇报规范统一写进角色的 **`charter`**（通过 `config roles create` / `update`），避免两处提示词重复注入。
 
 ---
 
 ## 工作流模式
 
-### 模式 1：配置助手 / 技能 / MCP / Provider / 设置
+### 模式 1：配置助手 / 常驻角色 / 技能 / MCP / Provider / 设置
 
-1. 用 `aionui-config` 读当前状态（`config assistants list`、`config skills list`、`config mcp servers list`、`config providers list`、`config settings get`）
-2. 向用户说明将要做的改动
-3. 执行写操作（注意助手系统提示词是第二步）
+1. 用 `aionui-config` 读当前状态（`config assistants list`、`config roles list`、`config skills list`、`config mcp servers list`、`config providers list`、`config settings get`）
+2. 向用户说明将要做的改动（招聘角色时按 `aionui-config` 先展示完整招聘单，等用户确认）
+3. 执行写操作（普通助手记得第二步写系统提示词；常驻角色则保持助手规则为空，把章程写在角色 `charter` 上）
 4. 读回确认
 5. 提醒用户刷新 / 重开对应界面以看到变化
 
@@ -148,6 +149,6 @@ Provider 列表包含每个 `api_key` 的明文。**永远不要**把 Provider �
 2. **诊断先宽后窄**：无线索先 `overview`，再深入
 3. **关键操作需确认，询问后必须等待**
 4. **密钥永不明文外露**，展示一律脱敏
-5. **建助手别忘第二步**：系统提示词单独写
+5. **区分普通助手与常驻角色**：普通助手第二步单独写系统提示词；常驻角色保持助手规则为空，职责只写进角色 `charter`
 6. **技能通过注入的运行时上下文工作，不要猜端口或地址**；CLI 报告上下文错误就提示用户启动 AionUi
 7. **改配置后提醒用户刷新界面**
