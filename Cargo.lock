@@ -839,8 +839,10 @@ version = "0.2.2"
 dependencies = [
  "aionui-api-types",
  "aionui-common",
+ "async-trait",
  "axum",
  "chrono",
+ "git2",
  "http-body-util",
  "rusqlite",
  "serde",

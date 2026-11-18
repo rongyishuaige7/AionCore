@@ -124,6 +124,20 @@ impl VersionInfo {
     }
 }
 
+/// Request extension recording the authenticated user id for crates that do not
+/// depend on `aionui-auth` directly (such as `aionui-role`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthenticatedUserId(pub String);
+
+/// Request extension injected ONLY when a request authenticated via the
+/// conversation-helper runtime token (`AIONUI_RUNTIME_TOKEN`), distinguishing
+/// an agent subprocess (`aioncore config ...`) from a human browser/UI session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeHelperCaller {
+    pub user_id: String,
+    pub conversation_id: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

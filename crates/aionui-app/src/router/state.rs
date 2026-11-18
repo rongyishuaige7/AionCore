@@ -248,7 +248,17 @@ pub async fn build_module_states(
     // resolve empty rules. Mirrors the interactive path in build_conversation_state.
     cron.conversation_service
         .with_assistant_dispatcher(assistant.service.clone() as Arc<dyn AssistantRuleDispatcher>);
+    let role_governance = Arc::new(RoleGovernanceAdapter {
+        roles: services.role_service.clone(),
+        cron: cron.cron_service.clone(),
+        conversation: services.conversation_service.clone(),
+        conversations: services.conversation_repo.clone(),
+        task_manager: services.worker_task_manager.clone(),
+    });
+    cron.cron_service
+        .set_role_proposal_port(role_governance.clone() as Arc<dyn aionui_cron::CronRoleProposalPort>);
     cron.cron_service.init().await;
+    spawn_role_dreamer_loop(role_governance.clone());
     tracing::info!(
         elapsed_ms = boot.elapsed().as_millis(),
         "startup: cron state initialized"
@@ -317,7 +327,12 @@ pub async fn build_module_states(
         file: build_module_state_phase(&boot, "file", || build_file_state(services))?,
         project: build_module_state_phase(&boot, "project", || build_project_state(services)),
         sidebar: build_module_state_phase(&boot, "sidebar", || build_sidebar_state(services)),
-        role: build_module_state_phase(&boot, "role", || build_role_state(services)),
+        role: build_module_state_phase(&boot, "role", || {
+            build_role_state(
+                services,
+                role_governance.clone() as Arc<dyn aionui_role::RoleExternalPort>,
+            )
+        }),
         mcp: build_module_state_phase(&boot, "mcp", || build_mcp_state(services)),
         extension: ext_state,
         hub: hub_state,
@@ -528,6 +543,7 @@ pub fn build_conversation_state(
             service: role_service(services),
         },
         conversations: conversation_service.conversation_repo().clone(),
+        cron: cron_service.clone(),
     }));
     if let Some(cron_service) = cron_service {
         conversation_service.with_delete_hook(cron_service.clone());
@@ -615,14 +631,12 @@ pub fn build_sidebar_state(services: &AppServices) -> SidebarRouterState {
 /// a stateless view over that directory, so the HTTP routes and the team
 /// runtime may each hold their own instance.
 fn role_service(services: &AppServices) -> Arc<RoleService> {
-    Arc::new(RoleService::new(services.data_dir.join("roles")))
+    services.role_service.clone()
 }
 
 /// Build the resident-role router state from application services.
-pub fn build_role_state(services: &AppServices) -> RoleRouterState {
-    RoleRouterState {
-        service: role_service(services),
-    }
+pub fn build_role_state(services: &AppServices, external: Arc<dyn aionui_role::RoleExternalPort>) -> RoleRouterState {
+    RoleRouterState::with_external(role_service(services), external)
 }
 
 /// Adapts the role service to the team runtime's [`aionui_team::TeamRolePort`],
@@ -635,6 +649,8 @@ struct RoleServiceTeamPort {
 #[async_trait::async_trait]
 impl aionui_team::TeamRolePort for RoleServiceTeamPort {
     async fn role_brief(&self, assistant_id: &str) -> Result<Option<aionui_team::TeamRoleBrief>, String> {
+        let playbook = self.service.prompt_playbook(assistant_id).await.unwrap_or_default();
+        let boss_profile = self.service.boss_profile().await.unwrap_or_default();
         match self.service.find(assistant_id).await {
             Ok(role) => Ok(role.map(|role| aionui_team::TeamRoleBrief {
                 charter: role.charter,
@@ -663,6 +679,8 @@ impl aionui_team::TeamRolePort for RoleServiceTeamPort {
                         )
                     })
                     .collect(),
+                playbook,
+                boss_profile,
             })),
             // An assistant id that cannot name a role directory is not a role.
             Err(RoleError::InvalidId(_)) => Ok(None),
@@ -767,6 +785,7 @@ struct RoleServiceConversationPort {
     roles: RoleServiceTeamPort,
     /// Where a role's recorded thread is looked up, to tell whether it still exists.
     conversations: Arc<dyn aionui_db::IConversationRepository>,
+    cron: Option<Arc<aionui_cron::service::CronService>>,
 }
 
 #[async_trait::async_trait]
@@ -904,6 +923,344 @@ impl aionui_conversation::ConversationRolePort for RoleServiceConversationPort {
         )
         .await;
     }
+
+    async fn retrospective_context(
+        &self,
+        user_id: &str,
+        assistant_id: &str,
+    ) -> Option<aionui_conversation::RoleRetrospectiveContext> {
+        let _role = self.roles.service.find(assistant_id).await.ok()??;
+        let (last_retrospective_at, _) = self.roles.service.dreamer_timestamps(assistant_id).await.ok()?;
+        let playbook_lines = self
+            .roles
+            .service
+            .prompt_playbook(assistant_id)
+            .await
+            .unwrap_or_default();
+        let boss_profile = self.roles.service.boss_profile().await.unwrap_or_default();
+        let mut failed_runs = Vec::new();
+        if let Some(ref cron) = self.cron
+            && let Ok(jobs) = cron
+                .list_jobs(user_id, &aionui_api_types::ListCronJobsQuery { conversation_id: None })
+                .await
+        {
+            for job in jobs {
+                let matches_role = job
+                    .agent_config
+                    .as_ref()
+                    .and_then(|c| c.assistant_id.as_deref().or(c.custom_agent_id.as_deref()))
+                    == Some(assistant_id);
+                if matches_role && job.last_status == Some(aionui_cron::types::JobStatus::Error) {
+                    let err = job.last_error.unwrap_or_default();
+                    failed_runs.push(format!("- {}: {}", job.name, err));
+                }
+            }
+        }
+        Some(aionui_conversation::RoleRetrospectiveContext {
+            last_retrospective_at,
+            playbook_lines,
+            boss_profile,
+            failed_runs,
+        })
+    }
+
+    async fn apply_retrospective(
+        &self,
+        assistant_id: &str,
+        playbook_ops: &[aionui_api_types::PlaybookDeltaOp],
+        boss_ops: &[aionui_api_types::PlaybookDeltaOp],
+        actor: &str,
+        reason: &str,
+        now: i64,
+    ) {
+        if let Err(error) = self
+            .roles
+            .service
+            .apply_retrospective(assistant_id, playbook_ops, boss_ops, actor, reason, now)
+            .await
+        {
+            tracing::warn!(assistant_id, error = %error, "conversation: role retrospective not applied");
+        }
+    }
+
+    async fn next_uncondensed_leaf_batch(
+        &self,
+        assistant_id: &str,
+        batch_size: usize,
+    ) -> Option<(String, usize, Vec<String>)> {
+        self.roles
+            .service
+            .next_uncondensed_leaf_batch(assistant_id, batch_size)
+            .await
+            .ok()
+            .flatten()
+    }
+
+    async fn record_condensed_leaf(
+        &self,
+        assistant_id: &str,
+        conversation_id: &str,
+        expected_start: usize,
+        consumed_count: usize,
+        condensed_leaf: &str,
+    ) -> bool {
+        self.roles
+            .service
+            .record_condensed_leaf(
+                assistant_id,
+                conversation_id,
+                expected_start,
+                consumed_count,
+                condensed_leaf,
+            )
+            .await
+            .unwrap_or(false)
+    }
+}
+
+struct RoleGovernanceAdapter {
+    roles: Arc<RoleService>,
+    cron: Arc<aionui_cron::service::CronService>,
+    conversation: ConversationService,
+    conversations: Arc<dyn aionui_db::IConversationRepository>,
+    task_manager: Arc<dyn IWorkerTaskManager>,
+}
+
+impl RoleGovernanceAdapter {
+    async fn run_dreamer_pass(
+        &self,
+        user_id: &str,
+        role_id: &str,
+        force_retrospective: bool,
+    ) -> Result<aionui_api_types::RoleDreamResponse, String> {
+        let role = self.roles.get(role_id).await.map_err(|e| e.to_string())?;
+        let now = aionui_common::now_ms();
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let (decayed_playbook, archived_progress) = self
+            .roles
+            .run_zero_llm_decay(role_id, &today, now)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let llm_outcome = self
+            .conversation
+            .run_role_dreamer_tasks(
+                user_id,
+                role_id,
+                role.thread_conversation_id.as_deref(),
+                &role.memory,
+                force_retrospective,
+                &self.task_manager,
+            )
+            .await;
+
+        let mut curated_memory = false;
+        if let Some(tidied) = llm_outcome.curated_memory {
+            let stamp = chrono::Local::now().format("%Y-%m-%d-%H%M%S").to_string();
+            if let Ok(done) = self
+                .roles
+                .curate_memory_as(
+                    role_id,
+                    &tidied,
+                    &stamp,
+                    "dreamer",
+                    "dreamer: verified and curated memory",
+                )
+                .await
+            {
+                curated_memory = done.archived_as.is_some();
+            }
+        }
+
+        let _ = self.roles.mark_dreamer_ran(role_id, aionui_common::now_ms()).await;
+        Ok(aionui_api_types::RoleDreamResponse {
+            decayed_playbook,
+            archived_progress,
+            curated_memory,
+            retrospective_ran: llm_outcome.retrospective_ran,
+            condensed_batches: llm_outcome.condensed_batches,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl aionui_role::RoleExternalPort for RoleGovernanceAdapter {
+    async fn apply_cron_proposal(
+        &self,
+        user_id: &str,
+        _role_id: &str,
+        change: &aionui_api_types::RoleProposalChange,
+    ) -> Result<(), String> {
+        match change {
+            aionui_api_types::RoleProposalChange::CreateCronJob { payload, .. } => {
+                if let Some(conv_id) = payload.get("conversation_helper").and_then(serde_json::Value::as_str)
+                    && let Some(inner) = payload.get("request")
+                {
+                    let req: aionui_api_types::CreateConversationCronRequest =
+                        serde_json::from_value(inner.clone()).map_err(|e| e.to_string())?;
+                    self.cron
+                        .create_for_conversation_helper(user_id, conv_id, req)
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| e.to_string())
+                } else {
+                    let req: aionui_api_types::CreateCronJobRequest =
+                        serde_json::from_value(payload.clone()).map_err(|e| e.to_string())?;
+                    self.cron
+                        .add_job(user_id, req)
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| e.to_string())
+                }
+            }
+            aionui_api_types::RoleProposalChange::UpdateCronJob { job_id, payload, .. } => {
+                if let Some(conv_id) = payload.get("conversation_helper").and_then(serde_json::Value::as_str)
+                    && let Some(inner) = payload.get("request")
+                {
+                    let req: aionui_api_types::UpdateConversationCronRequest =
+                        serde_json::from_value(inner.clone()).map_err(|e| e.to_string())?;
+                    self.cron
+                        .update_for_conversation_helper(user_id, conv_id, job_id, req)
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| e.to_string())
+                } else {
+                    let req: aionui_api_types::UpdateCronJobRequest =
+                        serde_json::from_value(payload.clone()).map_err(|e| e.to_string())?;
+                    self.cron
+                        .update_job(user_id, job_id, req)
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| e.to_string())
+                }
+            }
+            aionui_api_types::RoleProposalChange::DeleteCronJob { job_id, .. } => {
+                self.cron.remove_job(user_id, job_id).await.map_err(|e| e.to_string())
+            }
+            aionui_api_types::RoleProposalChange::UpdateRole { .. } => Ok(()),
+        }
+    }
+
+    async fn on_role_dismissed(&self, user_id: &str, role_id: &str) {
+        let Ok(jobs) = self
+            .cron
+            .list_jobs(user_id, &aionui_api_types::ListCronJobsQuery { conversation_id: None })
+            .await
+        else {
+            return;
+        };
+        for job in jobs {
+            let direct_match = job
+                .agent_config
+                .as_ref()
+                .and_then(|c| c.assistant_id.as_deref().or(c.custom_agent_id.as_deref()))
+                == Some(role_id);
+            let conv_match = if !direct_match && !job.conversation_id.trim().is_empty() {
+                self.conversations
+                    .get_assistant_snapshot(user_id, &job.conversation_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some_and(|snap| snap.assistant_id == role_id)
+            } else {
+                false
+            };
+            if !direct_match && !conv_match {
+                continue;
+            }
+            if aionui_cron::follow_up::is_follow_up(&job) {
+                let _ = self.cron.remove_job(user_id, &job.id).await;
+            } else if job.enabled {
+                let pause = aionui_api_types::UpdateCronJobRequest {
+                    name: None,
+                    description: None,
+                    enabled: Some(false),
+                    schedule: None,
+                    message: None,
+                    execution_mode: None,
+                    agent_config: None,
+                    conversation_title: None,
+                    max_retries: None,
+                    queue_enabled: None,
+                };
+                if let Err(error) = self.cron.update_job(user_id, &job.id, pause).await {
+                    tracing::warn!(role_id, job_id = %job.id, error = %error, "role dismiss: failed to pause cron job");
+                }
+            }
+        }
+    }
+
+    async fn run_dreamer(&self, user_id: &str, role_id: &str) -> Result<aionui_api_types::RoleDreamResponse, String> {
+        self.run_dreamer_pass(user_id, role_id, true).await
+    }
+}
+
+#[async_trait::async_trait]
+impl aionui_cron::CronRoleProposalPort for RoleGovernanceAdapter {
+    async fn is_resident_role(&self, assistant_id: &str) -> bool {
+        matches!(self.roles.find(assistant_id).await, Ok(Some(_)))
+    }
+
+    async fn conversation_assistant_id(&self, user_id: &str, conversation_id: &str) -> Option<String> {
+        self.conversations
+            .get_assistant_snapshot(user_id, conversation_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|snap| snap.assistant_id)
+    }
+
+    async fn stage_cron_proposal(
+        &self,
+        role_id: &str,
+        summary: String,
+        detail: String,
+        from_conversation_id: Option<String>,
+        change: aionui_api_types::RoleProposalChange,
+    ) -> Result<aionui_api_types::RoleProposal, String> {
+        self.roles
+            .stage_proposal(
+                role_id,
+                summary,
+                detail,
+                from_conversation_id,
+                change,
+                aionui_common::now_ms(),
+            )
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
+fn spawn_role_dreamer_loop(adapter: Arc<RoleGovernanceAdapter>) {
+    use chrono::Timelike;
+
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30 * 60));
+        // Skip the immediate startup tick so boot stays instant.
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let Ok(roles) = adapter.roles.list().await else {
+                continue;
+            };
+            let now = aionui_common::now_ms();
+            let hour = chrono::Local::now().hour();
+            let is_night_window = (2..6).contains(&hour);
+
+            for role in roles {
+                let (_, last_dreamer_at) = adapter.roles.dreamer_timestamps(&role.id).await.unwrap_or((0, 0));
+                let near_memory_cap = role.memory.len() >= aionui_conversation::DREAMER_CURATE_THRESHOLD_BYTES;
+                let due_nightly = is_night_window && now.saturating_sub(last_dreamer_at) >= 20 * 60 * 60 * 1_000;
+                if !near_memory_cap && !due_nightly {
+                    continue;
+                }
+                if let Err(error) = adapter.run_dreamer_pass("system_default_user", &role.id, false).await {
+                    tracing::warn!(role_id = %role.id, error = %error, "role dreamer: background pass failed");
+                }
+            }
+        }
+    });
 }
 
 /// The minute of a millisecond timestamp in the user's own time zone

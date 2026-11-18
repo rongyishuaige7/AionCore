@@ -17,4 +17,5 @@ pub mod types;
 
 pub use events::CronEventEmitter;
 pub use routes::cron_routes;
+pub use service::CronRoleProposalPort;
 pub use state::CronRouterState;

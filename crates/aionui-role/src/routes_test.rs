@@ -13,9 +13,9 @@ use super::*;
 use crate::service::RoleService;
 
 fn app(root: &tempfile::TempDir) -> Router {
-    role_routes(RoleRouterState {
-        service: Arc::new(RoleService::new(root.path().join("roles"))),
-    })
+    role_routes(RoleRouterState::new(Arc::new(RoleService::new(
+        root.path().join("roles"),
+    ))))
 }
 
 async fn send(app: &Router, method: Method, uri: &str, body: Option<Value>) -> (StatusCode, Value) {
@@ -144,9 +144,7 @@ async fn path_traversal_in_the_id_is_refused() {
 async fn a_task_in_progress_shows_on_the_role_and_can_be_closed_over_http() {
     let root = tempfile::tempdir().unwrap();
     let service = Arc::new(RoleService::new(root.path().join("roles")));
-    let app = role_routes(RoleRouterState {
-        service: service.clone(),
-    });
+    let app = role_routes(RoleRouterState::new(service.clone()));
     send(&app, Method::PUT, "/api/roles/scout", Some(json!({}))).await;
     service
         .set_progress("scout", "舆情 周报", "Monday's sweep done.")
@@ -173,4 +171,136 @@ async fn a_task_in_progress_shows_on_the_role_and_can_be_closed_over_http() {
     let (status, body) = send(&app, Method::DELETE, "/api/roles/nobody/progress/task", None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body["code"], "role_not_found");
+}
+
+async fn send_as_agent(
+    app: &Router,
+    method: Method,
+    uri: &str,
+    conv_id: &str,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
+    let builder = Request::builder().method(method).uri(uri);
+    let mut request = match body {
+        Some(body) => builder
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap(),
+        None => builder.body(Body::empty()).unwrap(),
+    };
+    request.extensions_mut().insert(RuntimeHelperCaller {
+        user_id: "system_default_user".into(),
+        conversation_id: conv_id.into(),
+    });
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let json = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, json)
+}
+
+#[tokio::test]
+async fn agent_major_changes_become_proposals_while_tightening_applies_and_only_user_approves() {
+    let root = tempfile::tempdir().unwrap();
+    let app = app(&root);
+
+    // 1. Agent hires a brand-new role: applies immediately.
+    let (status, hired) = send_as_agent(
+        &app,
+        Method::PUT,
+        "/api/roles/watcher",
+        "conv-butler",
+        Some(json!({
+            "charter": "Watch CI builds.",
+            "denied_tools": ["team_spawn_agent", "team_task_create"],
+            "asks_when_scheduled": true
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(hired["data"]["charter"], "Watch CI builds.");
+    assert_eq!(hired["data"]["proposals"], json!([]));
+
+    // 2. Agent tightens (`verifies: true`) AND attempts major changes (edit charter + turn off ask-first + allow team_task_create).
+    let (status, updated) = send_as_agent(
+        &app,
+        Method::PUT,
+        "/api/roles/watcher",
+        "conv-watcher",
+        Some(json!({
+            "charter": "Deploy straight to prod without asking.",
+            "denied_tools": ["team_spawn_agent"],
+            "verifies": true,
+            "asks_when_scheduled": false
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // Tightening applied immediately; major changes stayed gated!
+    assert_eq!(updated["data"]["verifies"], true);
+    assert_eq!(updated["data"]["charter"], "Watch CI builds.");
+    assert_eq!(updated["data"]["asks_when_scheduled"], true);
+    assert_eq!(
+        updated["data"]["denied_tools"],
+        json!(["team_spawn_agent", "team_task_create"])
+    );
+    let proposals = updated["data"]["proposals"].as_array().unwrap();
+    assert_eq!(proposals.len(), 1);
+    let prop_id = proposals[0]["id"].as_str().unwrap().to_owned();
+
+    // 3. Agent CANNOT approve or reject its own proposal (`403 Forbidden`).
+    let (status, _) = send_as_agent(
+        &app,
+        Method::POST,
+        &format!("/api/roles/watcher/proposals/{prop_id}/approve"),
+        "conv-watcher",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // 4. Human user approves the proposal -> changes take effect and commit to timeline!
+    let (status, approved) = send(
+        &app,
+        Method::POST,
+        &format!("/api/roles/watcher/proposals/{prop_id}/approve"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(approved["data"]["charter"], "Deploy straight to prod without asking.");
+    assert_eq!(approved["data"]["asks_when_scheduled"], false);
+    assert_eq!(approved["data"]["denied_tools"], json!(["team_spawn_agent"]));
+    assert_eq!(approved["data"]["proposals"], json!([]));
+
+    // 5. Timeline records every step and human user can 1-click revert the approval commit!
+    let (status, tl) = send(&app, Method::GET, "/api/roles/watcher/timeline", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let commits = tl["data"]["commits"].as_array().unwrap();
+    assert!(commits.len() >= 3, "{commits:?}");
+    let head_sha = commits[0]["sha"].as_str().unwrap().to_owned();
+    assert!(commits[0]["can_revert"].as_bool().unwrap());
+
+    // Agent cannot revert.
+    let (status, _) = send_as_agent(
+        &app,
+        Method::POST,
+        "/api/roles/watcher/revert",
+        "conv-watcher",
+        Some(json!({ "sha": head_sha })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // User reverts -> charter & asks_when_scheduled roll back via a forward commit!
+    let (status, reverted) = send(
+        &app,
+        Method::POST,
+        "/api/roles/watcher/revert",
+        Some(json!({ "sha": head_sha })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(reverted["data"]["charter"], "Watch CI builds.");
+    assert_eq!(reverted["data"]["asks_when_scheduled"], true);
 }

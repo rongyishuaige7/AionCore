@@ -8,21 +8,31 @@
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-use aionui_api_types::RoleReport;
+use aionui_api_types::{RoleProposal, RoleReport};
 use serde::{Deserialize, Serialize};
 
 use crate::error::RoleError;
+use crate::playbook::PlaybookMeta;
 
 const DEFINITION_FILE: &str = "role.json";
 const MEMORY_DIR: &str = "memory";
 const MEMORY_FILE: &str = "MEMORY.md";
+const PLAYBOOK_FILE: &str = "PLAYBOOK.md";
+const PLAYBOOK_ARCHIVED_FILE: &str = "PLAYBOOK-archived.md";
+const PLAYBOOK_META_FILE: &str = ".playbook_meta.json";
+const PROPOSALS_FILE: &str = "proposals.json";
+const DREAMER_FILE: &str = "dreamer.json";
+const BOSS_DIR: &str = "_boss";
+const BOSS_FILE: &str = "USER.md";
 const ARCHIVE_DIR: &str = "archive";
 const ARCHIVE_PREFIX: &str = "MEMORY-";
 const PROGRESS_DIR: &str = "progress";
+const PROGRESS_ARCHIVE_DIR: &str = ".archive";
 const PROGRESS_EXTENSION: &str = "md";
 const REPORTED_FILE: &str = "reported.jsonl";
 const THREAD_FILE: &str = "thread.json";
 const THREAD_LEAVES_DIR: &str = "thread-leaves";
+const CONDENSED_DIR: &str = "condensed";
 const LEAF_EXTENSION: &str = "md";
 const ID_SEPARATOR: &str = ":";
 const DIR_SEPARATOR: &str = "@";
@@ -93,6 +103,19 @@ pub(crate) struct LeafFile {
     pub updated_at: i64,
 }
 
+/// State persisted in `<role_dir>/dreamer.json` across retrospective & S5 dreamer runs.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct DreamerState {
+    #[serde(default)]
+    pub last_retrospective_at: i64,
+    #[serde(default)]
+    pub last_dreamer_at: i64,
+    #[serde(default)]
+    pub condensed_conversation_id: String,
+    #[serde(default)]
+    pub condensed_leaves_count: usize,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct RoleStore {
     root: PathBuf,
@@ -103,8 +126,12 @@ impl RoleStore {
         Self { root }
     }
 
-    fn role_dir(&self, id: &str) -> PathBuf {
+    pub(crate) fn role_dir(&self, id: &str) -> PathBuf {
         self.root.join(id.replace(ID_SEPARATOR, DIR_SEPARATOR))
+    }
+
+    pub(crate) fn boss_dir(&self) -> PathBuf {
+        self.root.join(BOSS_DIR)
     }
 
     pub(crate) fn memory_dir(&self, id: &str) -> PathBuf {
@@ -125,6 +152,9 @@ impl RoleStore {
                 continue;
             }
             if let Ok(name) = entry.file_name().into_string() {
+                if name == BOSS_DIR || name.starts_with('.') {
+                    continue;
+                }
                 ids.push(name.replace(DIR_SEPARATOR, ID_SEPARATOR));
             }
         }
@@ -233,6 +263,136 @@ impl RoleStore {
             .leaves_dir(id, conversation_id)
             .join(format!("{next:05}.{LEAF_EXTENSION}"));
         write_atomic(&path, leaf.as_bytes()).await
+    }
+
+    fn condensed_dir(&self, id: &str, conversation_id: &str) -> PathBuf {
+        self.leaves_dir(id, conversation_id).join(CONDENSED_DIR)
+    }
+
+    /// Higher-level condensed leaves under `thread-leaves/<conversation_id>/condensed/`.
+    pub(crate) async fn read_condensed_leaf_files(
+        &self,
+        id: &str,
+        conversation_id: &str,
+    ) -> Result<Vec<LeafFile>, RoleError> {
+        let dir = self.condensed_dir(id, conversation_id);
+        let mut entries = match tokio::fs::read_dir(&dir).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut names = Vec::new();
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) == Some(LEAF_EXTENSION)
+                && let Some(name) = path.file_name().and_then(|name| name.to_str())
+                && let Some(stem) = path.file_stem().and_then(|stem| stem.to_str())
+            {
+                let updated_at = entry.metadata().await.map(|m| modified_ms(&m)).unwrap_or(0);
+                names.push((name.to_owned(), format!("c{stem}"), updated_at));
+            }
+        }
+        names.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut leaves = Vec::with_capacity(names.len());
+        for (name, stem, updated_at) in names {
+            leaves.push(LeafFile {
+                stem,
+                content: tokio::fs::read_to_string(dir.join(name)).await?,
+                updated_at,
+            });
+        }
+        Ok(leaves)
+    }
+
+    pub(crate) async fn append_condensed_leaf(
+        &self,
+        id: &str,
+        conversation_id: &str,
+        leaf: &str,
+    ) -> Result<(), RoleError> {
+        let next = self.read_condensed_leaf_files(id, conversation_id).await?.len() + 1;
+        let path = self
+            .condensed_dir(id, conversation_id)
+            .join(format!("{next:05}.{LEAF_EXTENSION}"));
+        write_atomic(&path, leaf.as_bytes()).await
+    }
+
+    pub(crate) async fn read_playbook(&self, id: &str) -> Result<String, RoleError> {
+        match tokio::fs::read_to_string(self.memory_dir(id).join(PLAYBOOK_FILE)).await {
+            Ok(raw) => Ok(raw),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(String::new()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub(crate) async fn write_playbook(&self, id: &str, content: &str) -> Result<(), RoleError> {
+        write_atomic(&self.memory_dir(id).join(PLAYBOOK_FILE), content.as_bytes()).await
+    }
+
+    pub(crate) async fn read_archived_playbook(&self, id: &str) -> Result<String, RoleError> {
+        match tokio::fs::read_to_string(self.memory_dir(id).join(PLAYBOOK_ARCHIVED_FILE)).await {
+            Ok(raw) => Ok(raw),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(String::new()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub(crate) async fn write_archived_playbook(&self, id: &str, content: &str) -> Result<(), RoleError> {
+        write_atomic(&self.memory_dir(id).join(PLAYBOOK_ARCHIVED_FILE), content.as_bytes()).await
+    }
+
+    pub(crate) async fn read_playbook_meta(&self, id: &str) -> Result<PlaybookMeta, RoleError> {
+        let raw = match tokio::fs::read_to_string(self.role_dir(id).join(PLAYBOOK_META_FILE)).await {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(PlaybookMeta::default()),
+            Err(error) => return Err(error.into()),
+        };
+        Ok(serde_json::from_str(&raw).unwrap_or_default())
+    }
+
+    pub(crate) async fn write_playbook_meta(&self, id: &str, meta: &PlaybookMeta) -> Result<(), RoleError> {
+        let raw = serde_json::to_vec_pretty(meta).map_err(std::io::Error::other)?;
+        write_atomic(&self.role_dir(id).join(PLAYBOOK_META_FILE), &raw).await
+    }
+
+    pub(crate) async fn read_boss_profile(&self) -> Result<String, RoleError> {
+        match tokio::fs::read_to_string(self.boss_dir().join(BOSS_FILE)).await {
+            Ok(raw) => Ok(raw),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(String::new()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub(crate) async fn write_boss_profile(&self, content: &str) -> Result<(), RoleError> {
+        write_atomic(&self.boss_dir().join(BOSS_FILE), content.as_bytes()).await
+    }
+
+    pub(crate) async fn read_proposals(&self, id: &str) -> Result<Vec<RoleProposal>, RoleError> {
+        let raw = match tokio::fs::read_to_string(self.role_dir(id).join(PROPOSALS_FILE)).await {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        Ok(serde_json::from_str(&raw).unwrap_or_default())
+    }
+
+    pub(crate) async fn write_proposals(&self, id: &str, proposals: &[RoleProposal]) -> Result<(), RoleError> {
+        let raw = serde_json::to_vec_pretty(proposals).map_err(std::io::Error::other)?;
+        write_atomic(&self.role_dir(id).join(PROPOSALS_FILE), &raw).await
+    }
+
+    pub(crate) async fn read_dreamer_state(&self, id: &str) -> Result<DreamerState, RoleError> {
+        let raw = match tokio::fs::read_to_string(self.role_dir(id).join(DREAMER_FILE)).await {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(DreamerState::default()),
+            Err(error) => return Err(error.into()),
+        };
+        Ok(serde_json::from_str(&raw).unwrap_or_default())
+    }
+
+    pub(crate) async fn write_dreamer_state(&self, id: &str, state: &DreamerState) -> Result<(), RoleError> {
+        let raw = serde_json::to_vec_pretty(state).map_err(std::io::Error::other)?;
+        write_atomic(&self.role_dir(id).join(DREAMER_FILE), &raw).await
     }
 
     pub(crate) async fn read_memory(&self, id: &str) -> Result<String, RoleError> {
@@ -363,6 +523,25 @@ impl RoleStore {
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
             Err(error) => Err(error.into()),
         }
+    }
+
+    /// Move any `progress/<task>.md` file untouched since before `cutoff_ms` into
+    /// `progress/.archive/<task>.md`. Returns how many files were archived.
+    pub(crate) async fn archive_stale_progress(&self, id: &str, cutoff_ms: i64) -> Result<usize, RoleError> {
+        let open = self.list_progress(id).await?;
+        let mut archived = 0;
+        let archive_dir = self.progress_dir(id).join(PROGRESS_ARCHIVE_DIR);
+        for file in open {
+            if file.updated_at > 0 && file.updated_at < cutoff_ms {
+                tokio::fs::create_dir_all(&archive_dir).await?;
+                let src = self.progress_path(id, &file.task);
+                let dst = archive_dir.join(format!("{}.{PROGRESS_EXTENSION}", file.task));
+                if tokio::fs::rename(&src, &dst).await.is_ok() {
+                    archived += 1;
+                }
+            }
+        }
+        Ok(archived)
     }
 }
 

@@ -54,6 +54,25 @@ const PLACEHOLDER_PATTERNS: &[&str] = &[
 const RUN_LEASE_MS: i64 = 60_000;
 const RUN_LEASE_HEARTBEAT_MS: u64 = 20_000;
 const RUN_HISTORY_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
+
+/// Port used by `/api/cron` routes to hold agent-authored cron changes targeting
+/// a resident role as pending approval proposals (`PLAN.md` §6).
+#[async_trait::async_trait]
+pub trait CronRoleProposalPort: Send + Sync {
+    async fn is_resident_role(&self, assistant_id: &str) -> bool;
+
+    async fn conversation_assistant_id(&self, user_id: &str, conversation_id: &str) -> Option<String>;
+
+    async fn stage_cron_proposal(
+        &self,
+        role_id: &str,
+        summary: String,
+        detail: String,
+        from_conversation_id: Option<String>,
+        change: aionui_api_types::RoleProposalChange,
+    ) -> Result<aionui_api_types::RoleProposal, String>;
+}
+
 #[derive(Clone)]
 pub struct CronService {
     repo: Arc<dyn ICronRepository>,
@@ -66,6 +85,7 @@ pub struct CronService {
     emitter: CronEventEmitter,
     data_dir: PathBuf,
     instance_id: String,
+    role_proposal_port: Arc<std::sync::OnceLock<Arc<dyn CronRoleProposalPort>>>,
 }
 
 pub struct CronServiceDeps {
@@ -93,7 +113,16 @@ impl CronService {
             emitter: deps.emitter,
             data_dir: deps.data_dir,
             instance_id: generate_prefixed_id("cron-owner"),
+            role_proposal_port: Arc::new(std::sync::OnceLock::new()),
         }
+    }
+
+    pub fn set_role_proposal_port(&self, port: Arc<dyn CronRoleProposalPort>) {
+        let _ = self.role_proposal_port.set(port);
+    }
+
+    pub fn role_proposal_port(&self) -> Option<&Arc<dyn CronRoleProposalPort>> {
+        self.role_proposal_port.get()
     }
 
     // -----------------------------------------------------------------------

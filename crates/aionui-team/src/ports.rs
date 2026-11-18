@@ -154,6 +154,10 @@ pub struct TeamRoleBrief {
     /// What the role last told the user from runs nobody watched, newest
     /// first, one line each: when, `[say]` or `[ask]`, and the summary.
     pub reported: Vec<String>,
+    /// Active ACE playbook bullets (`[p-0001] (+3/-1) ...`).
+    pub playbook: Vec<String>,
+    /// Shared boss profile (`roles/_boss/USER.md`) across all resident roles.
+    pub boss_profile: String,
 }
 
 /// One task a role has under way.

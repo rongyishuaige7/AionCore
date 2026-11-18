@@ -731,3 +731,174 @@ async fn recall_and_expand_search_only_the_caller_roles_thread_runs_and_leaves()
 
     fixture.services.database.close().await;
 }
+
+async fn user_call(
+    fixture: &Fixture,
+    method: &str,
+    path: &str,
+    token: &str,
+    csrf: &str,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
+    let request = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .header("x-csrf-token", csrf)
+        .header("cookie", format!("aionui-csrf-token={csrf}"))
+        .body(body.map_or_else(Body::empty, |b| Body::from(b.to_string())))
+        .unwrap();
+    let response = fixture.app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    (status, body_json(response).await)
+}
+
+#[tokio::test]
+async fn proposals_gate_agent_role_and_cron_mutations_and_dismiss_cleans_up_schedules() {
+    let mut fixture = fixture().await;
+    let (user_token, csrf) = common::setup_and_login(&mut fixture.app, &fixture.services, "admin", "secret123").await;
+    let role_id = seeded_assistant_id(&fixture).await;
+    define_role_as(&fixture, &role_id, &["team_spawn_agent"]).await;
+
+    let agent_token = conversation_as(&fixture, "conv-steward", Some(&role_id)).await;
+
+    // 1. Agent attempts to relax charter & permissions via PUT /api/roles/{id}: held as proposal!
+    let (status, put_res) = call(
+        &fixture,
+        "PUT",
+        &format!("/api/roles/{role_id}"),
+        "conv-steward",
+        &agent_token,
+        Some(json!({
+            "charter": "Unilateral charter change",
+            "denied_tools": [],
+            "verifies": true,
+            "asks_when_scheduled": false
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{put_res}");
+    // `verifies: true` tightened immediately, while charter & denied_tools stayed unchanged.
+    assert_eq!(put_res["data"]["verifies"], json!(true));
+    assert_eq!(
+        put_res["data"]["charter"],
+        json!("Checks work before it is called done.")
+    );
+    assert_eq!(put_res["data"]["denied_tools"], json!(["team_spawn_agent"]));
+    let role_prop_id = put_res["data"]["proposals"][0]["id"].as_str().unwrap().to_owned();
+
+    // 2. Agent attempts to create a cron job for the resident role: held as 202 proposal!
+    let (status, cron_res) = call(
+        &fixture,
+        "POST",
+        "/api/cron/jobs",
+        "conv-steward",
+        &agent_token,
+        Some(json!({
+            "name": "Morning Sweep",
+            "schedule": { "kind": "cron", "expr": "0 8 * * *" },
+            "prompt": "Run morning check",
+            "conversation_id": "conv-steward",
+            "created_by": "agent",
+            "execution_mode": "new_conversation",
+            "agent_config": {
+                "name": "Sweeper",
+                "assistant_id": role_id,
+                "model": {
+                    "provider_id": "p1",
+                    "model": "m1"
+                }
+            }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{cron_res}");
+    assert_eq!(cron_res["data"]["status"], json!("proposal_pending"));
+    let cron_prop_id = cron_res["data"]["proposal"]["id"].as_str().unwrap().to_owned();
+
+    let (status, jobs_before) = user_call(&fixture, "GET", "/api/cron/jobs", &user_token, &csrf, None).await;
+    assert_eq!(status, StatusCode::OK, "{jobs_before}");
+    assert_eq!(jobs_before["data"].as_array().unwrap().len(), 0);
+
+    // 3. Agent also sets a one-shot follow-up (`role follow-up` stays direct, not gated).
+    let (status, fu) = call(
+        &fixture,
+        "POST",
+        "/api/runtime/role/follow-up",
+        "conv-steward",
+        &agent_token,
+        Some(json!({ "note": "check later", "after_minutes": 60 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{fu}");
+
+    // 4. Agent cannot approve its own proposal.
+    let (status, _) = call(
+        &fixture,
+        "POST",
+        &format!("/api/roles/{role_id}/proposals/{cron_prop_id}/approve"),
+        "conv-steward",
+        &agent_token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // 5. User approves both proposals -> charter updates and cron job is created!
+    let (status, approved_role) = user_call(
+        &fixture,
+        "POST",
+        &format!("/api/roles/{role_id}/proposals/{role_prop_id}/approve"),
+        &user_token,
+        &csrf,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{approved_role}");
+    assert_eq!(approved_role["data"]["charter"], json!("Unilateral charter change"));
+
+    let (status, approved_cron) = user_call(
+        &fixture,
+        "POST",
+        &format!("/api/roles/{role_id}/proposals/{cron_prop_id}/approve"),
+        &user_token,
+        &csrf,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{approved_cron}");
+    assert_eq!(approved_cron["data"]["proposals"], json!([]));
+
+    let (_, jobs_after) = user_call(&fixture, "GET", "/api/cron/jobs", &user_token, &csrf, None).await;
+    let jobs_arr = jobs_after["data"].as_array().unwrap();
+    assert_eq!(
+        jobs_arr.len(),
+        2,
+        "1 approved recurring job + 1 follow-up: {jobs_arr:?}"
+    );
+
+    // 6. User dismisses the role -> follow-up is deleted and recurring schedule is paused!
+    let (status, _) = user_call(
+        &fixture,
+        "DELETE",
+        &format!("/api/roles/{role_id}"),
+        &user_token,
+        &csrf,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (_, jobs_dismissed) = user_call(&fixture, "GET", "/api/cron/jobs", &user_token, &csrf, None).await;
+    let remaining = jobs_dismissed["data"].as_array().unwrap();
+    assert_eq!(
+        remaining.len(),
+        1,
+        "follow-up removed, recurring kept paused: {remaining:?}"
+    );
+    assert_eq!(remaining[0]["name"], json!("Morning Sweep"));
+    assert_eq!(remaining[0]["enabled"], json!(false));
+
+    fixture.services.database.close().await;
+}

@@ -9,6 +9,7 @@ pub mod error;
 pub(crate) mod message_cursor;
 mod message_persistence;
 pub mod response_middleware;
+mod role_retrospective;
 mod role_thread;
 pub mod routes;
 pub mod routes_aux;
@@ -36,6 +37,9 @@ mod turn_recovery_policy;
 pub use convert::row_to_response_with_extra;
 pub use error::ConversationError;
 pub use response_middleware::{MessageMiddleware, MiddlewareResult, strip_think_tags};
+pub use role_retrospective::{
+    CONDENSE_BATCH_SIZE, DREAMER_CURATE_THRESHOLD_BYTES, RoleDreamTasksOutcome, RoleRetrospectiveContext,
+};
 pub use role_thread::{Line, RoleThreadMark, RoleThreadState, Speaker, is_unfinished_text_row, lines_of};
 pub use routes::conversation_routes;
 pub use routes_aux::conversation_ops_routes;

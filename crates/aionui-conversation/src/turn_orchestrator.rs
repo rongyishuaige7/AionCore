@@ -273,7 +273,18 @@ impl ConversationTurnOrchestrator {
             });
         }
 
-        let mut pending_send = Some((input.send, input.msg_id));
+        let mut send = input.send;
+        if aionui_ai_agent::take_rebuilt_from_stale_anchor(&input.conv_id)
+            && !send.content.contains("<role-thread-handoff>")
+            && let Some(handoff) = self
+                .service
+                .handoff_after_stale_anchor_rebuild(&input.user_id, &input.conv_id, &input.msg_id)
+                .await
+        {
+            send.content = format!("{handoff}\n\n{}", send.content);
+        }
+
+        let mut pending_send = Some((send, input.msg_id));
         let mut continuation_count = input.continuation_count;
         let continuation_policy = TurnContinuationPolicy::new(MAX_SYSTEM_RESPONSE_CONTINUATIONS_PER_TURN);
         let mut last_outcome = None;
@@ -673,6 +684,8 @@ impl ConversationTurnOrchestrator {
         // Completion updates activity recency. Snapshot only after that write,
         // otherwise our own completion would invalidate every slow summary.
         if !was_deleting && let Some(generator) = title_generator {
+            self.service
+                .schedule_rotation_retrospective_if_due(&input.user_id, &conv_id, Arc::clone(&generator));
             self.service
                 .schedule_thread_upkeep(&input.user_id, &conv_id, Arc::clone(&generator));
             self.service

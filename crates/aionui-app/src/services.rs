@@ -39,6 +39,7 @@ pub struct AppServices {
     pub worker_task_manager: Arc<dyn IWorkerTaskManager>,
     pub active_lease_registry: Arc<ActiveLeaseRegistry>,
     pub runtime_token_service: Arc<RuntimeTokenService>,
+    pub role_service: Arc<aionui_role::RoleService>,
     pub conversation_runtime_state: Arc<ConversationRuntimeStateService>,
     pub conversation_service: ConversationService,
     /// Cross-session messaging. The queue, the rate limiter and the notify
@@ -424,6 +425,8 @@ impl AppServices {
         conversation_service
             .with_turn_cancelled_hook(Arc::new(QueueClearingCancelHook::new(session_message_queue.clone())));
 
+        let role_service = Arc::new(aionui_role::RoleService::new(data_dir.join("roles")));
+
         Ok(Self {
             database,
             jwt_service: Arc::new(JwtService::new(secret.clone())),
@@ -436,6 +439,7 @@ impl AppServices {
             worker_task_manager,
             active_lease_registry,
             runtime_token_service,
+            role_service,
             conversation_runtime_state,
             conversation_service,
             session_message_service,

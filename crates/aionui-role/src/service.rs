@@ -6,13 +6,20 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use aionui_api_types::{
-    RoleExpandRequest, RoleExpandResponse, RoleProgress, RoleRecallRequest, RoleRecallResponse, RoleReport,
-    RoleReportOutcome, RoleResponse, TeamToolName, UpsertRoleRequest,
+    PlaybookDeltaOp, RoleCommit, RoleExpandRequest, RoleExpandResponse, RoleProgress, RoleProposal, RoleProposalChange,
+    RoleRecallRequest, RoleRecallResponse, RoleReport, RoleReportOutcome, RoleResponse, TeamToolName,
+    UpsertRoleRequest,
 };
 use aionui_common::now_ms;
 use tokio::sync::Mutex;
 
 use crate::error::RoleError;
+use crate::git::{self, BOSS_TRACKED_PATHS, ROLE_TRACKED_PATHS};
+use crate::playbook::{
+    PROGRESS_ARCHIVE_IDLE_DAYS, append_archived_playbook, apply_boss_deltas, apply_playbook_deltas, decay_playbook,
+    parse_playbook, prompt_playbook_lines, render_playbook,
+};
+use crate::proposals::{classify_role_update, new_proposal_id};
 use crate::recall::{RecallIndex, RecallSync, RecallWatermark};
 pub use crate::store::ThreadMark;
 use crate::store::{RoleDefinition, RoleStore, ThreadRecord};
@@ -142,9 +149,23 @@ impl RoleService {
         Ok(Some(self.to_response(id, definition).await?))
     }
 
-    /// Create the role or replace its definition. The memory is left untouched,
-    /// and so is `created_at` of an existing role.
+    /// Create the role or replace its definition (human user caller). The
+    /// memory is left untouched, and so is `created_at` of an existing role.
     pub async fn upsert(&self, id: &str, request: UpsertRoleRequest) -> Result<RoleResponse, RoleError> {
+        self.upsert_by_caller(id, request, None).await
+    }
+
+    /// Create or update the role definition. When `agent_conversation_id` is
+    /// `Some(conv_id)` and the role already exists, tightening changes apply
+    /// immediately while major changes (modifying `charter`, relaxing
+    /// `denied_tools`, turning off `asks_when_scheduled` or `verifies`) are held
+    /// as a pending `RoleProposal` until the user approves them.
+    pub async fn upsert_by_caller(
+        &self,
+        id: &str,
+        request: UpsertRoleRequest,
+        agent_conversation_id: Option<&str>,
+    ) -> Result<RoleResponse, RoleError> {
         validate_role_id(id)?;
         let charter = request.charter.trim().to_owned();
         if charter.chars().count() > MAX_CHARTER_CHARS {
@@ -154,6 +175,7 @@ impl RoleService {
         }
         let denied_tools = normalize_denied_tools(&request.denied_tools)?;
 
+        let _guard = self.memory_lock.lock().await;
         // A corrupt definition must not block the user from saving a good one.
         let existing = match self.store.read_definition(id).await {
             Ok(existing) => existing,
@@ -161,6 +183,32 @@ impl RoleService {
             Err(error) => return Err(error),
         };
         let now = now_ms();
+        let role_dir = self.store.role_dir(id);
+        git::ensure_baseline(role_dir.clone(), ROLE_TRACKED_PATHS, now).await?;
+
+        if let (Some(existing_def), Some(conv_id)) = (&existing, agent_conversation_id) {
+            let classified = classify_role_update(
+                existing_def,
+                charter,
+                denied_tools,
+                request.verifies,
+                request.asks_when_scheduled,
+                now,
+            );
+            let mut effective = existing_def.clone();
+            if let Some((tightened, reason)) = classified.immediate {
+                self.store.write_definition(id, &tightened).await?;
+                git::commit(role_dir.clone(), ROLE_TRACKED_PATHS, "agent".into(), reason, now).await?;
+                effective = tightened;
+            }
+            if let Some((summary, detail, change)) = classified.proposal {
+                self.stage_proposal_locked(id, summary, detail, Some(conv_id.to_owned()), change, now)
+                    .await?;
+            }
+            return self.to_response(id, effective).await;
+        }
+
+        let is_new = existing.is_none();
         let definition = RoleDefinition {
             charter,
             denied_tools,
@@ -170,6 +218,12 @@ impl RoleService {
             updated_at: now,
         };
         self.store.write_definition(id, &definition).await?;
+        let (actor, msg) = match (agent_conversation_id.is_some(), is_new) {
+            (true, _) => ("agent", "role: hired resident role"),
+            (false, true) => ("user", "role: created resident role"),
+            (false, false) => ("user", "role: updated charter and permissions"),
+        };
+        git::commit(role_dir, ROLE_TRACKED_PATHS, actor.into(), msg.into(), now).await?;
         self.to_response(id, definition).await
     }
 
@@ -185,7 +239,18 @@ impl RoleService {
             return Err(RoleError::NotFound(id.to_owned()));
         };
         let _guard = self.memory_lock.lock().await;
+        let now = now_ms();
+        let role_dir = self.store.role_dir(id);
+        git::ensure_baseline(role_dir.clone(), ROLE_TRACKED_PATHS, now).await?;
         self.store.write_memory(id, memory).await?;
+        git::commit(
+            role_dir,
+            ROLE_TRACKED_PATHS,
+            "user".into(),
+            "memory: edited memory".into(),
+            now,
+        )
+        .await?;
         self.to_response(id, definition).await
     }
 
@@ -228,7 +293,19 @@ impl RoleService {
                 "memory is full ({MAX_MEMORY_BYTES} bytes), the user has to prune it first"
             )));
         }
+        let now = now_ms();
+        let role_dir = self.store.role_dir(id);
+        git::ensure_baseline(role_dir.clone(), ROLE_TRACKED_PATHS, now).await?;
         self.store.write_memory(id, &updated).await?;
+        let preview: String = note.chars().take(56).collect();
+        git::commit(
+            role_dir,
+            ROLE_TRACKED_PATHS,
+            "agent".into(),
+            format!("memory: {preview}"),
+            now,
+        )
+        .await?;
         Ok(RememberedNote {
             line,
             already_recorded: false,
@@ -242,6 +319,20 @@ impl RoleService {
     /// `memory/archive/` and an empty memory is refused. `stamp` names that
     /// copy (the caller's local time, digits and `-` only).
     pub async fn curate_memory(&self, id: &str, memory: &str, stamp: &str) -> Result<CuratedMemory, RoleError> {
+        self.curate_memory_as(id, memory, stamp, "agent", "memory: curated and tidied")
+            .await
+    }
+
+    /// Like [`Self::curate_memory`], recording the given `actor` and `commit_msg`
+    /// in the role's git repository.
+    pub async fn curate_memory_as(
+        &self,
+        id: &str,
+        memory: &str,
+        stamp: &str,
+        actor: &str,
+        commit_msg: &str,
+    ) -> Result<CuratedMemory, RoleError> {
         validate_role_id(id)?;
         let curated = memory.trim_end();
         if curated.trim().is_empty() {
@@ -270,6 +361,9 @@ impl RoleService {
                 bytes_after: bytes_before,
             });
         }
+        let now = now_ms();
+        let role_dir = self.store.role_dir(id);
+        git::ensure_baseline(role_dir.clone(), ROLE_TRACKED_PATHS, now).await?;
         let archived_as = if previous.trim().is_empty() {
             None
         } else {
@@ -280,6 +374,14 @@ impl RoleService {
             )
         };
         self.store.write_memory(id, &curated).await?;
+        git::commit(
+            role_dir,
+            ROLE_TRACKED_PATHS,
+            actor.to_owned(),
+            commit_msg.to_owned(),
+            now,
+        )
+        .await?;
         Ok(CuratedMemory {
             archived_as,
             bytes_before,
@@ -434,7 +536,9 @@ impl RoleService {
     }
 
     /// Where the summaries of the role's thread stand, when `conversation_id`
-    /// is that thread; `None` for any other conversation.
+    /// is that thread; `None` for any other conversation. When S5 leaf
+    /// condensation has merged older leaves into `condensed/`, returns the
+    /// condensed frontier followed by the newest uncondensed `D0` leaves.
     pub async fn thread_upkeep(&self, id: &str, conversation_id: &str) -> Result<Option<ThreadUpkeep>, RoleError> {
         validate_role_id(id)?;
         validate_conversation_id(conversation_id)?;
@@ -444,10 +548,21 @@ impl RoleService {
         if record.conversation_id != conversation_id {
             return Ok(None);
         }
+        let d0 = self.store.read_leaves(id, conversation_id).await?;
+        let condensed = self.store.read_condensed_leaf_files(id, conversation_id).await?;
+        let dreamer = self.store.read_dreamer_state(id).await?;
+        let leaves = if !condensed.is_empty() && dreamer.condensed_conversation_id == conversation_id {
+            let consumed = dreamer.condensed_leaves_count.min(d0.len());
+            let mut combined: Vec<String> = condensed.into_iter().map(|file| file.content).collect();
+            combined.extend_from_slice(&d0[consumed..]);
+            combined
+        } else {
+            d0
+        };
         Ok(Some(ThreadUpkeep {
             summarized_to: record.summarized_to,
             rotated_at: record.rotated_at,
-            leaves: self.store.read_leaves(id, conversation_id).await?,
+            leaves,
         }))
     }
 
@@ -527,7 +642,9 @@ impl RoleService {
         let leaves = match sync.active_thread.as_deref() {
             Some(thread_id) => {
                 validate_conversation_id(thread_id)?;
-                self.store.read_leaf_files(id, thread_id).await?
+                let mut files = self.store.read_leaf_files(id, thread_id).await?;
+                files.extend(self.store.read_condensed_leaf_files(id, thread_id).await?);
+                files
             }
             None => Vec::new(),
         };
@@ -558,11 +675,409 @@ impl RoleService {
         self.recall.expand(id, request).await
     }
 
+    /// Shared boss profile (`roles/_boss/USER.md`) injected into every resident
+    /// role's standing prompt.
+    pub async fn boss_profile(&self) -> Result<String, RoleError> {
+        self.store.read_boss_profile().await
+    }
+
+    /// Active playbook lines formatted for prompt injection.
+    pub async fn prompt_playbook(&self, id: &str) -> Result<Vec<String>, RoleError> {
+        validate_role_id(id)?;
+        let raw = self.store.read_playbook(id).await?;
+        let meta = self.store.read_playbook_meta(id).await?;
+        Ok(prompt_playbook_lines(&parse_playbook(&raw, &meta)))
+    }
+
+    /// Apply incremental ACE retrospective deltas to `id`'s `PLAYBOOK.md` and
+    /// to the shared `roles/_boss/USER.md`, committing each change to git.
+    pub async fn apply_retrospective(
+        &self,
+        id: &str,
+        playbook_ops: &[PlaybookDeltaOp],
+        boss_ops: &[PlaybookDeltaOp],
+        actor: &str,
+        reason: &str,
+        now: i64,
+    ) -> Result<(usize, bool), RoleError> {
+        validate_role_id(id)?;
+        if self.store.read_definition(id).await?.is_none() {
+            return Err(RoleError::NotFound(id.to_owned()));
+        }
+        let _guard = self.memory_lock.lock().await;
+
+        let role_dir = self.store.role_dir(id);
+        git::ensure_baseline(role_dir.clone(), ROLE_TRACKED_PATHS, now).await?;
+
+        let raw_pb = self.store.read_playbook(id).await?;
+        let archived_pb = self.store.read_archived_playbook(id).await?;
+        let mut meta = self.store.read_playbook_meta(id).await?;
+        let mut entries = parse_playbook(&raw_pb, &meta);
+        let applied = apply_playbook_deltas(&mut entries, &mut meta, &archived_pb, playbook_ops, now);
+        if applied > 0 {
+            self.store.write_playbook(id, &render_playbook(&entries)).await?;
+            self.store.write_playbook_meta(id, &meta).await?;
+            git::commit(
+                role_dir,
+                ROLE_TRACKED_PATHS,
+                actor.to_owned(),
+                format!("playbook: {reason} ({applied} update(s))"),
+                now,
+            )
+            .await?;
+        }
+
+        let boss_raw = self.store.read_boss_profile().await?;
+        let boss_changed = if let Some(updated_boss) = apply_boss_deltas(&boss_raw, boss_ops) {
+            let boss_dir = self.store.boss_dir();
+            git::ensure_baseline(boss_dir.clone(), BOSS_TRACKED_PATHS, now).await?;
+            self.store.write_boss_profile(&updated_boss).await?;
+            git::commit(
+                boss_dir,
+                BOSS_TRACKED_PATHS,
+                actor.to_owned(),
+                format!("boss({id}): {reason}"),
+                now,
+            )
+            .await?;
+            true
+        } else {
+            false
+        };
+
+        let mut dreamer = self.store.read_dreamer_state(id).await?;
+        dreamer.last_retrospective_at = now;
+        self.store.write_dreamer_state(id, &dreamer).await?;
+
+        Ok((applied, boss_changed))
+    }
+
+    /// Remove one playbook entry by id (`p-NNNN`) on user request.
+    pub async fn remove_playbook_entry(&self, id: &str, entry_id: &str, now: i64) -> Result<RoleResponse, RoleError> {
+        validate_role_id(id)?;
+        let Some(definition) = self.store.read_definition(id).await? else {
+            return Err(RoleError::NotFound(id.to_owned()));
+        };
+        let _guard = self.memory_lock.lock().await;
+        let role_dir = self.store.role_dir(id);
+        git::ensure_baseline(role_dir.clone(), ROLE_TRACKED_PATHS, now).await?;
+
+        let raw_pb = self.store.read_playbook(id).await?;
+        let archived_pb = self.store.read_archived_playbook(id).await?;
+        let mut meta = self.store.read_playbook_meta(id).await?;
+        let mut entries = parse_playbook(&raw_pb, &meta);
+        let removed = apply_playbook_deltas(
+            &mut entries,
+            &mut meta,
+            &archived_pb,
+            &[PlaybookDeltaOp::Remove {
+                id: entry_id.trim().to_owned(),
+            }],
+            now,
+        );
+        if removed > 0 {
+            self.store.write_playbook(id, &render_playbook(&entries)).await?;
+            self.store.write_playbook_meta(id, &meta).await?;
+            git::commit(
+                role_dir,
+                ROLE_TRACKED_PATHS,
+                "user".into(),
+                format!("playbook: removed {}", entry_id.trim()),
+                now,
+            )
+            .await?;
+        }
+        self.to_response(id, definition).await
+    }
+
+    /// Stage an agent-proposed major change (role definition or scheduled task)
+    /// for user review in the Roles drawer.
+    pub async fn stage_proposal(
+        &self,
+        id: &str,
+        summary: String,
+        detail: String,
+        from_conversation_id: Option<String>,
+        change: RoleProposalChange,
+        now: i64,
+    ) -> Result<RoleProposal, RoleError> {
+        validate_role_id(id)?;
+        if self.store.read_definition(id).await?.is_none() {
+            return Err(RoleError::NotFound(id.to_owned()));
+        }
+        let _guard = self.memory_lock.lock().await;
+        self.stage_proposal_locked(id, summary, detail, from_conversation_id, change, now)
+            .await
+    }
+
+    async fn stage_proposal_locked(
+        &self,
+        id: &str,
+        summary: String,
+        detail: String,
+        from_conversation_id: Option<String>,
+        change: RoleProposalChange,
+        now: i64,
+    ) -> Result<RoleProposal, RoleError> {
+        let mut proposals = self.store.read_proposals(id).await?;
+        if let Some(existing) = proposals.iter_mut().find(|p| p.change == change) {
+            existing.summary = summary;
+            existing.detail = detail;
+            existing.from_conversation_id = from_conversation_id;
+            existing.created_at = now;
+            let updated = existing.clone();
+            self.store.write_proposals(id, &proposals).await?;
+            return Ok(updated);
+        }
+        let proposal = RoleProposal {
+            id: new_proposal_id(now, &proposals),
+            role_id: id.to_owned(),
+            summary,
+            detail,
+            from_conversation_id,
+            created_at: now,
+            change,
+        };
+        proposals.push(proposal.clone());
+        self.store.write_proposals(id, &proposals).await?;
+        Ok(proposal)
+    }
+
+    /// Remove and return a pending proposal by id (`prop-...`).
+    pub async fn take_proposal(&self, id: &str, proposal_id: &str) -> Result<RoleProposal, RoleError> {
+        validate_role_id(id)?;
+        if self.store.read_definition(id).await?.is_none() {
+            return Err(RoleError::NotFound(id.to_owned()));
+        }
+        let _guard = self.memory_lock.lock().await;
+        let mut proposals = self.store.read_proposals(id).await?;
+        let Some(pos) = proposals.iter().position(|p| p.id == proposal_id) else {
+            return Err(RoleError::InvalidRequest(format!("unknown proposal: {proposal_id}")));
+        };
+        let taken = proposals.remove(pos);
+        self.store.write_proposals(id, &proposals).await?;
+        Ok(taken)
+    }
+
+    /// Apply a user-approved `RoleProposalChange::UpdateRole` and commit to git.
+    pub async fn apply_approved_role_change(
+        &self,
+        id: &str,
+        summary: &str,
+        change: &RoleProposalChange,
+        now: i64,
+    ) -> Result<RoleResponse, RoleError> {
+        validate_role_id(id)?;
+        let _guard = self.memory_lock.lock().await;
+        let Some(mut definition) = self.store.read_definition(id).await? else {
+            return Err(RoleError::NotFound(id.to_owned()));
+        };
+        if let RoleProposalChange::UpdateRole {
+            charter,
+            denied_tools,
+            verifies,
+            asks_when_scheduled,
+        } = change
+        {
+            if let Some(c) = charter {
+                definition.charter = c.trim().to_owned();
+            }
+            if let Some(d) = denied_tools {
+                definition.denied_tools = normalize_denied_tools(d)?;
+            }
+            if let Some(v) = verifies {
+                definition.verifies = *v;
+            }
+            if let Some(a) = asks_when_scheduled {
+                definition.asks_when_scheduled = *a;
+            }
+            definition.updated_at = now;
+            let role_dir = self.store.role_dir(id);
+            git::ensure_baseline(role_dir.clone(), ROLE_TRACKED_PATHS, now).await?;
+            self.store.write_definition(id, &definition).await?;
+            git::commit(
+                role_dir,
+                ROLE_TRACKED_PATHS,
+                "user".into(),
+                format!("proposal: approved — {summary}"),
+                now,
+            )
+            .await?;
+        }
+        self.to_response(id, definition).await
+    }
+
+    /// Reject and remove a pending proposal.
+    pub async fn reject_proposal(&self, id: &str, proposal_id: &str) -> Result<RoleResponse, RoleError> {
+        let _ = self.take_proposal(id, proposal_id).await?;
+        self.get(id).await
+    }
+
+    /// Read git version history for `id`, newest commit first.
+    pub async fn timeline(&self, id: &str, limit: usize) -> Result<Vec<RoleCommit>, RoleError> {
+        validate_role_id(id)?;
+        if self.store.read_definition(id).await?.is_none() {
+            return Err(RoleError::NotFound(id.to_owned()));
+        }
+        let role_dir = self.store.role_dir(id);
+        git::ensure_baseline(role_dir.clone(), ROLE_TRACKED_PATHS, now_ms()).await?;
+        git::timeline(role_dir, limit.clamp(1, 100)).await
+    }
+
+    /// Revert commit `sha` in `id`'s git repository by creating a new forward
+    /// revert commit and checking out the tracked files.
+    pub async fn revert(&self, id: &str, sha: &str, now: i64) -> Result<RoleResponse, RoleError> {
+        validate_role_id(id)?;
+        if self.store.read_definition(id).await?.is_none() {
+            return Err(RoleError::NotFound(id.to_owned()));
+        }
+        let _guard = self.memory_lock.lock().await;
+        let role_dir = self.store.role_dir(id);
+        git::revert(role_dir, ROLE_TRACKED_PATHS, sha.to_owned(), "user".into(), now).await?;
+        let Some(definition) = self.store.read_definition(id).await? else {
+            return Err(RoleError::NotFound(id.to_owned()));
+        };
+        self.to_response(id, definition).await
+    }
+
+    /// Run S5 zero-LLM decay on `id`: score and archive stale/contradicted
+    /// playbook items to `PLAYBOOK-archived.md` (with a git commit), and move
+    /// untouched `progress/<task>.md` files to `progress/.archive/`.
+    pub async fn run_zero_llm_decay(&self, id: &str, day: &str, now: i64) -> Result<(usize, usize), RoleError> {
+        validate_role_id(id)?;
+        if self.store.read_definition(id).await?.is_none() {
+            return Err(RoleError::NotFound(id.to_owned()));
+        }
+        let _guard = self.memory_lock.lock().await;
+        let role_dir = self.store.role_dir(id);
+        git::ensure_baseline(role_dir.clone(), ROLE_TRACKED_PATHS, now).await?;
+
+        let raw_pb = self.store.read_playbook(id).await?;
+        let mut meta = self.store.read_playbook_meta(id).await?;
+        let mut entries = parse_playbook(&raw_pb, &meta);
+        let archived = decay_playbook(&mut entries, &mut meta, now);
+        self.store.write_playbook_meta(id, &meta).await?;
+
+        let decayed_count = archived.len();
+        if decayed_count > 0 {
+            let prev_archived = self.store.read_archived_playbook(id).await?;
+            let next_archived = append_archived_playbook(&prev_archived, &archived, day);
+            self.store.write_playbook(id, &render_playbook(&entries)).await?;
+            self.store.write_archived_playbook(id, &next_archived).await?;
+            git::commit(
+                role_dir,
+                ROLE_TRACKED_PATHS,
+                "dreamer".into(),
+                format!("decay: archived {decayed_count} stale playbook item(s)"),
+                now,
+            )
+            .await?;
+        }
+
+        let cutoff = now.saturating_sub(PROGRESS_ARCHIVE_IDLE_DAYS * 24 * 60 * 60 * 1_000);
+        let archived_progress = self.store.archive_stale_progress(id, cutoff).await?;
+        Ok((decayed_count, archived_progress))
+    }
+
+    /// Read `(last_retrospective_at, last_dreamer_at)` for `id`.
+    pub async fn dreamer_timestamps(&self, id: &str) -> Result<(i64, i64), RoleError> {
+        validate_role_id(id)?;
+        let state = self.store.read_dreamer_state(id).await?;
+        Ok((state.last_retrospective_at, state.last_dreamer_at))
+    }
+
+    /// Record that a dreamer maintenance cycle completed at `now`.
+    pub async fn mark_dreamer_ran(&self, id: &str, now: i64) -> Result<(), RoleError> {
+        validate_role_id(id)?;
+        let _guard = self.memory_lock.lock().await;
+        let mut state = self.store.read_dreamer_state(id).await?;
+        state.last_dreamer_at = now;
+        self.store.write_dreamer_state(id, &state).await
+    }
+
+    /// Next batch of `batch_size` uncondensed `D0` leaves for `id`'s current
+    /// thread (`(conversation_id, start_index, leaves)`), if enough have
+    /// accumulated.
+    pub async fn next_uncondensed_leaf_batch(
+        &self,
+        id: &str,
+        batch_size: usize,
+    ) -> Result<Option<(String, usize, Vec<String>)>, RoleError> {
+        validate_role_id(id)?;
+        let Some(thread) = self.store.read_thread(id).await? else {
+            return Ok(None);
+        };
+        let d0 = self.store.read_leaves(id, &thread.conversation_id).await?;
+        let state = self.store.read_dreamer_state(id).await?;
+        let start = if state.condensed_conversation_id == thread.conversation_id {
+            state.condensed_leaves_count.min(d0.len())
+        } else {
+            0
+        };
+        if d0.len().saturating_sub(start) < batch_size || batch_size == 0 {
+            return Ok(None);
+        }
+        Ok(Some((
+            thread.conversation_id,
+            start,
+            d0[start..start + batch_size].to_vec(),
+        )))
+    }
+
+    /// Persist a condensed leaf summarizing `consumed_count` `D0` leaves starting
+    /// at `expected_start` of `conversation_id`.
+    pub async fn record_condensed_leaf(
+        &self,
+        id: &str,
+        conversation_id: &str,
+        expected_start: usize,
+        consumed_count: usize,
+        condensed_leaf: &str,
+    ) -> Result<bool, RoleError> {
+        validate_role_id(id)?;
+        validate_conversation_id(conversation_id)?;
+        let _guard = self.memory_lock.lock().await;
+        let Some(thread) = self.store.read_thread(id).await? else {
+            return Ok(false);
+        };
+        if thread.conversation_id != conversation_id || condensed_leaf.trim().is_empty() {
+            return Ok(false);
+        }
+        let mut state = self.store.read_dreamer_state(id).await?;
+        let current_start = if state.condensed_conversation_id == conversation_id {
+            state.condensed_leaves_count
+        } else {
+            0
+        };
+        if current_start != expected_start {
+            return Ok(false);
+        }
+        self.store
+            .append_condensed_leaf(id, conversation_id, condensed_leaf)
+            .await?;
+        state.condensed_conversation_id = conversation_id.to_owned();
+        state.condensed_leaves_count = current_start + consumed_count;
+        self.store.write_dreamer_state(id, &state).await?;
+        Ok(true)
+    }
+
     /// Dismiss the role. Its memory directory stays on disk and is picked up
     /// again if the role is defined anew.
     pub async fn remove(&self, id: &str) -> Result<(), RoleError> {
         validate_role_id(id)?;
+        let _guard = self.memory_lock.lock().await;
+        let now = now_ms();
+        let role_dir = self.store.role_dir(id);
+        git::ensure_baseline(role_dir.clone(), ROLE_TRACKED_PATHS, now).await?;
         if self.store.remove_definition(id).await? {
+            git::commit(
+                role_dir,
+                ROLE_TRACKED_PATHS,
+                "user".into(),
+                "role: dismissed".into(),
+                now,
+            )
+            .await?;
             Ok(())
         } else {
             Err(RoleError::NotFound(id.to_owned()))
@@ -570,6 +1085,8 @@ impl RoleService {
     }
 
     async fn to_response(&self, id: &str, definition: RoleDefinition) -> Result<RoleResponse, RoleError> {
+        let pb_raw = self.store.read_playbook(id).await?;
+        let pb_meta = self.store.read_playbook_meta(id).await?;
         Ok(RoleResponse {
             id: id.to_owned(),
             charter: definition.charter,
@@ -595,6 +1112,8 @@ impl RoleService {
                 reported
             },
             thread_conversation_id: self.store.read_thread(id).await?.map(|record| record.conversation_id),
+            playbook: parse_playbook(&pb_raw, &pb_meta),
+            proposals: self.store.read_proposals(id).await?,
             created_at: definition.created_at,
             updated_at: definition.updated_at,
         })
@@ -625,7 +1144,7 @@ fn validate_role_id(id: &str) -> Result<(), RoleError> {
     let plain = id
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'));
-    if id.is_empty() || id.len() > MAX_ROLE_ID_LEN || !plain || id.starts_with('.') {
+    if id.is_empty() || id.len() > MAX_ROLE_ID_LEN || !plain || id.starts_with('.') || id == "_boss" {
         return Err(RoleError::InvalidId(id.chars().take(MAX_ROLE_ID_LEN).collect()));
     }
     Ok(())

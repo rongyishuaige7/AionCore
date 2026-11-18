@@ -8,6 +8,7 @@ use axum::middleware::Next;
 use axum::response::Response;
 
 use aionui_common::ApiError;
+pub use aionui_common::{AuthenticatedUserId, RuntimeHelperCaller};
 use aionui_db::{IUserRepository, UserStatus, UserType};
 
 use crate::JwtService;
@@ -93,9 +94,15 @@ pub async fn auth_middleware(
     mut request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
-    // In local mode, skip JWT verification and inject a fixed default user.
+    // In local mode, skip JWT verification for UI requests, but still verify and
+    // tag agent subprocess calls carrying `x-aionui-runtime-token`.
     if state.identity_mode == AuthIdentityMode::Local {
-        request.extensions_mut().insert(CurrentUser::local_default());
+        if request.headers().contains_key(RUNTIME_TOKEN_HEADER) {
+            return runtime_token_channel(&state, request, next).await;
+        }
+        let local = CurrentUser::local_default();
+        request.extensions_mut().insert(AuthenticatedUserId(local.id.clone()));
+        request.extensions_mut().insert(local);
         return Ok(next.run(request).await);
     }
 
@@ -135,6 +142,7 @@ pub async fn auth_middleware(
         return Err(ApiError::Unauthorized("Invalid authentication session".into()));
     }
 
+    request.extensions_mut().insert(AuthenticatedUserId(user.id.clone()));
     request.extensions_mut().insert(CurrentUser {
         id: user.id,
         username: user.username.unwrap_or_else(|| "external_user".to_string()),
@@ -175,31 +183,41 @@ async fn runtime_token_channel(state: &AuthState, mut request: Request, next: Ne
         return Err(ApiError::Unauthorized("Invalid runtime token".into()));
     }
 
-    let user = state
-        .user_repo
-        .find_active_by_id(&user_id)
-        .await
-        .map_err(|e| {
+    let current_user = match state.user_repo.find_active_by_id(&user_id).await {
+        Ok(Some(user)) => {
+            if state.identity_mode == AuthIdentityMode::AionPro && user.user_type != UserType::Aionpro {
+                return Err(ApiError::coded(
+                    StatusCode::UNAUTHORIZED,
+                    "USER_CONTEXT_REQUIRED",
+                    "User context required.",
+                    None,
+                ));
+            }
+            CurrentUser {
+                id: user.id,
+                username: user.username.unwrap_or_else(|| "external_user".to_string()),
+                user_type: user.user_type,
+                status: user.status,
+            }
+        }
+        Ok(None) if state.identity_mode == AuthIdentityMode::Local && user_id == "system_default_user" => {
+            CurrentUser::local_default()
+        }
+        Ok(None) => return Err(ApiError::Unauthorized("Invalid authentication subject".into())),
+        Err(e) => {
             tracing::error!(error = %e, "runtime token channel user lookup failed");
-            ApiError::Internal("Authentication service unavailable".into())
-        })?
-        .ok_or_else(|| ApiError::Unauthorized("Invalid authentication subject".into()))?;
+            return Err(ApiError::Internal("Authentication service unavailable".into()));
+        }
+    };
 
-    if state.identity_mode == AuthIdentityMode::AionPro && user.user_type != UserType::Aionpro {
-        return Err(ApiError::coded(
-            StatusCode::UNAUTHORIZED,
-            "USER_CONTEXT_REQUIRED",
-            "User context required.",
-            None,
-        ));
-    }
-
-    request.extensions_mut().insert(CurrentUser {
-        id: user.id,
-        username: user.username.unwrap_or_else(|| "external_user".to_string()),
-        user_type: user.user_type,
-        status: user.status,
+    request
+        .extensions_mut()
+        .insert(AuthenticatedUserId(current_user.id.clone()));
+    request.extensions_mut().insert(RuntimeHelperCaller {
+        user_id: current_user.id.clone(),
+        conversation_id,
     });
+    request.extensions_mut().insert(current_user);
 
     Ok(next.run(request).await)
 }

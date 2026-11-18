@@ -124,6 +124,23 @@ fn render(brief: &TeamRoleBrief, setting: Setting) -> String {
         out.push_str("\n\n");
     }
 
+    let boss = brief.boss_profile.trim();
+    if !boss.is_empty() {
+        out.push_str("### About the user\n\n");
+        out.push_str(boss);
+        out.push_str("\n\n");
+    }
+
+    if !brief.playbook.is_empty() {
+        out.push_str("### Playbook\n\n");
+        for item in &brief.playbook {
+            out.push_str("- ");
+            out.push_str(item);
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+
     out.push_str("### Memory\n\n");
     let memory = brief.memory.trim();
     if memory.is_empty() {
@@ -351,6 +368,8 @@ mod tests {
             verifies: false,
             progress: Vec::new(),
             reported: Vec::new(),
+            playbook: Vec::new(),
+            boss_profile: String::new(),
         }
     }
 
@@ -700,5 +719,24 @@ mod tests {
             );
             assert!(!section.ends_with('\n'));
         }
+    }
+
+    #[test]
+    fn boss_profile_and_playbook_appear_when_present_and_omit_cleanly_when_empty() {
+        let bare = render_direct_standing_role(&brief());
+        assert!(!bare.contains("### About the user"));
+        assert!(!bare.contains("### Playbook"));
+
+        let enriched = render_scheduled_standing_role(&TeamRoleBrief {
+            boss_profile: "- [u-0001] Prefers concise conclusions first".into(),
+            playbook: vec!["[p-0001] (+3/-0) Verify data sources before sending weekly metrics".into()],
+            ..brief()
+        });
+        assert!(enriched.contains("### About the user\n\n- [u-0001] Prefers concise conclusions first"));
+        assert!(
+            enriched.contains("### Playbook\n\n- [p-0001] (+3/-0) Verify data sources before sending weekly metrics")
+        );
+        assert!(!enriched.contains("team_"));
+        assert!(!enriched.ends_with('\n'));
     }
 }

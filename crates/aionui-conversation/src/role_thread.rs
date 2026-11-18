@@ -14,7 +14,7 @@
 //! Summaries go through the same isolated, tool-less exchange titles use, on
 //! the model the thread itself runs on.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -469,6 +469,7 @@ pub(crate) struct RoleThreads {
     /// Conversation id → the role's assistant id.
     threads: Arc<Mutex<HashMap<String, String>>>,
     revisions: Arc<Mutex<HashMap<String, u64>>>,
+    rotated_pending: Arc<Mutex<HashSet<String>>>,
     sequence: Arc<AtomicU64>,
 }
 
@@ -489,6 +490,20 @@ impl RoleThreads {
             .unwrap_or_else(|e| e.into_inner())
             .get(conversation_id)
             .cloned()
+    }
+
+    fn mark_rotated(&self, conversation_id: &str) {
+        self.rotated_pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(conversation_id.to_owned());
+    }
+
+    fn take_rotated(&self, conversation_id: &str) -> bool {
+        self.rotated_pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(conversation_id)
     }
 
     fn bump(&self, conversation_id: &str) -> u64 {
@@ -621,8 +636,9 @@ impl ConversationService {
             .map(|line| line.mark.created_at)
             .max();
         let now = now_ms();
+        let rebuilt_stale = aionui_ai_agent::take_rebuilt_from_stale_anchor(&row.id);
         let why = rotation(&RotationSignals {
-            anchored: session.session_id.is_some(),
+            anchored: session.session_id.is_some() && !rebuilt_stale,
             idle_ms: last_said.map(|at| now.saturating_sub(at)),
             used,
             size,
@@ -663,6 +679,7 @@ impl ConversationService {
         self.refresh_standing_role(port, user_id, row, assistant_id).await;
         port.mark_thread_rotated(assistant_id, &row.id, now).await;
         self.leave_rotation_tip(user_id, &row.id, &handoff).await;
+        self.role_threads.mark_rotated(&row.id);
         info!(
             conversation_id = %row.id,
             assistant_id,
@@ -673,6 +690,78 @@ impl ConversationService {
             "role thread moves to a fresh session"
         );
         Some(handoff.text)
+    }
+
+    /// When an ACP session's stored `session_id` was rejected as `SessionNotFound`
+    /// inside `get_or_build_task` (after `rotate_thread_if_due` already ran),
+    /// build and record the `Unanchored` `<role-thread-handoff>` so the freshly
+    /// created session starts primed instead of blank.
+    pub(crate) async fn handoff_after_stale_anchor_rebuild(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        user_msg_id: &str,
+    ) -> Option<String> {
+        let port = self.role_port()?;
+        let assistant_id = self.role_threads.assistant_of(conversation_id)?;
+        let state = port.thread_state(&assistant_id, conversation_id).await?;
+        let lines: Vec<Line> = self
+            .thread_lines(user_id, conversation_id, state.summarized_to.as_ref())
+            .await
+            .ok()?
+            .into_iter()
+            .filter(|line| line.mark.id != user_msg_id)
+            .collect();
+        if lines.is_empty() && state.leaves.is_empty() {
+            return None;
+        }
+        let split = recent_start(&lines, KEEP_ROUNDS);
+        let handoff = render_handoff(&state.leaves, &lines[..split], &lines[split..], Rotation::Unanchored);
+        let now = now_ms();
+        port.mark_thread_rotated(&assistant_id, conversation_id, now).await;
+        self.leave_rotation_tip(user_id, conversation_id, &handoff).await;
+        self.role_threads.mark_rotated(conversation_id);
+        info!(
+            conversation_id,
+            assistant_id,
+            leaves = handoff.leaves,
+            rounds = handoff.rounds,
+            "role thread primed after stale ACP anchor rebuild"
+        );
+        Some(handoff.text)
+    }
+
+    /// Run an S4 retrospective pass right after a turn whose session rotated.
+    pub(crate) fn schedule_rotation_retrospective_if_due(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        generator: Arc<dyn TitleGenerator>,
+    ) {
+        if !self.role_threads.take_rotated(conversation_id) {
+            return;
+        }
+        let Some(assistant_id) = self.role_threads.assistant_of(conversation_id) else {
+            return;
+        };
+        let this = self.clone();
+        let user_id = user_id.to_owned();
+        let conversation_id = conversation_id.to_owned();
+        tokio::spawn(async move {
+            let Ok(_slot) = UPKEEP_SLOTS.acquire().await else {
+                return;
+            };
+            this.maybe_run_retrospective(
+                &user_id,
+                &assistant_id,
+                Some(&conversation_id),
+                generator.as_ref(),
+                "reflector",
+                "session rotation review",
+                false,
+            )
+            .await;
+        });
     }
 
     /// Swap the standing-role section the conversation opens with for one
@@ -843,7 +932,27 @@ impl ConversationService {
         }
         if kept > 0 {
             port.catch_up_recall(user_id, assistant_id).await;
-            info!(conversation_id, assistant_id, leaves = kept, "role thread summarized");
+            let condensed = self.condense_leaves_for_role(assistant_id, generator).await;
+            if condensed > 0 {
+                port.catch_up_recall(user_id, assistant_id).await;
+            }
+            self.maybe_run_retrospective(
+                user_id,
+                assistant_id,
+                Some(conversation_id),
+                generator,
+                "reflector",
+                "thread summary review",
+                false,
+            )
+            .await;
+            info!(
+                conversation_id,
+                assistant_id,
+                leaves = kept,
+                condensed,
+                "role thread summarized"
+            );
         }
     }
 }

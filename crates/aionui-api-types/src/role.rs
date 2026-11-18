@@ -39,6 +39,12 @@ pub struct RoleResponse {
     /// from runs elsewhere is brought. Absent until the user has talked to it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_conversation_id: Option<String>,
+    /// ACE-style itemized operating lessons (`PLAYBOOK.md`).
+    #[serde(default)]
+    pub playbook: Vec<RolePlaybookEntry>,
+    /// Agent-proposed major changes held until the user approves or rejects them.
+    #[serde(default)]
+    pub proposals: Vec<RoleProposal>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -404,4 +410,120 @@ pub struct RoleExpandResponse {
     /// True when a message or surrounding window was clipped to stay within the size cap.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
+}
+
+/// One itemized lesson in a role's `memory/PLAYBOOK.md`: `- [p-0001] (+3/-1) <content>`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RolePlaybookEntry {
+    pub id: String,
+    pub helpful: u32,
+    pub harmful: u32,
+    pub content: String,
+    #[serde(default)]
+    pub updated_at: i64,
+}
+
+/// Incremental ACE delta operation over `PLAYBOOK.md` or `roles/_boss/USER.md`.
+/// Never rewrites the whole file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "UPPERCASE")]
+pub enum PlaybookDeltaOp {
+    Add {
+        content: String,
+    },
+    Update {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content: Option<String>,
+        #[serde(default)]
+        helpful_delta: u32,
+        #[serde(default)]
+        harmful_delta: u32,
+    },
+    Remove {
+        id: String,
+    },
+}
+
+/// What an agent-authored proposal wants to change on a resident role.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RoleProposalChange {
+    UpdateRole {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        charter: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        denied_tools: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        verifies: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        asks_when_scheduled: Option<bool>,
+    },
+    CreateCronJob {
+        name: String,
+        schedule_desc: String,
+        prompt: String,
+        payload: serde_json::Value,
+    },
+    UpdateCronJob {
+        job_id: String,
+        name: String,
+        payload: serde_json::Value,
+    },
+    DeleteCronJob {
+        job_id: String,
+        name: String,
+    },
+}
+
+/// A major change proposed by an agent and held until the user approves or rejects it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleProposal {
+    pub id: String,
+    pub role_id: String,
+    pub summary: String,
+    pub detail: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_conversation_id: Option<String>,
+    pub created_at: TimestampMs,
+    pub change: RoleProposalChange,
+}
+
+/// One git commit in `<data_dir>/roles/<id>/.git`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleCommit {
+    pub sha: String,
+    pub short_sha: String,
+    pub at: TimestampMs,
+    pub actor: String,
+    pub message: String,
+    #[serde(default)]
+    pub files: Vec<String>,
+    pub additions: usize,
+    pub deletions: usize,
+    pub diff: String,
+    pub can_revert: bool,
+}
+
+/// Response of `GET /api/roles/{id}/timeline`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleTimelineResponse {
+    pub commits: Vec<RoleCommit>,
+}
+
+/// Body of `POST /api/roles/{id}/revert`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoleRevertRequest {
+    pub sha: String,
+}
+
+/// Summary of an S5 dreamer maintenance run on one role.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleDreamResponse {
+    pub decayed_playbook: usize,
+    pub archived_progress: usize,
+    pub curated_memory: bool,
+    pub retrospective_ran: bool,
+    pub condensed_batches: usize,
 }

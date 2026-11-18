@@ -1293,3 +1293,145 @@ async fn recall_isolates_roles_expands_windows_and_rebuilds_when_db_deleted() {
         .unwrap();
     assert_eq!(rebuilt.hits.len(), 1);
 }
+
+#[tokio::test]
+async fn playbook_deltas_boss_profile_decay_condensation_and_git_revert_preserve_runtime_files() {
+    use aionui_api_types::PlaybookDeltaOp;
+
+    let root = tempfile::tempdir().unwrap();
+    let service = service(&root);
+    service
+        .upsert("analyst", request("Owns weekly growth metrics.", &[]))
+        .await
+        .unwrap();
+
+    // Runtime files (thread, leaves, progress) must survive git commits and reverts untouched.
+    service
+        .open_thread_turn("analyst", "thread_live", false, 1_000)
+        .await
+        .unwrap();
+    service
+        .set_progress("analyst", "q4-audit", "Step 1 done")
+        .await
+        .unwrap();
+
+    // S4: Apply incremental ACE retrospective deltas to PLAYBOOK.md + shared _boss/USER.md.
+    let day0 = 1_000_000_000_i64;
+    let (applied, boss_changed) = service
+        .apply_retrospective(
+            "analyst",
+            &[
+                PlaybookDeltaOp::Add {
+                    content: "发周报前先核对数据源".into(),
+                },
+                PlaybookDeltaOp::Add {
+                    content: "异常波动需附同比与环比".into(),
+                },
+            ],
+            &[PlaybookDeltaOp::Add {
+                content: "老板阅读偏好：先给结论，再列数据".into(),
+            }],
+            "reflector",
+            "thread rotation review",
+            day0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(applied, 2);
+    assert!(boss_changed);
+    assert!(service.boss_profile().await.unwrap().contains("[u-0001] 老板阅读偏好"));
+
+    // Update p-0001 (+3 helpful) and mark p-0002 harmful (-2) so zero-LLM decay distinguishes them.
+    service
+        .apply_retrospective(
+            "analyst",
+            &[
+                PlaybookDeltaOp::Update {
+                    id: "p-0001".into(),
+                    content: None,
+                    helpful_delta: 3,
+                    harmful_delta: 0,
+                },
+                PlaybookDeltaOp::Update {
+                    id: "p-0002".into(),
+                    content: None,
+                    helpful_delta: 0,
+                    harmful_delta: 2,
+                },
+            ],
+            &[],
+            "reflector",
+            "user correction",
+            day0 + 1_000,
+        )
+        .await
+        .unwrap();
+
+    // S5: Zero-LLM decay archives contradicted p-0002 while keeping reinforced p-0001,
+    // and commits the change so it can even be reverted from timeline!
+    let (decayed, _) = service
+        .run_zero_llm_decay("analyst", "2026-11-17", day0 + 2_000)
+        .await
+        .unwrap();
+    assert_eq!(decayed, 1);
+    let after_decay = service.get("analyst").await.unwrap();
+    assert_eq!(after_decay.playbook.len(), 1);
+    assert_eq!(after_decay.playbook[0].id, "p-0001");
+    assert_eq!(after_decay.playbook[0].helpful, 4);
+
+    // Reverting the decay commit restores p-0002 without touching thread.json or progress/!
+    let timeline = service.timeline("analyst", 20).await.unwrap();
+    assert!(timeline[0].message.contains("decay:"));
+    let restored = service.revert("analyst", &timeline[0].sha, day0 + 3_000).await.unwrap();
+    assert_eq!(restored.playbook.len(), 2);
+    assert_eq!(
+        restored.thread_conversation_id.as_deref(),
+        Some("thread_live"),
+        "thread.json must not be disturbed by git revert"
+    );
+    assert_eq!(
+        restored.progress.len(),
+        1,
+        "progress files must not be disturbed by git revert"
+    );
+
+    // S5: LCM leaf condensation merges 6 D0 leaves into condensed/00001.md while keeping tail D0 leaves.
+    for idx in 1..=7 {
+        service
+            .add_thread_leaf(
+                "analyst",
+                "thread_live",
+                &format!("<!-- 2026-11-17 0{idx}:00 → 2026-11-17 0{idx}:30 · 4 messages -->\n- leaf {idx}"),
+                ThreadMark {
+                    created_at: (idx * 100) as i64,
+                    id: format!("m{idx}"),
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let (conv_id, start, batch) = service
+        .next_uncondensed_leaf_batch("analyst", 6)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(conv_id, "thread_live");
+    assert_eq!(start, 0);
+    assert_eq!(batch.len(), 6);
+    assert!(
+        service
+            .record_condensed_leaf(
+                "analyst",
+                "thread_live",
+                0,
+                6,
+                "<!-- 2026-11-17 01:00 → 2026-11-17 06:30 · condensed 6 summaries -->\n- merged 1..6\n",
+            )
+            .await
+            .unwrap()
+    );
+    let upkeep = service.thread_upkeep("analyst", "thread_live").await.unwrap().unwrap();
+    assert_eq!(upkeep.leaves.len(), 2);
+    assert!(upkeep.leaves[0].contains("merged 1..6"));
+    assert!(upkeep.leaves[1].contains("leaf 7"));
+}

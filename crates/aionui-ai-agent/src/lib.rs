@@ -77,3 +77,25 @@ pub use session_context::{
     WorkspaceContext,
 };
 pub use task_manager::{IWorkerTaskManager, WorkerTaskManagerImpl};
+
+static REBUILT_STALE_ANCHORS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// Record that `conversation_id` had a persisted `session_id` rejected as
+/// `SessionNotFound` and was silently rebuilt via `session/new`.
+pub fn mark_rebuilt_from_stale_anchor(conversation_id: &str) {
+    REBUILT_STALE_ANCHORS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(conversation_id.to_owned());
+}
+
+/// Consume whether `conversation_id`'s ACP session was rebuilt from a dead
+/// anchor since the last check, allowing role threads to inject their
+/// `<role-thread-handoff>` instead of starting blank.
+pub fn take_rebuilt_from_stale_anchor(conversation_id: &str) -> bool {
+    REBUILT_STALE_ANCHORS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(conversation_id)
+}

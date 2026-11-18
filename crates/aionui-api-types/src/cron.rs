@@ -59,7 +59,7 @@ pub struct CronAgentConfigReadDto {
     pub workspace: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct CronAgentConfigWriteDto {
     pub name: String,
@@ -143,7 +143,7 @@ pub struct CronJobResponse {
 // D. Create / Update request DTOs
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateCronJobRequest {
     pub name: String,
@@ -192,7 +192,7 @@ pub struct UpdateConversationCronRequest {
     pub message: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateCronJobRequest {
     #[serde(default)]
     pub name: Option<String>,

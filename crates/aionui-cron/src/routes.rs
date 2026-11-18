@@ -7,12 +7,12 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post, put};
 
 use aionui_api_types::{
-    ApiResponse, ConversationResponse, CreateConversationCronRequest, CreateConversationCronResponse,
-    CreateCronJobRequest, CronJobResponse, HasSkillResponse, ListCronJobsQuery, RunNowResponse, SaveCronSkillRequest,
+    ApiResponse, ConversationResponse, CreateConversationCronRequest, CreateCronJobRequest, CronJobResponse,
+    CronScheduleDto, HasSkillResponse, ListCronJobsQuery, RoleProposalChange, RunNowResponse, SaveCronSkillRequest,
     UpdateConversationCronRequest, UpdateCronJobRequest,
 };
 use aionui_auth::CurrentUser;
-use aionui_common::ApiError;
+use aionui_common::{ApiError, RuntimeHelperCaller};
 use aionui_db::DbError;
 
 use crate::error::CronError;
@@ -78,11 +78,57 @@ pub fn cron_routes(state: CronRouterState) -> Router {
 async fn create_job(
     State(state): State<CronRouterState>,
     Extension(user): Extension<CurrentUser>,
+    helper: Option<Extension<RuntimeHelperCaller>>,
     body: Result<Json<CreateCronJobRequest>, JsonRejection>,
-) -> Result<(StatusCode, Json<ApiResponse<CronJobResponse>>), ApiError> {
+) -> Result<(StatusCode, Json<ApiResponse<serde_json::Value>>), ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    if let (Some(Extension(caller)), Some(port)) = (&helper, state.cron_service.role_proposal_port()) {
+        let target_asst = match req
+            .agent_config
+            .as_ref()
+            .and_then(|c| c.assistant_id.clone())
+            .filter(|id| !id.trim().is_empty())
+        {
+            Some(id) => Some(id),
+            None if !req.conversation_id.trim().is_empty() => {
+                port.conversation_assistant_id(&user.id, &req.conversation_id).await
+            }
+            None => None,
+        };
+        if let Some(role_id) = target_asst
+            && port.is_resident_role(&role_id).await
+        {
+            let sched = format_schedule_dto(&req.schedule);
+            let prompt = req.prompt.clone().or_else(|| req.message.clone()).unwrap_or_default();
+            let payload = serde_json::to_value(&req).map_err(|e| ApiError::Internal(e.to_string()))?;
+            let summary = format!("new schedule: {} ({sched})", req.name);
+            let detail = format!("name: {}\nschedule: {sched}\nprompt: {prompt}", req.name);
+            let proposal = port
+                .stage_cron_proposal(
+                    &role_id,
+                    summary,
+                    detail,
+                    Some(caller.conversation_id.clone()),
+                    RoleProposalChange::CreateCronJob {
+                        name: req.name,
+                        schedule_desc: sched,
+                        prompt,
+                        payload,
+                    },
+                )
+                .await
+                .map_err(ApiError::BadRequest)?;
+            return Ok((
+                StatusCode::ACCEPTED,
+                Json(ApiResponse::ok(serde_json::json!({
+                    "status": "proposal_pending",
+                    "proposal": proposal,
+                }))),
+            ));
+        }
+    }
     let job = state.cron_service.add_job(&user.id, req).await?;
-    let resp = CronService::to_response(&job);
+    let resp = serde_json::to_value(CronService::to_response(&job)).map_err(|e| ApiError::Internal(e.to_string()))?;
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(resp))))
 }
 
@@ -108,21 +154,94 @@ async fn get_job(
 async fn update_job(
     State(state): State<CronRouterState>,
     Extension(user): Extension<CurrentUser>,
+    helper: Option<Extension<RuntimeHelperCaller>>,
     Path(id): Path<String>,
     body: Result<Json<UpdateCronJobRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<CronJobResponse>>, ApiError> {
+) -> Result<(StatusCode, Json<ApiResponse<serde_json::Value>>), ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    if let (Some(Extension(caller)), Some(port)) = (&helper, state.cron_service.role_proposal_port()) {
+        let existing = state.cron_service.get_job(&user.id, &id).await?;
+        if !crate::follow_up::is_follow_up(&existing) {
+            let role_id = resolve_job_role_id(&user.id, &existing, port.as_ref()).await;
+            let pure_pause = req.enabled == Some(false)
+                && req.schedule.is_none()
+                && req.message.is_none()
+                && req.agent_config.is_none()
+                && req.execution_mode.is_none();
+            if let Some(role_id) = role_id
+                && !pure_pause
+                && port.is_resident_role(&role_id).await
+            {
+                let payload = serde_json::to_value(&req).map_err(|e| ApiError::Internal(e.to_string()))?;
+                let summary = format!("update schedule: {}", existing.name);
+                let detail = serde_json::to_string_pretty(&payload).unwrap_or_default();
+                let proposal = port
+                    .stage_cron_proposal(
+                        &role_id,
+                        summary,
+                        detail,
+                        Some(caller.conversation_id.clone()),
+                        RoleProposalChange::UpdateCronJob {
+                            job_id: id,
+                            name: existing.name,
+                            payload,
+                        },
+                    )
+                    .await
+                    .map_err(ApiError::BadRequest)?;
+                return Ok((
+                    StatusCode::ACCEPTED,
+                    Json(ApiResponse::ok(serde_json::json!({
+                        "status": "proposal_pending",
+                        "proposal": proposal,
+                    }))),
+                ));
+            }
+        }
+    }
     let job = state.cron_service.update_job(&user.id, &id, req).await?;
-    Ok(Json(ApiResponse::ok(CronService::to_response(&job))))
+    let resp = serde_json::to_value(CronService::to_response(&job)).map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok((StatusCode::OK, Json(ApiResponse::ok(resp))))
 }
 
 async fn delete_job(
     State(state): State<CronRouterState>,
     Extension(user): Extension<CurrentUser>,
+    helper: Option<Extension<RuntimeHelperCaller>>,
     Path(id): Path<String>,
-) -> Result<Json<ApiResponse<()>>, ApiError> {
+) -> Result<(StatusCode, Json<ApiResponse<serde_json::Value>>), ApiError> {
+    if let (Some(Extension(caller)), Some(port)) = (&helper, state.cron_service.role_proposal_port()) {
+        let existing = state.cron_service.get_job(&user.id, &id).await?;
+        if !crate::follow_up::is_follow_up(&existing)
+            && let Some(role_id) = resolve_job_role_id(&user.id, &existing, port.as_ref()).await
+            && port.is_resident_role(&role_id).await
+        {
+            let summary = format!("delete schedule: {}", existing.name);
+            let detail = format!("remove scheduled task `{}` ({id})", existing.name);
+            let proposal = port
+                .stage_cron_proposal(
+                    &role_id,
+                    summary,
+                    detail,
+                    Some(caller.conversation_id.clone()),
+                    RoleProposalChange::DeleteCronJob {
+                        job_id: id,
+                        name: existing.name,
+                    },
+                )
+                .await
+                .map_err(ApiError::BadRequest)?;
+            return Ok((
+                StatusCode::ACCEPTED,
+                Json(ApiResponse::ok(serde_json::json!({
+                    "status": "proposal_pending",
+                    "proposal": proposal,
+                }))),
+            ));
+        }
+    }
     state.cron_service.remove_job(&user.id, &id).await?;
-    Ok(Json(ApiResponse::success()))
+    Ok((StatusCode::OK, Json(ApiResponse::ok(serde_json::Value::Null))))
 }
 
 async fn run_now(
@@ -152,15 +271,52 @@ async fn create_conversation_cron(
     Extension(current_user): Extension<CurrentUser>,
     headers: HeaderMap,
     body: Result<Json<CreateConversationCronRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<CreateConversationCronResponse>>, ApiError> {
+) -> Result<(StatusCode, Json<ApiResponse<serde_json::Value>>), ApiError> {
     let user_id = trusted_header_user_id(&headers, &current_user)?;
     let conversation_id = header_value(&headers, "x-aionui-conversation-id")?;
     let Json(req) = body.map_err(ApiError::from)?;
+    if let Some(port) = state.cron_service.role_proposal_port()
+        && let Some(role_id) = port.conversation_assistant_id(&user_id, &conversation_id).await
+        && port.is_resident_role(&role_id).await
+    {
+        let payload = serde_json::json!({
+            "conversation_helper": conversation_id,
+            "request": req,
+        });
+        let summary = format!("new schedule: {} ({})", req.name, req.schedule);
+        let detail = format!(
+            "name: {}\nschedule: {} ({})\nprompt: {}",
+            req.name, req.schedule, req.schedule_description, req.message
+        );
+        let proposal = port
+            .stage_cron_proposal(
+                &role_id,
+                summary,
+                detail,
+                Some(conversation_id),
+                RoleProposalChange::CreateCronJob {
+                    name: req.name,
+                    schedule_desc: req.schedule,
+                    prompt: req.message,
+                    payload,
+                },
+            )
+            .await
+            .map_err(ApiError::BadRequest)?;
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(ApiResponse::ok(serde_json::json!({
+                "status": "proposal_pending",
+                "proposal": proposal,
+            }))),
+        ));
+    }
     let resp = state
         .cron_service
         .create_for_conversation_helper(&user_id, &conversation_id, req)
         .await?;
-    Ok(Json(ApiResponse::ok(resp)))
+    let val = serde_json::to_value(resp).map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok((StatusCode::OK, Json(ApiResponse::ok(val))))
 }
 
 async fn list_conversation_cron(
@@ -184,15 +340,83 @@ async fn update_conversation_cron(
     headers: HeaderMap,
     Path(id): Path<String>,
     body: Result<Json<UpdateConversationCronRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<CronJobResponse>>, ApiError> {
+) -> Result<(StatusCode, Json<ApiResponse<serde_json::Value>>), ApiError> {
     let user_id = trusted_header_user_id(&headers, &current_user)?;
     let conversation_id = header_value(&headers, "x-aionui-conversation-id")?;
     let Json(req) = body.map_err(ApiError::from)?;
+    if let Some(port) = state.cron_service.role_proposal_port() {
+        let existing = state.cron_service.get_job(&user_id, &id).await?;
+        if let Some(role_id) = resolve_job_role_id(&user_id, &existing, port.as_ref()).await
+            && port.is_resident_role(&role_id).await
+        {
+            let payload = serde_json::json!({
+                "conversation_helper": conversation_id,
+                "request": req,
+            });
+            let summary = format!("update schedule: {}", req.name);
+            let detail = format!(
+                "name: {}\nschedule: {} ({})\nprompt: {}",
+                req.name, req.schedule, req.schedule_description, req.message
+            );
+            let proposal = port
+                .stage_cron_proposal(
+                    &role_id,
+                    summary,
+                    detail,
+                    Some(conversation_id),
+                    RoleProposalChange::UpdateCronJob {
+                        job_id: id,
+                        name: req.name,
+                        payload,
+                    },
+                )
+                .await
+                .map_err(ApiError::BadRequest)?;
+            return Ok((
+                StatusCode::ACCEPTED,
+                Json(ApiResponse::ok(serde_json::json!({
+                    "status": "proposal_pending",
+                    "proposal": proposal,
+                }))),
+            ));
+        }
+    }
     let job = state
         .cron_service
         .update_for_conversation_helper(&user_id, &conversation_id, &id, req)
         .await?;
-    Ok(Json(ApiResponse::ok(CronService::to_response(&job))))
+    let val = serde_json::to_value(CronService::to_response(&job)).map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok((StatusCode::OK, Json(ApiResponse::ok(val))))
+}
+
+async fn resolve_job_role_id(
+    user_id: &str,
+    job: &crate::types::CronJob,
+    port: &dyn crate::service::CronRoleProposalPort,
+) -> Option<String> {
+    if let Some(asst_id) = job
+        .agent_config
+        .as_ref()
+        .and_then(|c| c.assistant_id.as_deref().or(c.custom_agent_id.as_deref()))
+        .filter(|s| !s.trim().is_empty())
+    {
+        return Some(asst_id.to_owned());
+    }
+    if !job.conversation_id.trim().is_empty() {
+        return port.conversation_assistant_id(user_id, &job.conversation_id).await;
+    }
+    None
+}
+
+fn format_schedule_dto(schedule: &CronScheduleDto) -> String {
+    match schedule {
+        CronScheduleDto::Cron { expr, tz, .. } => match tz {
+            Some(tz) => format!("{expr} ({tz})"),
+            None => expr.clone(),
+        },
+        CronScheduleDto::Every { every_ms, .. } => format!("every {}m", (*every_ms / 60_000).max(1)),
+        CronScheduleDto::At { at_ms, .. } => format!("at {at_ms}"),
+    }
 }
 
 fn header_value(headers: &HeaderMap, name: &'static str) -> Result<String, ApiError> {

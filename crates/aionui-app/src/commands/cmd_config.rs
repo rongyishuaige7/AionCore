@@ -1194,9 +1194,18 @@ fn role_summary(role: &Value) -> Value {
         .and_then(Value::as_str)
         .map_or(0, |memory| memory.chars().count());
     summary.insert("memory_chars".into(), json!(memory_chars));
-    for (field, count) in [("progress", "progress_count"), ("reported", "reported_count")] {
+    for (field, count) in [
+        ("progress", "progress_count"),
+        ("reported", "reported_count"),
+        ("playbook", "playbook_count"),
+    ] {
         let len = role.get(field).and_then(Value::as_array).map_or(0, Vec::len);
         summary.insert(count.into(), json!(len));
+    }
+    if let Some(proposals) = role.get("proposals").and_then(Value::as_array)
+        && !proposals.is_empty()
+    {
+        summary.insert("pending_proposals".into(), Value::Array(proposals.clone()));
     }
     Value::Object(summary)
 }

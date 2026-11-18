@@ -61,6 +61,7 @@ use crate::convert::{
     row_to_message_response_compact, row_to_response, row_to_response_with_extra, search_row_to_item, string_to_enum,
 };
 use crate::error::ConversationError;
+use crate::role_retrospective::RoleRetrospectiveContext;
 use crate::role_thread::{RoleThreadMark, RoleThreadState};
 use crate::session_context::{AionrsRuntimePermissionSeed, SessionContextBuilder};
 use crate::session_mentions;
@@ -184,6 +185,44 @@ pub trait ConversationRolePort: Send + Sync {
 
     /// Catch up the role's recall index after new summary leaves were written.
     async fn catch_up_recall(&self, _user_id: &str, _assistant_id: &str) {}
+
+    /// Current playbook, shared boss profile, and failed runs for an S4/S5 retrospective.
+    async fn retrospective_context(&self, _user_id: &str, _assistant_id: &str) -> Option<RoleRetrospectiveContext> {
+        None
+    }
+
+    /// Persist incremental ACE delta operations from a retrospective pass.
+    async fn apply_retrospective(
+        &self,
+        _assistant_id: &str,
+        _playbook_ops: &[aionui_api_types::PlaybookDeltaOp],
+        _boss_ops: &[aionui_api_types::PlaybookDeltaOp],
+        _actor: &str,
+        _reason: &str,
+        _now: i64,
+    ) {
+    }
+
+    /// Next batch of uncondensed `D0` leaves for S5 leaf condensation.
+    async fn next_uncondensed_leaf_batch(
+        &self,
+        _assistant_id: &str,
+        _batch_size: usize,
+    ) -> Option<(String, usize, Vec<String>)> {
+        None
+    }
+
+    /// Persist a condensed leaf summarizing `consumed_count` `D0` leaves.
+    async fn record_condensed_leaf(
+        &self,
+        _assistant_id: &str,
+        _conversation_id: &str,
+        _expected_start: usize,
+        _consumed_count: usize,
+        _condensed_leaf: &str,
+    ) -> bool {
+        false
+    }
 }
 
 /// `extra` keys of a conversation the user opens beside something else: never
@@ -4839,7 +4878,7 @@ impl ConversationService {
         })
     }
 
-    async fn ensure_runtime_agent(
+    pub(crate) async fn ensure_runtime_agent(
         &self,
         user_id: &str,
         conversation_id: &str,

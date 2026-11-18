@@ -22,6 +22,9 @@
 //! composition layer adapts [`RoleService`] to that port.
 
 mod error;
+mod git;
+mod playbook;
+mod proposals;
 mod recall;
 mod service;
 mod state;
@@ -30,6 +33,10 @@ mod store;
 pub mod routes;
 
 pub use error::RoleError;
+pub use playbook::{
+    MAX_BOSS_ITEMS, MAX_PLAYBOOK_ITEM_CHARS, MAX_PLAYBOOK_ITEMS, PLAYBOOK_ARCHIVE_IDLE_DAYS, PLAYBOOK_GRACE_DAYS,
+    PROGRESS_ARCHIVE_IDLE_DAYS, playbook_decay_score,
+};
 pub use recall::{
     DEFAULT_EXPAND_WINDOW, DEFAULT_RECALL_LIMIT, MAX_EXPAND_WINDOW, MAX_RECALL_LIMIT, MAX_RECALL_QUERY_CHARS,
     RecallConversationSync, RecallMessage, RecallSync, RecallWatermark, leaf_ref_id, message_ref_id,
@@ -40,4 +47,4 @@ pub use service::{
     MAX_PROGRESS_TASKS, MAX_TASK_NAME_CHARS, ProgressUpdate, RememberedNote, RoleService, ThreadMark, ThreadTurn,
     ThreadUpkeep,
 };
-pub use state::RoleRouterState;
+pub use state::{RoleExternalPort, RoleRouterState};

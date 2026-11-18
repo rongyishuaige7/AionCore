@@ -126,6 +126,7 @@ impl AcpAgentManager {
             error = %err,
             "open_session_resume: stale session id rejected by CLI; clearing persisted session id and rebuilding via session/new"
         );
+        crate::mark_rebuilt_from_stale_anchor(&self.params.conversation_id);
         {
             let mut session = self.session.write().await;
             session.clear_session_id();
