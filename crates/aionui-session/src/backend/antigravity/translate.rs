@@ -6,8 +6,8 @@
 
 use std::collections::BTreeMap;
 
-use super::CODE_STEPS_FAILED;
 use super::wire::{AgyEvent, AgyState, AgyStepType, AgyStepUpdate, AgySubagent, AgyUsage};
+use super::{CODE_DISCONNECTED_AFTER_REPLY, CODE_STEPS_FAILED};
 use crate::event::{
     CancelReason, LocalizedText, NoticeLevel, SessionEvent, ToolResultContent, TurnOutcome, UsageBreakdown,
 };
@@ -25,6 +25,27 @@ pub(crate) fn explain_turn_error(raw: &str) -> String {
         );
     }
     raw.to_owned()
+}
+
+/// Whether agy's terminal error is its connection to the model service
+/// dropping, as opposed to the service refusing or failing the request.
+///
+/// Observed: `API error (attempt 1): request failed: Post
+/// "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse": EOF`.
+fn is_connection_drop(raw: &str) -> bool {
+    let lower = raw.to_ascii_lowercase();
+    lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|word| word == "eof")
+        || [
+            "connection reset",
+            "broken pipe",
+            "connection closed",
+            "stream closed",
+            "stream reset",
+        ]
+        .iter()
+        .any(|phrase| lower.contains(phrase))
 }
 
 /// Folds the agy stream into `SessionEvent`s, carrying the small amount of
@@ -50,6 +71,18 @@ pub(crate) struct Translator {
     /// Per-call counters keyed by step, not result's session-cumulative counters.
     /// Verified: agy 1.3.5 captures summarized in ARCHITECTURE.md.
     step_usage: BTreeMap<u64, AgyUsage>,
+    /// The step whose reply text is streaming, so a DONE frame without text of
+    /// its own still counts as a finished reply.
+    reply_step: Option<u64>,
+    /// THIS turn's reply finished (an `agent_response` step reached DONE with
+    /// text) and no tool or subagent step started after it.
+    ///
+    /// agy can end such a turn as `ERROR` when its connection to the model
+    /// service drops afterwards (`… streamGenerateContent …: EOF`). Logs from
+    /// 2026-11-18..20 show 20 agy turns failed this way, every one with its
+    /// reply already persisted: the user saw an error card, and a Retry that
+    /// would run the whole prompt again, for an answer they already had.
+    reply_complete: bool,
 }
 
 impl Translator {
@@ -69,6 +102,8 @@ impl Translator {
         match ev {
             AgyEvent::Init(init) => {
                 self.step_usage.clear();
+                self.reply_step = None;
+                self.reply_complete = false;
                 if !init.conversation_id.is_empty() {
                     self.backend_session_id = Some(init.conversation_id.clone());
                 }
@@ -83,25 +118,50 @@ impl Translator {
                 if !r.conversation_id.is_empty() {
                     self.backend_session_id = Some(r.conversation_id);
                 }
-                let is_error = !r.status.eq_ignore_ascii_case("SUCCESS");
-                let outcome = match r.status.to_ascii_uppercase().as_str() {
+                let status = r.status.to_ascii_uppercase();
+                let reply_complete = std::mem::take(&mut self.reply_complete);
+                self.reply_step = None;
+                // A dropped connection after a finished reply is not a failed
+                // turn: the answer is delivered, and nothing is left to retry.
+                let dropped_after_reply = reply_complete
+                    && status != "SUCCESS"
+                    && status != "INTERRUPTED"
+                    && r.error.as_deref().is_some_and(is_connection_drop);
+                let is_error = status != "SUCCESS" && !dropped_after_reply;
+                let outcome = match status.as_str() {
                     "SUCCESS" => TurnOutcome::EndTurn,
+                    _ if dropped_after_reply => TurnOutcome::EndTurn,
                     "INTERRUPTED" => TurnOutcome::Cancelled {
                         reason: CancelReason::UserCancel,
                     },
                     _ => TurnOutcome::Failed,
                 };
+                let dropped_detail = if dropped_after_reply { r.error.clone() } else { None };
                 // On failure agy puts the reason in `error`, not `response`.
                 let result_text = if is_error {
                     explain_turn_error(&r.error.unwrap_or(r.response))
                 } else {
                     r.response
                 };
-                let mut out = Vec::with_capacity(3);
+                let mut out = Vec::with_capacity(4);
                 // A resumed result includes PREVIOUS turns. Only the completed
                 // steps in this turn can supply current occupancy or new spend.
                 if let Some(usage) = self.take_turn_usage() {
                     out.push(usage);
+                }
+                // Before the terminal, for the same reason as the notice below.
+                // Info: the reply is complete and there is nothing to act on;
+                // the note only keeps agy's error from vanishing silently.
+                if let Some(detail) = dropped_detail {
+                    out.push(SessionEvent::Notice {
+                        level: NoticeLevel::Info,
+                        message: format!(
+                            "agy lost its connection to the model service after the reply was complete ({detail}). \
+                             The reply is complete; the turn is not counted as failed."
+                        ),
+                        localized: Some(LocalizedText::new(CODE_DISCONNECTED_AFTER_REPLY).with("detail", detail)),
+                        supersedes_key: None,
+                    });
                 }
                 // BEFORE the terminal, and it MUST stay there. `StreamRelay`
                 // breaks out of its receive loop the moment it sees the turn's
@@ -207,14 +267,23 @@ impl Translator {
 
         match su.step_type {
             AgyStepType::AgentResponse => {
+                let has_text = su.text_delta.as_deref().is_some_and(|t| !t.is_empty());
                 if let Some(text) = su.text_delta.filter(|t| !t.is_empty()) {
                     out.push(SessionEvent::MessageDelta { item_id: id, text });
                 }
+                if has_text {
+                    self.reply_step = Some(su.step_index);
+                }
+                // Streaming text means a reply is under way, not finished.
+                self.reply_complete = su.state == AgyState::Done && self.reply_step == Some(su.step_index);
                 // NOTE: `usage.thinking_tokens` is a COUNT only — agy never
                 // emits thinking text. Synthesizing a ThoughtDelta here would
                 // render a permanently empty thought card.
             }
             AgyStepType::Tool => {
+                if su.state == AgyState::Active {
+                    self.reply_complete = false;
+                }
                 let info = su.tool_info;
                 let raw_name = info
                     .as_ref()
@@ -269,6 +338,9 @@ impl Translator {
             // into its own prose. The card therefore settles empty rather than
             // inventing an output it was never given.
             AgyStepType::Subagent => {
+                if su.state == AgyState::Active {
+                    self.reply_complete = false;
+                }
                 let agents = su.subagent_info.map(|i| i.subagents).unwrap_or_default();
                 match su.state {
                     AgyState::Active => out.push(SessionEvent::ToolCall {
@@ -1028,5 +1100,99 @@ mod tests {
             })
             .expect("notice expected");
         assert!(msg.contains('1') && !msg.contains('2'), "counted twice: {msg}");
+    }
+
+    /// agy 1.x ending a turn as ERROR after its reply was complete: the
+    /// connection to the model service dropped once the answer was out.
+    const REPLY_THEN_EOF: &[&str] = &[
+        r#"{"event":"step_update","step_update":{"step_index":4,"state":"ACTIVE","step_type":"tool","tool_name":"search_web","tool_info":{"name":"search_web"}}}"#,
+        r#"{"event":"step_update","step_update":{"step_index":4,"state":"DONE","step_type":"tool","tool_name":"search_web","tool_info":{"name":"search_web","output":"…"}}}"#,
+        r#"{"event":"step_update","step_update":{"step_index":5,"state":"DONE","step_type":"agent_response","text_delta":"Here is the answer."}}"#,
+        r#"{"event":"result","result":{"conversation_id":"c1","status":"ERROR","error":"API error (attempt 1): request failed: Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse\": EOF"}}"#,
+    ];
+
+    fn terminal(evs: &[SessionEvent]) -> (bool, &TurnOutcome) {
+        evs.iter()
+            .find_map(|e| match e {
+                SessionEvent::TurnResult { is_error, outcome, .. } => Some((*is_error, outcome)),
+                _ => None,
+            })
+            .expect("a terminal is always emitted")
+    }
+
+    #[test]
+    fn a_connection_drop_after_a_finished_reply_ends_the_turn_normally() {
+        let (_, evs) = tr(REPLY_THEN_EOF);
+        let (is_error, outcome) = terminal(&evs);
+        assert!(!is_error, "the reply was delivered: {evs:?}");
+        assert!(matches!(outcome, TurnOutcome::EndTurn));
+
+        let notice_at = evs
+            .iter()
+            .position(|e| {
+                matches!(e, SessionEvent::Notice { level: NoticeLevel::Info, localized: Some(l), .. }
+                    if l.code == CODE_DISCONNECTED_AFTER_REPLY && l.params.get("detail").is_some_and(|d| d.as_str().is_some_and(|d| d.ends_with("EOF"))))
+            })
+            .expect("agy's error must not vanish silently");
+        let result_at = evs
+            .iter()
+            .position(|e| matches!(e, SessionEvent::TurnResult { .. }))
+            .unwrap();
+        assert!(
+            notice_at < result_at,
+            "a notice after the terminal is dropped by the relay"
+        );
+    }
+
+    #[test]
+    fn a_connection_drop_before_the_reply_finished_still_fails() {
+        // Text streaming but never DONE: the answer may be cut off.
+        let (_, evs) = tr(&[
+            r#"{"event":"step_update","step_update":{"step_index":5,"state":"ACTIVE","step_type":"agent_response","text_delta":"Here is the ans"}}"#,
+            r#"{"event":"result","result":{"conversation_id":"c1","status":"ERROR","error":"request failed: unexpected EOF"}}"#,
+        ]);
+        assert!(terminal(&evs).0);
+
+        // A tool started after the reply: the turn was still working.
+        let (_, evs) = tr(&[
+            r#"{"event":"step_update","step_update":{"step_index":5,"state":"DONE","step_type":"agent_response","text_delta":"Let me check."}}"#,
+            r#"{"event":"step_update","step_update":{"step_index":6,"state":"ACTIVE","step_type":"tool","tool_name":"run_command"}}"#,
+            r#"{"event":"result","result":{"conversation_id":"c1","status":"ERROR","error":"request failed: EOF"}}"#,
+        ]);
+        assert!(terminal(&evs).0);
+    }
+
+    #[test]
+    fn a_service_error_after_a_finished_reply_still_fails() {
+        let (_, evs) = tr(&[
+            r#"{"event":"step_update","step_update":{"step_index":5,"state":"DONE","step_type":"agent_response","text_delta":"Done."}}"#,
+            r#"{"event":"result","result":{"conversation_id":"c1","status":"ERROR","error":"RESOURCE_EXHAUSTED (code 429): quota exceeded"}}"#,
+        ]);
+        assert!(terminal(&evs).0);
+        assert!(!evs.iter().any(|e| matches!(e, SessionEvent::Notice { .. })));
+    }
+
+    #[test]
+    fn a_reply_streamed_before_its_done_frame_counts_as_finished() {
+        let (_, evs) = tr(&[
+            r#"{"event":"step_update","step_update":{"step_index":5,"state":"ACTIVE","step_type":"agent_response","text_delta":"Here is "}}"#,
+            r#"{"event":"step_update","step_update":{"step_index":5,"state":"DONE","step_type":"agent_response"}}"#,
+            r#"{"event":"result","result":{"conversation_id":"c1","status":"ERROR","error":"read: connection reset by peer"}}"#,
+        ]);
+        assert!(!terminal(&evs).0);
+    }
+
+    #[test]
+    fn a_finished_reply_does_not_carry_into_the_next_turn() {
+        let mut t = Translator::default();
+        for line in REPLY_THEN_EOF {
+            t.translate(parse_line(line).expect("fixture must parse"));
+        }
+        t.translate(parse_line(r#"{"event":"init","conversation_id":"c1","init":{"model":"m"}}"#).expect("init"));
+        let evs = t.translate(
+            parse_line(r#"{"event":"result","result":{"conversation_id":"c1","status":"ERROR","error":"request failed: EOF"}}"#)
+                .expect("fixture must parse"),
+        );
+        assert!(terminal(&evs).0, "a turn with no reply of its own must fail: {evs:?}");
     }
 }

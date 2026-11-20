@@ -14,6 +14,9 @@ mod argv;
 /// interpolating `{{count}}`. agy-specific: no other backend reports steps that
 /// silently failed while the turn still ends in success.
 pub(crate) const CODE_STEPS_FAILED: &str = "ANTIGRAVITY_STEPS_FAILED";
+/// i18n key for the "the connection dropped after the reply was complete"
+/// notice, interpolating `{{detail}}` (agy's own error line).
+pub(crate) const CODE_DISCONNECTED_AFTER_REPLY: &str = "ANTIGRAVITY_DISCONNECTED_AFTER_REPLY";
 
 mod conn;
 mod models;
