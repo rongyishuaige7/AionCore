@@ -268,7 +268,7 @@ const THREAD_ASIDE_KEYS: [&str; 2] = ["companion_of", "jot_trial"];
 /// `extra` keys of a conversation a schedule or a team creates. Those put the
 /// role to work with their own wording of its section, so such a conversation
 /// is not given the direct one as well.
-const PUT_TO_WORK_EXTRA_KEYS: [&str; 3] = ["cron_job_id", "cronJobId", "teamId"];
+const PUT_TO_WORK_EXTRA_KEYS: [&str; 4] = ["cron_job_id", "cronJobId", "teamId", "team_id"];
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct AssistantSnapshot {
@@ -1081,7 +1081,21 @@ impl ConversationService {
         };
 
         let now = now_ms();
-        let mut extra = serde_json::from_str::<serde_json::Value>(&row.extra).unwrap_or_default();
+        let mut extra = if row.extra.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            match serde_json::from_str::<serde_json::Value>(&row.extra) {
+                Ok(value) if value.is_object() => value,
+                Ok(_) => {
+                    warn!(conversation_id = %row.id, "keeper brief skipped: conversation extra is not an object");
+                    return content;
+                }
+                Err(error) => {
+                    warn!(conversation_id = %row.id, error = %error, "keeper brief skipped: conversation extra unreadable");
+                    return content;
+                }
+            }
+        };
         if let Some(object) = extra.as_object_mut() {
             object.insert(KEEPER_BRIEFED_AT_KEY.into(), serde_json::json!(now));
             object.insert(KEEPER_BRIEF_ROLE_KEY.into(), serde_json::json!(brief.role_id));
@@ -1097,10 +1111,13 @@ impl ConversationService {
         row.extra = extra.to_string();
 
         // Right after the user's message, so the card sits between it and the reply.
+        // Share id and msg_id so the persisted row and live WS event share one
+        // index key and never render twice on reload/reconnect races.
+        let card_id = Self::mint_msg_id();
         let card = MessageRow {
-            id: Self::mint_msg_id(),
+            id: card_id.clone(),
             conversation_id: row.id.clone(),
-            msg_id: None,
+            msg_id: Some(card_id),
             r#type: KEEPER_BRIEF_MESSAGE.into(),
             content: brief.card.to_string(),
             position: Some("center".into()),
@@ -1115,6 +1132,7 @@ impl ConversationService {
                 serde_json::json!({
                     "user_id": user_id,
                     "id": card.id,
+                    "msg_id": card.msg_id,
                     "conversation_id": row.id,
                     "type": card.r#type,
                     "content": brief.card,

@@ -104,6 +104,7 @@ async fn the_first_turn_in_a_kept_project_opens_with_the_keepers_brief_and_only_
         Some(true)
     );
     assert_eq!(card.position.as_deref(), Some("center"));
+    assert_eq!(card.msg_id.as_deref(), Some(card.id.as_str()));
     assert!(card.created_at > user.unwrap().created_at);
     assert_eq!(messages.iter().filter(|m| m.r#type == "keeper_brief").count(), 1);
 
@@ -112,17 +113,27 @@ async fn the_first_turn_in_a_kept_project_opens_with_the_keepers_brief_and_only_
     assert!(extra["keeper_briefed_at"].as_i64().is_some());
     assert_eq!(extra["keeper_brief_role"], "seo");
 
-    assert!(
-        broadcaster
-            .take_events()
-            .iter()
-            .any(|e| e.name == "role.keeper_brief" && e.data["conversation_id"] == id.as_str())
-    );
+    assert!(broadcaster.take_events().iter().any(|e| {
+        e.name == "role.keeper_brief"
+            && e.data["conversation_id"] == id.as_str()
+            && e.data["msg_id"] == card.id.as_str()
+    }));
 }
 
 #[tokio::test]
 async fn a_conversation_opened_with_the_brief_off_is_not_briefed() {
     let (svc, _broadcaster, repo, task_mgr, agent, id) = kept_conversation(json!({ "keeper_brief_off": true })).await;
+
+    send(&svc, &task_mgr, &id).await;
+
+    assert_eq!(agent.sent_contents(), vec!["Hello".to_owned()]);
+    let messages = repo_messages_asc(&repo, &id, 50).await;
+    assert!(messages.iter().all(|m| m.r#type != "keeper_brief"));
+}
+
+#[tokio::test]
+async fn a_snake_case_team_conversation_is_not_briefed() {
+    let (svc, _broadcaster, repo, task_mgr, agent, id) = kept_conversation(json!({ "team_id": "team-1" })).await;
 
     send(&svc, &task_mgr, &id).await;
 

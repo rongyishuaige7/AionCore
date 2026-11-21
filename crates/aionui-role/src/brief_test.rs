@@ -151,3 +151,39 @@ fn the_agent_reads_it_as_background_to_check() {
     assert!(text.contains("- [p-0001] Stage first"));
     assert!(text.contains("- 2026-11-16 robots.txt blocks /cart"));
 }
+
+#[test]
+fn overlapping_project_names_do_not_bleed_into_a_shorter_sibling() {
+    let others = vec!["yipan-global-store".to_owned(), "yipan-en".to_owned()];
+    let memory = "\
+- 2026-11-16 [yipan-global-store] robots.txt blocks /cart
+- 2026-11-17 [yipan-en] pricing banner updated
+- 2026-11-18 yipan-global-store sitemap submitted
+- 2026-11-19 [yipan] 首页导航改为两栏
+- 2026-11-20 yipan 支付回调增加幂等校验
+";
+    let mut src = sources(&others, memory, &[], &[]);
+    src.project_name = "yipan";
+    let brief = compose(&src, "robots.txt");
+    assert_eq!(
+        brief.memory,
+        vec![
+            "2026-11-20 yipan 支付回调增加幂等校验",
+            "2026-11-19 [yipan] 首页导航改为两栏",
+        ]
+    );
+}
+
+#[test]
+fn overlapping_cjk_project_names_stay_isolated() {
+    let others = vec!["亿盘海外".to_owned()];
+    let memory = "\
+- 2026-11-16 [亿盘海外] 独立站启用了新域名
+- 2026-11-17 亿盘海外 结账页汇率接口超时
+- 2026-11-18 [亿盘] 国内版支持微信扫码
+";
+    let mut src = sources(&others, memory, &[], &[]);
+    src.project_name = "亿盘";
+    let brief = compose(&src, "域名");
+    assert_eq!(brief.memory, vec!["2026-11-18 [亿盘] 国内版支持微信扫码"]);
+}

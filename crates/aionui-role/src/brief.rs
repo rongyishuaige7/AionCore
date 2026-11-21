@@ -219,14 +219,35 @@ impl Lens {
     }
 
     fn names_this(&self, lower: &str) -> bool {
-        self.name.as_deref().is_some_and(|name| lower.contains(name))
+        let Some(this) = self.name.as_deref() else {
+            return false;
+        };
+        if has_bracket_tag(lower, this) {
+            return true;
+        }
+        // Mask out other projects whose names contain `this` (e.g. `yipan-global-store`
+        // or `亿盘海外` containing `yipan` / `亿盘`) before scanning plain text so a
+        // shorter project name never claims a longer sibling's notes.
+        let mut masked = lower.to_owned();
+        for other in &self.others {
+            if other.len() > this.len() && other.contains(this) {
+                masked = strip_project_mentions(&masked, other);
+            }
+        }
+        mentions_project(&masked, this)
+    }
+
+    fn names_other(&self, lower: &str) -> bool {
+        self.others
+            .iter()
+            .any(|other| has_bracket_tag(lower, other) || mentions_project(lower, other))
     }
 
     /// Text about another project the role keeps, and not about this one, is
     /// left out of this project's brief.
     fn belongs(&self, text: &str) -> bool {
         let lower = text.to_lowercase();
-        self.names_this(&lower) || !self.others.iter().any(|other| lower.contains(other.as_str()))
+        self.names_this(&lower) || !self.names_other(&lower)
     }
 
     /// How strongly `text` bears on this conversation: naming the project
@@ -236,6 +257,81 @@ impl Lens {
         let named = if self.names_this(&lower) { 1_000 } else { 0 };
         named + self.terms.iter().filter(|term| lower.contains(term.as_str())).count()
     }
+}
+
+/// Whether `lower` carries an explicit `[name]` project tag.
+fn has_bracket_tag(lower: &str, name: &str) -> bool {
+    let mut rest = lower;
+    while let Some(open) = rest.find('[') {
+        rest = &rest[open + 1..];
+        let Some(close) = rest.find(']') else {
+            break;
+        };
+        if rest[..close].trim() == name {
+            return true;
+        }
+        rest = &rest[close + 1..];
+    }
+    false
+}
+
+fn is_ascii_ident_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '-' | '_')
+}
+
+/// Whether `lower` mentions `name` as a standalone project token: ASCII edges
+/// must not touch another ASCII identifier character (`-`, `_`, letter, digit),
+/// so `yipan` never matches inside `yipan-global-store` or `yipan-en`.
+fn mentions_project(lower: &str, name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let check_left = name.chars().next().is_some_and(is_ascii_ident_char);
+    let check_right = name.chars().next_back().is_some_and(is_ascii_ident_char);
+    for (start, _) in lower.match_indices(name) {
+        let end = start + name.len();
+        let left_ok = !check_left
+            || lower[..start]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !is_ascii_ident_char(c));
+        let right_ok = !check_right || lower[end..].chars().next().is_none_or(|c| !is_ascii_ident_char(c));
+        if left_ok && right_ok {
+            return true;
+        }
+    }
+    false
+}
+
+/// Replaces boundary-matched occurrences of `name` with spaces so a shorter
+/// sibling name cannot match inside a longer sibling's mention.
+fn strip_project_mentions(lower: &str, name: &str) -> String {
+    if name.is_empty() {
+        return lower.to_owned();
+    }
+    let check_left = name.chars().next().is_some_and(is_ascii_ident_char);
+    let check_right = name.chars().next_back().is_some_and(is_ascii_ident_char);
+    let mut out = String::with_capacity(lower.len());
+    let mut cursor = 0;
+    for (start, _) in lower.match_indices(name) {
+        if start < cursor {
+            continue;
+        }
+        let end = start + name.len();
+        let left_ok = !check_left
+            || lower[..start]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !is_ascii_ident_char(c));
+        let right_ok = !check_right || lower[end..].chars().next().is_none_or(|c| !is_ascii_ident_char(c));
+        if left_ok && right_ok {
+            out.push_str(&lower[cursor..start]);
+            out.push(' ');
+            cursor = end;
+        }
+    }
+    out.push_str(&lower[cursor..]);
+    out
 }
 
 /// Indexes of `items` worth handing over, most relevant first and, among
