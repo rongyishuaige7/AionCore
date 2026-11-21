@@ -421,6 +421,8 @@ pub struct ScannedSkill {
     pub name: String,
     pub description: String,
     pub path: String,
+    /// The entry itself is a symlink (a junction on Windows) to a folder elsewhere.
+    pub is_link: bool,
 }
 
 /// An auto-injected built-in skill.
@@ -1168,13 +1170,36 @@ pub async fn export_skill_with_symlink(skill_path: &Path, target_dir: &Path) -> 
         }
     }
 
-    create_symlink(skill_path, &target_link).await?;
+    // Link the real folder, not a link to it, so removing one link never breaks another.
+    let source = tokio::fs::canonicalize(skill_path)
+        .await
+        .unwrap_or_else(|_| skill_path.to_path_buf());
+    create_symlink(&source, &target_link).await?;
 
     debug!(
         skill = %skill_name,
         link = %target_link.display(),
         "skill exported (symlink)"
     );
+    Ok(())
+}
+
+/// Remove a skill link made by [`export_skill_with_symlink`], leaving the folder it points
+/// at alone. Anything that is not a link to a skill folder is refused, so a real skill
+/// folder can never be deleted through here.
+pub async fn remove_skill_symlink(link: &Path) -> Result<(), ExtensionError> {
+    let meta = match tokio::fs::symlink_metadata(link).await {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Err(ExtensionError::SkillNotFound(link.display().to_string()));
+        }
+        Err(e) => return Err(e.into()),
+    };
+    if !meta.file_type().is_symlink() || !link.join(SKILL_MANIFEST_FILE).is_file() {
+        return Err(ExtensionError::InvalidSkillPath(link.display().to_string()));
+    }
+    remove_symlink(link).await?;
+    debug!(link = %link.display(), "skill link removed");
     Ok(())
 }
 
@@ -1939,10 +1964,14 @@ async fn scan_skill_dirs(dir: &Path) -> Result<Vec<ScannedSkill>, ExtensionError
                     } else {
                         name
                     };
+                    let is_link = tokio::fs::symlink_metadata(&entry_path)
+                        .await
+                        .is_ok_and(|meta| meta.file_type().is_symlink());
                     result.push(ScannedSkill {
                         name: final_name,
                         description,
                         path: entry_path.to_string_lossy().into_owned(),
+                        is_link,
                     });
                 }
             }
@@ -2121,6 +2150,21 @@ fn extract_frontmatter_text(content: &str) -> Option<&str> {
 #[cfg(unix)]
 pub(crate) async fn create_symlink(src: &Path, dst: &Path) -> Result<(), ExtensionError> {
     tokio::fs::symlink(src, dst).await.map_err(ExtensionError::Io)
+}
+
+#[cfg(not(windows))]
+async fn remove_symlink(link: &Path) -> Result<(), ExtensionError> {
+    tokio::fs::remove_file(link).await.map_err(ExtensionError::Io)
+}
+
+/// A directory junction or symlink goes with `remove_dir`, which removes the link and
+/// never the folder behind it; a file symlink with `remove_file`.
+#[cfg(windows)]
+async fn remove_symlink(link: &Path) -> Result<(), ExtensionError> {
+    match tokio::fs::remove_dir(link).await {
+        Ok(()) => Ok(()),
+        Err(_) => tokio::fs::remove_file(link).await.map_err(ExtensionError::Io),
+    }
 }
 
 #[cfg(windows)]

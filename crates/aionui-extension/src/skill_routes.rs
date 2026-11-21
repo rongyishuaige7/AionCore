@@ -13,9 +13,9 @@ use aionui_api_types::{
     AddExternalPathRequest, ApiResponse, ExportSkillRequest, ExternalSkillSourceResponse, ImportSkillFailureResponse,
     ImportSkillRequest, ImportSkillResponse, MaterializeSkillsRequest, MaterializeSkillsResponse, MaterializedSkillRef,
     NamedPathResponse, ReadAssistantRuleRequest, ReadBuiltinResourceRequest, ReadSkillInfoRequest,
-    ReadSkillInfoResponse, RemoveExternalPathRequest, ScanForSkillsRequest, ScanForSkillsResponse,
-    ScannedSkillResponse, SkillImportLimitsResponse, SkillImportRecordResponse, SkillListItemResponse,
-    SkillPathsResponse, SkillSourceResponse, WriteAssistantRuleRequest,
+    ReadSkillInfoResponse, RemoveExternalPathRequest, RemoveSkillSymlinkRequest, ScanForSkillsRequest,
+    ScanForSkillsResponse, ScannedSkillResponse, SkillImportLimitsResponse, SkillImportRecordResponse,
+    SkillListItemResponse, SkillPathsResponse, SkillSourceResponse, WriteAssistantRuleRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -74,6 +74,7 @@ pub fn skill_routes(state: SkillRouterState) -> Router {
         // Import / export / delete
         .route("/api/skills/import", post(import_skill))
         .route("/api/skills/export-symlink", post(export_skill_symlink))
+        .route("/api/skills/remove-symlink", post(remove_skill_symlink))
         .route("/api/skills/{name}", delete(delete_skill))
         // Scanning & discovery
         .route("/api/skills/scan", post(scan_for_skills))
@@ -233,6 +234,15 @@ async fn export_skill_symlink(
     Ok(Json(ApiResponse::success()))
 }
 
+/// `POST /api/skills/remove-symlink` — remove a skill link made by export-symlink.
+async fn remove_skill_symlink(
+    body: Result<Json<RemoveSkillSymlinkRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    skill_service::remove_skill_symlink(Path::new(&req.link_path)).await?;
+    Ok(Json(ApiResponse::success()))
+}
+
 /// `DELETE /api/skills/:name` — delete a user-custom skill.
 async fn delete_skill(
     State(state): State<SkillRouterState>,
@@ -299,6 +309,7 @@ async fn scan_for_skills(
                 name: s.name,
                 description: s.description,
                 path: s.path,
+                is_link: s.is_link,
             })
             .collect(),
     };
@@ -338,6 +349,7 @@ async fn detect_external(
                     name: sk.name,
                     description: sk.description,
                     path: sk.path,
+                    is_link: sk.is_link,
                 })
                 .collect(),
         })

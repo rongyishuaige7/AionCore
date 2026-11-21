@@ -196,9 +196,9 @@ pub use skill::{
     ImportSkillFailureResponse, ImportSkillRequest, ImportSkillResponse, MaterializeSkillsRequest,
     MaterializeSkillsResponse, MaterializedSkillRef, NamedPathResponse, ReadAssistantRuleRequest,
     ReadBuiltinResourceRequest, ReadSkillInfoRequest, ReadSkillInfoResponse, RemoveExternalPathRequest,
-    ScanForSkillsRequest, ScanForSkillsResponse, ScannedSkillResponse, SkillImportLimitsResponse,
-    SkillImportRecordResponse, SkillListItemResponse, SkillPathsResponse, SkillSourceResponse,
-    WriteAssistantRuleRequest,
+    RemoveSkillSymlinkRequest, ScanForSkillsRequest, ScanForSkillsResponse, ScannedSkillResponse,
+    SkillImportLimitsResponse, SkillImportRecordResponse, SkillListItemResponse, SkillPathsResponse,
+    SkillSourceResponse, WriteAssistantRuleRequest,
 };
 pub use skill_delivery::{SkillDelivery, SkillDeliveryMode, SkillDeliveryParse, parse_skill_delivery};
 pub use skill_runtime::{

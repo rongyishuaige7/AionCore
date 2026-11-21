@@ -15,8 +15,8 @@ use aionui_extension::skill_service::{
     NamedPath, SkillPaths, delete_assistant_rule, delete_assistant_skill, delete_skill,
     detect_and_count_external_skills, export_skill_with_symlink, import_skill, import_skill_with_repo_for_user,
     list_available_skills, materialize_skills_for_agent_with_repo_for_user, read_assistant_rule, read_assistant_skill,
-    read_builtin_rule, read_builtin_skill, read_skill_info, resolve_skill_paths, scan_for_skills, write_assistant_rule,
-    write_assistant_skill,
+    read_builtin_rule, read_builtin_skill, read_skill_info, remove_skill_symlink, resolve_skill_paths, scan_for_skills,
+    write_assistant_rule, write_assistant_skill,
 };
 use tempfile::TempDir;
 
@@ -335,6 +335,42 @@ async fn sm5_export_skill_symlink() {
 
     let link = export_dir.join("source-skill");
     assert!(link.is_symlink());
+}
+
+/// SM-5b: A link is reported as one, points at the real folder even when exported from a
+/// link, and is removed without touching that folder; a real folder is refused.
+#[cfg(unix)]
+#[tokio::test]
+async fn sm5b_remove_skill_symlink() {
+    let tmp = TempDir::new().unwrap();
+    let real_root = tmp.path().join("real");
+    create_skill(&real_root, "shared", "Shared skill");
+    let real = std::fs::canonicalize(real_root.join("shared")).unwrap();
+
+    // One agent's folder holds the skill through a link it made by hand.
+    let first = tmp.path().join("first");
+    std::fs::create_dir_all(&first).unwrap();
+    std::os::unix::fs::symlink(&real, first.join("shared")).unwrap();
+    create_skill(&first, "own", "A folder of its own");
+
+    let scanned = scan_for_skills(&first).await.unwrap();
+    let by_name = |name: &str| scanned.iter().find(|skill| skill.name == name).unwrap().is_link;
+    assert!(by_name("shared"));
+    assert!(!by_name("own"));
+
+    // Handing it on from that link links the real folder, not the link.
+    let second = tmp.path().join("second");
+    export_skill_with_symlink(&first.join("shared"), &second).await.unwrap();
+    assert_eq!(std::fs::read_link(second.join("shared")).unwrap(), real);
+
+    remove_skill_symlink(&second.join("shared")).await.unwrap();
+    assert!(std::fs::symlink_metadata(second.join("shared")).is_err());
+    assert!(real.join(SKILL_MD).is_file());
+    assert!(first.join("shared").join(SKILL_MD).is_file());
+
+    assert!(remove_skill_symlink(&first.join("own")).await.is_err());
+    assert!(first.join("own").join(SKILL_MD).is_file());
+    assert!(remove_skill_symlink(&second.join("shared")).await.is_err());
 }
 
 /// SM-6: Delete user custom skill.

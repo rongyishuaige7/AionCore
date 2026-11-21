@@ -127,6 +127,12 @@ pub struct ExportSkillRequest {
     pub target_dir: String,
 }
 
+/// Request body for `POST /api/skills/remove-symlink`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RemoveSkillSymlinkRequest {
+    pub link_path: String,
+}
+
 /// Request body for `DELETE /api/skills/:name` (path param, but also usable as body).
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeleteSkillRequest {
@@ -149,6 +155,10 @@ pub struct ScannedSkillResponse {
     pub name: String,
     pub description: String,
     pub path: String,
+    /// The entry is a symlink (a junction on Windows) to a folder elsewhere, so
+    /// `POST /api/skills/remove-symlink` can take it away.
+    #[serde(default)]
+    pub is_link: bool,
 }
 
 /// Response for `POST /api/skills/scan`.
@@ -533,10 +543,12 @@ mod tests {
             name: "found-skill".into(),
             description: "Found during scan".into(),
             path: "/dir/found-skill".into(),
+            is_link: true,
         };
         let json = serde_json::to_value(&skill).unwrap();
         assert_eq!(json["name"], "found-skill");
         assert_eq!(json["path"], "/dir/found-skill");
+        assert_eq!(json["is_link"], true);
     }
 
     #[test]
@@ -551,11 +563,13 @@ mod tests {
                     name: "s1".into(),
                     description: "d1".into(),
                     path: "/p1".into(),
+                    is_link: false,
                 },
                 ScannedSkillResponse {
                     name: "s2".into(),
                     description: "d2".into(),
                     path: "/p2".into(),
+                    is_link: false,
                 },
             ],
         };
