@@ -1435,3 +1435,165 @@ async fn playbook_deltas_boss_profile_decay_condensation_and_git_revert_preserve
     assert!(upkeep.leaves[0].contains("merged 1..6"));
     assert!(upkeep.leaves[1].contains("leaf 7"));
 }
+
+fn claims(projects: &[(&str, &str)]) -> SetRoleProjectsRequest {
+    SetRoleProjectsRequest {
+        projects: projects
+            .iter()
+            .map(|(project_id, name)| RoleProjectClaim {
+                project_id: (*project_id).to_owned(),
+                name: (*name).to_owned(),
+            })
+            .collect(),
+        transfer: false,
+    }
+}
+
+#[tokio::test]
+async fn a_role_keeps_projects_and_saving_its_charter_leaves_them_alone() {
+    let root = tempfile::tempdir().unwrap();
+    let service = service(&root);
+    service
+        .upsert("seo", request("Watches search traffic.", &[]))
+        .await
+        .unwrap();
+
+    let role = service
+        .set_projects(
+            "seo",
+            claims(&[("project_a", "  yipan\nstore "), ("project_a", "dup")]),
+            1_000,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        role.projects,
+        vec![RoleKeptProject {
+            project_id: "project_a".into(),
+            name: "yipan store".into(),
+            claimed_at: 1_000,
+        }]
+    );
+
+    let role = service
+        .set_projects("seo", claims(&[("project_b", "gallery"), ("project_a", "")]), 2_000)
+        .await
+        .unwrap();
+    let kept: Vec<(&str, &str, i64)> = role
+        .projects
+        .iter()
+        .map(|k| (k.project_id.as_str(), k.name.as_str(), k.claimed_at))
+        .collect();
+    assert_eq!(
+        kept,
+        vec![("project_b", "gallery", 2_000), ("project_a", "yipan store", 1_000)]
+    );
+
+    let role = service
+        .upsert("seo", request("Watches search traffic daily.", &[]))
+        .await
+        .unwrap();
+    assert_eq!(role.projects.len(), 2);
+
+    let keepers = service.keepers().await.unwrap();
+    let pairs: Vec<(&str, &str)> = keepers
+        .iter()
+        .map(|k| (k.project_id.as_str(), k.role_id.as_str()))
+        .collect();
+    assert_eq!(pairs, vec![("project_a", "seo"), ("project_b", "seo")]);
+
+    let timeline = service.timeline("seo", 10).await.unwrap();
+    let messages: Vec<&str> = timeline.iter().map(|c| c.message.as_str()).collect();
+    assert!(messages.contains(&"projects: took on gallery"), "{messages:?}");
+    assert!(messages.contains(&"projects: took on yipan store"), "{messages:?}");
+}
+
+#[tokio::test]
+async fn a_project_has_one_keeper_and_changes_hands_only_on_transfer() {
+    let root = tempfile::tempdir().unwrap();
+    let service = service(&root);
+    service.upsert("chief", request("", &[])).await.unwrap();
+    service.upsert("seo", request("", &[])).await.unwrap();
+    service
+        .set_projects(
+            "chief",
+            claims(&[("project_j", "journal"), ("project_k", "notes")]),
+            1_000,
+        )
+        .await
+        .unwrap();
+
+    let refused = service
+        .set_projects("seo", claims(&[("project_j", "journal")]), 2_000)
+        .await;
+    assert!(matches!(refused, Err(RoleError::Conflict(_))), "{refused:?}");
+    assert!(service.get("seo").await.unwrap().projects.is_empty());
+
+    let mut transfer = claims(&[("project_j", "journal")]);
+    transfer.transfer = true;
+    let seo = service.set_projects("seo", transfer, 3_000).await.unwrap();
+    assert_eq!(seo.projects[0].claimed_at, 3_000);
+    let chief = service.get("chief").await.unwrap();
+    let left: Vec<&str> = chief.projects.iter().map(|k| k.project_id.as_str()).collect();
+    assert_eq!(left, vec!["project_k"]);
+    let handover = service.timeline("chief", 1).await.unwrap();
+    assert_eq!(handover[0].message, "projects: handed journal to seo");
+
+    let keepers = service.keepers().await.unwrap();
+    let pairs: Vec<(&str, &str)> = keepers
+        .iter()
+        .map(|k| (k.project_id.as_str(), k.role_id.as_str()))
+        .collect();
+    assert_eq!(pairs, vec![("project_j", "seo"), ("project_k", "chief")]);
+}
+
+#[tokio::test]
+async fn letting_go_is_recorded_and_bad_project_ids_are_refused() {
+    let root = tempfile::tempdir().unwrap();
+    let service = service(&root);
+    service.upsert("seo", request("", &[])).await.unwrap();
+    service
+        .set_projects("seo", claims(&[("project_a", "store")]), 1_000)
+        .await
+        .unwrap();
+
+    let role = service.set_projects("seo", claims(&[]), 2_000).await.unwrap();
+    assert!(role.projects.is_empty());
+    assert_eq!(
+        service.timeline("seo", 1).await.unwrap()[0].message,
+        "projects: let go of store"
+    );
+    assert!(service.keepers().await.unwrap().is_empty());
+
+    for bad in ["", "../escape", "has space"] {
+        let result = service.set_projects("seo", claims(&[(bad, "x")]), 3_000).await;
+        assert!(matches!(result, Err(RoleError::InvalidRequest(_))), "{bad}: {result:?}");
+    }
+    let missing = service
+        .set_projects("nobody", claims(&[("project_a", "")]), 3_000)
+        .await;
+    assert!(matches!(missing, Err(RoleError::NotFound(_))));
+}
+
+#[tokio::test]
+async fn when_a_revert_brings_back_an_old_claim_the_later_claim_keeps_the_project() {
+    let root = tempfile::tempdir().unwrap();
+    let service = service(&root);
+    service.upsert("chief", request("", &[])).await.unwrap();
+    service.upsert("seo", request("", &[])).await.unwrap();
+    service
+        .set_projects("seo", claims(&[("project_j", "journal")]), 5_000)
+        .await
+        .unwrap();
+    let mut stale = service.store.read_definition("chief").await.unwrap().unwrap();
+    stale.projects = vec![RoleKeptProject {
+        project_id: "project_j".into(),
+        name: "journal".into(),
+        claimed_at: 1_000,
+    }];
+    service.store.write_definition("chief", &stale).await.unwrap();
+
+    let keepers = service.keepers().await.unwrap();
+    assert_eq!(keepers.len(), 1);
+    assert_eq!(keepers[0].role_id, "seo");
+}

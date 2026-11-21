@@ -304,3 +304,53 @@ async fn agent_major_changes_become_proposals_while_tightening_applies_and_only_
     assert_eq!(reverted["data"]["charter"], "Watch CI builds.");
     assert_eq!(reverted["data"]["asks_when_scheduled"], true);
 }
+
+#[tokio::test]
+async fn keepers_over_http_where_only_the_user_hands_out_projects() {
+    let root = tempfile::tempdir().unwrap();
+    let app = app(&root);
+    for id in ["chief", "seo"] {
+        let (status, _) = send(
+            &app,
+            Method::PUT,
+            &format!("/api/roles/{id}"),
+            Some(json!({ "charter": "" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    let (status, body) = send(&app, Method::GET, "/api/roles/keepers", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["keepers"], json!([]));
+
+    let one = json!({ "projects": [{ "project_id": "project_j", "name": "journal" }] });
+    let (status, body) = send(&app, Method::PUT, "/api/roles/chief/projects", Some(one.clone())).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["projects"][0]["project_id"], "project_j");
+
+    let (status, body) = send(&app, Method::PUT, "/api/roles/seo/projects", Some(one.clone())).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["code"], "role_project_taken");
+
+    let (status, body) = send_as_agent(&app, Method::PUT, "/api/roles/seo/projects", "conv-1", Some(one)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["code"], "role_user_review_required");
+
+    let taken = json!({ "projects": [{ "project_id": "project_j", "name": "journal" }], "transfer": true });
+    let (status, _) = send(&app, Method::PUT, "/api/roles/seo/projects", Some(taken)).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, body) = send(&app, Method::GET, "/api/roles/keepers", None).await;
+    assert_eq!(body["data"]["keepers"][0]["role_id"], "seo");
+
+    let (status, body) = send_as_agent(
+        &app,
+        Method::PUT,
+        "/api/roles/seo/projects",
+        "conv-1",
+        Some(json!({ "projects": [] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["projects"], json!([]));
+}

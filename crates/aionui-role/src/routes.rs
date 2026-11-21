@@ -17,10 +17,12 @@
 //! - `POST /api/roles/{id}/revert` — create a forward git revert commit.
 //! - `POST /api/roles/{id}/dream` — run S5 dreamer maintenance on demand.
 //! - `DELETE /api/roles/{id}` — dismiss the role (and pause/clean its cron jobs).
+//! - `GET /api/roles/keepers` — every kept project and the role keeping it.
+//! - `PUT /api/roles/{id}/projects` — the projects the role keeps (agents may only let go).
 
 use aionui_api_types::{
-    ApiResponse, RoleDreamResponse, RoleListResponse, RoleProposalChange, RoleResponse, RoleRevertRequest,
-    RoleTimelineResponse, UpdateRoleMemoryRequest, UpsertRoleRequest,
+    ApiResponse, RoleDreamResponse, RoleKeepersResponse, RoleListResponse, RoleProposalChange, RoleResponse,
+    RoleRevertRequest, RoleTimelineResponse, SetRoleProjectsRequest, UpdateRoleMemoryRequest, UpsertRoleRequest,
 };
 use aionui_common::{ApiError, AuthenticatedUserId, RuntimeHelperCaller, now_ms};
 use axum::extract::{Extension, Path, State};
@@ -37,8 +39,10 @@ const DEFAULT_USER_ID: &str = "system_default_user";
 pub fn role_routes(state: RoleRouterState) -> Router {
     Router::new()
         .route("/api/roles", get(list_roles))
+        .route("/api/roles/keepers", get(list_keepers))
         .route("/api/roles/{id}", get(get_role).put(put_role).delete(delete_role))
         .route("/api/roles/{id}/memory", put(put_memory))
+        .route("/api/roles/{id}/projects", put(put_projects))
         .route("/api/roles/{id}/progress/{task}", delete(delete_progress))
         .route("/api/roles/{id}/playbook/{entry_id}", delete(delete_playbook_entry))
         .route(
@@ -55,6 +59,46 @@ pub fn role_routes(state: RoleRouterState) -> Router {
 async fn list_roles(State(state): State<RoleRouterState>) -> Result<Json<ApiResponse<RoleListResponse>>, ApiError> {
     let roles = state.service.list().await.map_err(to_api_error)?;
     Ok(Json(ApiResponse::ok(RoleListResponse { roles })))
+}
+
+async fn list_keepers(
+    State(state): State<RoleRouterState>,
+) -> Result<Json<ApiResponse<RoleKeepersResponse>>, ApiError> {
+    let keepers = state.service.keepers().await.map_err(to_api_error)?;
+    Ok(Json(ApiResponse::ok(RoleKeepersResponse { keepers })))
+}
+
+/// Set the projects a role keeps. Only the user hands a role a project; an
+/// agent may let one go.
+async fn put_projects(
+    State(state): State<RoleRouterState>,
+    helper: Option<Extension<RuntimeHelperCaller>>,
+    Path(id): Path<String>,
+    Json(body): Json<SetRoleProjectsRequest>,
+) -> Result<Json<ApiResponse<RoleResponse>>, ApiError> {
+    if helper.is_some() {
+        let current = state.service.get(&id).await.map_err(to_api_error)?;
+        let claims_more = body.projects.iter().any(|claim| {
+            !current
+                .projects
+                .iter()
+                .any(|kept| kept.project_id == claim.project_id.trim())
+        });
+        if claims_more {
+            return Err(ApiError::coded(
+                StatusCode::FORBIDDEN,
+                "role_user_review_required",
+                "only the user may give a role a project to keep",
+                None,
+            ));
+        }
+    }
+    let role = state
+        .service
+        .set_projects(&id, body, now_ms())
+        .await
+        .map_err(to_api_error)?;
+    Ok(Json(ApiResponse::ok(role)))
 }
 
 async fn get_role(
@@ -282,6 +326,7 @@ fn to_api_error(err: RoleError) -> ApiError {
         RoleError::InvalidId(_) => ApiError::coded(StatusCode::BAD_REQUEST, "role_invalid_id", "invalid role id", None),
         RoleError::InvalidRequest(msg) => ApiError::coded(StatusCode::BAD_REQUEST, "role_bad_request", msg, None),
         RoleError::NotFound(_) => ApiError::coded(StatusCode::NOT_FOUND, "role_not_found", "role not found", None),
+        RoleError::Conflict(msg) => ApiError::coded(StatusCode::CONFLICT, "role_project_taken", msg, None),
         RoleError::Corrupt(_) | RoleError::Io(_) => {
             tracing::error!(error = %err, "role: internal error");
             ApiError::coded(

@@ -9,6 +9,9 @@ pub enum RoleError {
     /// Malformed definition or memory (unknown tool, over the size cap). Maps to 400.
     #[error("invalid request: {0}")]
     InvalidRequest(String),
+    /// The change collides with another role's (a project it already keeps). Maps to 409.
+    #[error("conflict: {0}")]
+    Conflict(String),
     /// No role is defined for this id. Maps to 404.
     #[error("role not found: {0}")]
     NotFound(String),

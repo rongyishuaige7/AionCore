@@ -676,7 +676,7 @@ fn is_denied(role: &RoleResponse, tool: TeamToolName) -> bool {
 
 fn role_failure(error: RoleError, command: &str) -> Reply {
     match error {
-        RoleError::InvalidRequest(message) => failure(
+        RoleError::InvalidRequest(message) | RoleError::Conflict(message) => failure(
             StatusCode::BAD_REQUEST,
             RoleCliErrorCode::SchemaValidationFailed,
             message,

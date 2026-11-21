@@ -45,8 +45,56 @@ pub struct RoleResponse {
     /// Agent-proposed major changes held until the user approves or rejects them.
     #[serde(default)]
     pub proposals: Vec<RoleProposal>,
+    /// Projects this role keeps, in the order it took them on.
+    #[serde(default)]
+    pub projects: Vec<RoleKeptProject>,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+/// A project a resident role keeps: it briefs conversations started there and
+/// takes in what they leave behind. A project has at most one keeper.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleKeptProject {
+    pub project_id: String,
+    /// The project's name when the role took it on, for the role's own files
+    /// and history; the live name comes from the project itself.
+    #[serde(default)]
+    pub name: String,
+    pub claimed_at: TimestampMs,
+}
+
+/// One project to keep, as `PUT /api/roles/{id}/projects` names it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleProjectClaim {
+    pub project_id: String,
+    #[serde(default)]
+    pub name: String,
+}
+
+/// Body of `PUT /api/roles/{id}/projects` — the full set of projects the role
+/// keeps from now on. A project another role keeps is refused unless
+/// `transfer` is set, in which case it changes hands.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetRoleProjectsRequest {
+    #[serde(default)]
+    pub projects: Vec<RoleProjectClaim>,
+    #[serde(default)]
+    pub transfer: bool,
+}
+
+/// Who keeps one project.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleKeeper {
+    pub project_id: String,
+    pub role_id: String,
+    pub claimed_at: TimestampMs,
+}
+
+/// `GET /api/roles/keepers` — every kept project and its keeper.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleKeepersResponse {
+    pub keepers: Vec<RoleKeeper>,
 }
 
 /// How a run nobody watched ended, as the role itself declared it.

@@ -8,7 +8,7 @@
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-use aionui_api_types::{RoleProposal, RoleReport};
+use aionui_api_types::{RoleKeptProject, RoleProposal, RoleReport};
 use serde::{Deserialize, Serialize};
 
 use crate::error::RoleError;
@@ -52,6 +52,10 @@ pub(crate) struct RoleDefinition {
     /// Absent in role files written before the flag existed.
     #[serde(default)]
     pub asks_when_scheduled: bool,
+    /// Projects the role keeps. Absent in role files written before keepers
+    /// existed, and while the role keeps none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub projects: Vec<RoleKeptProject>,
     pub created_at: i64,
     pub updated_at: i64,
 }

@@ -164,11 +164,12 @@ pub use response::{ApiResponse, ErrorResponse};
 pub use role::{
     PlaybookDeltaOp, ROLE_CLI_SCHEMA_VERSION, RoleCliEnvelope, RoleCliError, RoleCliErrorCode, RoleCliMeta, RoleCommit,
     RoleCurateRequest, RoleCurateResponse, RoleDreamResponse, RoleExpandMessage, RoleExpandRequest, RoleExpandResponse,
-    RoleFollowUpRequest, RoleFollowUpResponse, RoleListResponse, RolePlaybookEntry, RoleProgress, RoleProgressRequest,
-    RoleProgressResponse, RoleProposal, RoleProposalChange, RoleRecallBound, RoleRecallHit, RoleRecallKind,
-    RoleRecallRequest, RoleRecallResponse, RoleRecallScope, RoleRecallSource, RoleRememberRequest,
-    RoleRememberResponse, RoleReport, RoleReportOutcome, RoleReportRequest, RoleReportResponse, RoleReportedEvent,
-    RoleResponse, RoleRevertRequest, RoleTimelineResponse, UpdateRoleMemoryRequest, UpsertRoleRequest,
+    RoleFollowUpRequest, RoleFollowUpResponse, RoleKeeper, RoleKeepersResponse, RoleKeptProject, RoleListResponse,
+    RolePlaybookEntry, RoleProgress, RoleProgressRequest, RoleProgressResponse, RoleProjectClaim, RoleProposal,
+    RoleProposalChange, RoleRecallBound, RoleRecallHit, RoleRecallKind, RoleRecallRequest, RoleRecallResponse,
+    RoleRecallScope, RoleRecallSource, RoleRememberRequest, RoleRememberResponse, RoleReport, RoleReportOutcome,
+    RoleReportRequest, RoleReportResponse, RoleReportedEvent, RoleResponse, RoleRevertRequest, RoleTimelineResponse,
+    SetRoleProjectsRequest, UpdateRoleMemoryRequest, UpsertRoleRequest,
 };
 pub use runtime::{
     EnsureNodeRuntimeRequest, EnsureNodeRuntimeResponse, RuntimeFailureKind, RuntimeResourceKind, RuntimeStatusPayload,

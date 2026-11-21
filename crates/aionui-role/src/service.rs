@@ -6,9 +6,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use aionui_api_types::{
-    PlaybookDeltaOp, RoleCommit, RoleExpandRequest, RoleExpandResponse, RoleProgress, RoleProposal, RoleProposalChange,
-    RoleRecallRequest, RoleRecallResponse, RoleReport, RoleReportOutcome, RoleResponse, TeamToolName,
-    UpsertRoleRequest,
+    PlaybookDeltaOp, RoleCommit, RoleExpandRequest, RoleExpandResponse, RoleKeeper, RoleKeptProject, RoleProgress,
+    RoleProjectClaim, RoleProposal, RoleProposalChange, RoleRecallRequest, RoleRecallResponse, RoleReport,
+    RoleReportOutcome, RoleResponse, SetRoleProjectsRequest, TeamToolName, UpsertRoleRequest,
 };
 use aionui_common::now_ms;
 use tokio::sync::Mutex;
@@ -43,6 +43,11 @@ pub const MAX_REPORT_SUMMARY_CHARS: usize = 300;
 /// How many of the things a role told the user are kept; older ones are dropped.
 pub const MAX_KEPT_REPORTS: usize = 30;
 const MAX_ROLE_ID_LEN: usize = 128;
+/// Cap on how many projects one role keeps.
+pub const MAX_KEPT_PROJECTS: usize = 20;
+/// Cap on the project name a role keeps beside a project id, in characters.
+pub const MAX_KEPT_PROJECT_NAME_CHARS: usize = 80;
+const MAX_PROJECT_ID_LEN: usize = 128;
 
 /// What [`RoleService::remember`] did with a note.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,12 +214,16 @@ impl RoleService {
         }
 
         let is_new = existing.is_none();
+        // What the role keeps is set apart from its charter, so saving the charter leaves it alone.
+        let (created_at, projects) =
+            existing.map_or((now, Vec::new()), |existing| (existing.created_at, existing.projects));
         let definition = RoleDefinition {
             charter,
             denied_tools,
             verifies: request.verifies,
             asks_when_scheduled: request.asks_when_scheduled,
-            created_at: existing.map_or(now, |existing| existing.created_at),
+            projects,
+            created_at,
             updated_at: now,
         };
         self.store.write_definition(id, &definition).await?;
@@ -1061,6 +1070,161 @@ impl RoleService {
         Ok(true)
     }
 
+    /// Every kept project and its keeper, by project id. Two roles can name the
+    /// same project only when a revert brought an old claim back; the later
+    /// claim wins.
+    pub async fn keepers(&self) -> Result<Vec<RoleKeeper>, RoleError> {
+        let mut by_project: HashMap<String, RoleKeeper> = HashMap::new();
+        for id in self.store.list_ids().await? {
+            if validate_role_id(&id).is_err() {
+                continue;
+            }
+            let definition = match self.store.read_definition(&id).await {
+                Ok(Some(definition)) => definition,
+                Ok(None) => continue,
+                Err(error) => {
+                    tracing::warn!(role_id = %id, error = %error, "role: skipped unreadable role for keepers");
+                    continue;
+                }
+            };
+            for kept in definition.projects {
+                let wins = by_project.get(&kept.project_id).is_none_or(|current| {
+                    (kept.claimed_at, id.as_str()) > (current.claimed_at, current.role_id.as_str())
+                });
+                if wins {
+                    by_project.insert(
+                        kept.project_id.clone(),
+                        RoleKeeper {
+                            project_id: kept.project_id,
+                            role_id: id.clone(),
+                            claimed_at: kept.claimed_at,
+                        },
+                    );
+                }
+            }
+        }
+        let mut keepers: Vec<RoleKeeper> = by_project.into_values().collect();
+        keepers.sort_by(|a, b| a.project_id.cmp(&b.project_id));
+        Ok(keepers)
+    }
+
+    /// Replace the projects the role keeps, in the order given. A project the
+    /// role already kept keeps its `claimed_at`. A project another role keeps
+    /// is refused with [`RoleError::Conflict`] unless `transfer` is set; then
+    /// it leaves that role, which records the handover in its own history.
+    pub async fn set_projects(
+        &self,
+        id: &str,
+        request: SetRoleProjectsRequest,
+        now: i64,
+    ) -> Result<RoleResponse, RoleError> {
+        validate_role_id(id)?;
+        let claims = normalize_project_claims(&request.projects)?;
+        let _guard = self.memory_lock.lock().await;
+        let Some(mut definition) = self.store.read_definition(id).await? else {
+            return Err(RoleError::NotFound(id.to_owned()));
+        };
+        let is_new = |claim: &&RoleProjectClaim| !definition.projects.iter().any(|k| k.project_id == claim.project_id);
+        let added: Vec<&RoleProjectClaim> = claims.iter().filter(is_new).collect();
+        let taking = |project_id: &str| added.iter().any(|claim| claim.project_id == project_id);
+
+        let mut holders = Vec::new();
+        if !added.is_empty() {
+            for other in self.store.list_ids().await? {
+                if other == id || validate_role_id(&other).is_err() {
+                    continue;
+                }
+                let Ok(Some(other_definition)) = self.store.read_definition(&other).await else {
+                    continue;
+                };
+                if other_definition.projects.iter().any(|kept| taking(&kept.project_id)) {
+                    holders.push((other, other_definition));
+                }
+            }
+        }
+        if let Some((holder, holder_definition)) = holders.first()
+            && !request.transfer
+        {
+            let taken = holder_definition
+                .projects
+                .iter()
+                .find(|kept| taking(&kept.project_id))
+                .map(kept_label)
+                .unwrap_or_default();
+            return Err(RoleError::Conflict(format!("{taken} is already kept by {holder}")));
+        }
+        for (holder, mut holder_definition) in holders {
+            let handed: Vec<String> = holder_definition
+                .projects
+                .iter()
+                .filter(|kept| taking(&kept.project_id))
+                .map(kept_label)
+                .collect();
+            let holder_dir = self.store.role_dir(&holder);
+            git::ensure_baseline(holder_dir.clone(), ROLE_TRACKED_PATHS, now).await?;
+            holder_definition.projects.retain(|kept| !taking(&kept.project_id));
+            holder_definition.updated_at = now;
+            self.store.write_definition(&holder, &holder_definition).await?;
+            git::commit(
+                holder_dir,
+                ROLE_TRACKED_PATHS,
+                "user".into(),
+                format!("projects: handed {} to {id}", handed.join(", ")),
+                now,
+            )
+            .await?;
+        }
+
+        let next: Vec<RoleKeptProject> = claims
+            .iter()
+            .map(|claim| {
+                let before = definition.projects.iter().find(|k| k.project_id == claim.project_id);
+                RoleKeptProject {
+                    project_id: claim.project_id.clone(),
+                    name: match before {
+                        Some(kept) if claim.name.is_empty() => kept.name.clone(),
+                        _ => claim.name.clone(),
+                    },
+                    claimed_at: before.map_or(now, |kept| kept.claimed_at),
+                }
+            })
+            .collect();
+        if next == definition.projects {
+            return self.to_response(id, definition).await;
+        }
+        let took: Vec<String> = next
+            .iter()
+            .filter(|kept| taking(&kept.project_id))
+            .map(kept_label)
+            .collect();
+        let let_go: Vec<String> = definition
+            .projects
+            .iter()
+            .filter(|kept| !next.iter().any(|n| n.project_id == kept.project_id))
+            .map(kept_label)
+            .collect();
+        let mut parts = Vec::new();
+        if !took.is_empty() {
+            parts.push(format!("took on {}", took.join(", ")));
+        }
+        if !let_go.is_empty() {
+            parts.push(format!("let go of {}", let_go.join(", ")));
+        }
+        let message = if parts.is_empty() {
+            "projects: renamed".to_owned()
+        } else {
+            format!("projects: {}", parts.join("; "))
+        };
+
+        let role_dir = self.store.role_dir(id);
+        git::ensure_baseline(role_dir.clone(), ROLE_TRACKED_PATHS, now).await?;
+        definition.projects = next;
+        definition.updated_at = now;
+        self.store.write_definition(id, &definition).await?;
+        git::commit(role_dir, ROLE_TRACKED_PATHS, "user".into(), message, now).await?;
+        self.to_response(id, definition).await
+    }
+
     /// Dismiss the role. Its memory directory stays on disk and is picked up
     /// again if the role is defined anew.
     pub async fn remove(&self, id: &str) -> Result<(), RoleError> {
@@ -1114,10 +1278,61 @@ impl RoleService {
             thread_conversation_id: self.store.read_thread(id).await?.map(|record| record.conversation_id),
             playbook: parse_playbook(&pb_raw, &pb_meta),
             proposals: self.store.read_proposals(id).await?,
+            projects: definition.projects,
             created_at: definition.created_at,
             updated_at: definition.updated_at,
         })
     }
+}
+
+/// A project as a role's history names it: its name, or its id before it had one.
+fn kept_label(kept: &RoleKeptProject) -> String {
+    if kept.name.is_empty() {
+        kept.project_id.clone()
+    } else {
+        kept.name.clone()
+    }
+}
+
+/// Check project ids (the backend issues `project_<uuid>`), flatten names to
+/// one short line, and drop repeats, keeping the first.
+fn normalize_project_claims(claims: &[RoleProjectClaim]) -> Result<Vec<RoleProjectClaim>, RoleError> {
+    let mut normalized: Vec<RoleProjectClaim> = Vec::with_capacity(claims.len());
+    for claim in claims {
+        let project_id = claim.project_id.trim();
+        let valid = !project_id.is_empty()
+            && project_id.len() <= MAX_PROJECT_ID_LEN
+            && project_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'));
+        if !valid {
+            return Err(RoleError::InvalidRequest(format!(
+                "invalid project id: {}",
+                project_id.chars().take(MAX_PROJECT_ID_LEN).collect::<String>()
+            )));
+        }
+        if normalized.iter().any(|kept| kept.project_id == project_id) {
+            continue;
+        }
+        let name: String = claim
+            .name
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(MAX_KEPT_PROJECT_NAME_CHARS)
+            .collect();
+        normalized.push(RoleProjectClaim {
+            project_id: project_id.to_owned(),
+            name,
+        });
+    }
+    if normalized.len() > MAX_KEPT_PROJECTS {
+        return Err(RoleError::InvalidRequest(format!(
+            "a role keeps at most {MAX_KEPT_PROJECTS} projects"
+        )));
+    }
+    Ok(normalized)
 }
 
 /// A thread's summaries live in a directory named after its conversation, so
