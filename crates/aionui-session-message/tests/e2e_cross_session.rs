@@ -202,6 +202,7 @@ async fn the_send_message_team_guard_cannot_be_bypassed_by_calling_the_layer_bel
                 content: "straight at the bottom layer".to_owned(),
                 files: Vec::new(),
                 sessions: Vec::new(),
+                roles: Vec::new(),
                 inject_skills: Vec::new(),
                 hidden: false,
             },

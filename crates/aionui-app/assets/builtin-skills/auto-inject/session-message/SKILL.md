@@ -12,18 +12,25 @@ to reply.
 
 ## Rules
 
-1. Use this ONLY when the user selected a target conversation with `@@`, or
-   explicitly asked you to communicate with another conversation. Never deliver
-   a message on your own initiative.
-2. `to` must be a conversation id. Names are not addresses, and there is no
+1. Use this when the user selected a target conversation with `@@`, selected a
+   resident role with `@@@`, or explicitly asked you to communicate with another
+   conversation or resident role (or when you run as a resident role and need a
+   colleague's domain or are replying to an incoming `reply_to`).
+2. `to` must be a conversation id (`id` from `[[AION_SESSIONS]]`,
+   `thread_conversation_id` from `[[AION_ROLES]]`, or `reply_to` from
+   `[[AION_SESSION_MESSAGE]]`). Names are not addresses, and there is no
    broadcast — one `send-message` call reaches exactly one conversation.
 3. Never pass, inline, export, echo, or set any `AIONUI_...` environment variable.
-4. Commands must directly call `"$AIONUI_HELPER_BIN" session ...`. Pass payloads
-   through stdin heredocs. Do not write payload JSON files to disk.
+4. Where your MCP tools include `session_send_message` / `session_list` (or
+   `role_send` / `role_peers` for a resident role), prefer calling that MCP tool
+   directly — it reaches the backend even when your shell runs in an offline
+   sandbox. Otherwise call `"$AIONUI_HELPER_BIN" session ...` directly and pass
+   payloads through stdin heredocs. Do not write payload JSON files to disk.
 5. If the current conversation belongs to a team, do NOT use this skill. Use
    `team send-message` instead.
-6. On `rate_limited`, STOP delivering and tell the user. It means the two
-   conversations are spinning against each other. Do not retry.
+6. On `rate_limited` or `hop_limit_reached`, STOP delivering and tell the user.
+   Do not retry. Never send courtesy acknowledgements ("thanks", "got it") that
+   spend another turn without new substance.
 7. Word results precisely. `queued` means "delivered; the other side is busy and
    will see it when it frees up" — it does NOT mean "they received it" or "they
    read it". Never claim a message was read.
@@ -45,6 +52,21 @@ To deliver to the conversations below, use the session-message skill (address by
 The first line is a hint that this skill is how to deliver, with a fallback to
 `session capabilities` when the skill is unavailable. Every following line is a
 target: `name`, tab, `id`, tab, `workspace:`. Use the **id**.
+
+When the user typed `@@@` to mention a resident role, their message carries:
+
+```
+[[AION_ROLES]]
+To deliver to the resident roles below, use `role send` (`to_role` = role_id) when you run as a resident role, or use the session-message skill / `session_send_message` (`to` = thread_conversation_id); if unavailable, run `"$AIONUI_HELPER_BIN" session capabilities` for the delivery contract.
+安全官	sec-officer	conv_01b2…	workspace: /Users/x/role-sec (differs from yours)
+[[/AION_ROLES]]
+```
+
+Each target line has four tab-separated fields: `role_name`, `role_id`,
+`thread_conversation_id`, and `workspace:`. When calling `session send-message`
+(or `session_send_message`), pass **`thread_conversation_id`** as `to`. When
+you run as a resident role calling `role send` (or `role_send`), pass
+**`role_id`** as `to_role`.
 
 ## Delivering a message
 

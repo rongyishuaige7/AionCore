@@ -16,6 +16,9 @@ const REMEMBER_TOOL: &str = "team_remember";
 /// The team tool a role member records its ongoing work with.
 const PROGRESS_TOOL: &str = "team_progress";
 
+/// Permission-table entry that disables autonomous peer outreach (`role send`).
+const ROLE_SEND_TOOL: &str = "role_send";
+
 /// The helper a role run outside a team reads and writes its memory with. The
 /// stdin JSON arrives through a quoted here-document, so a note may hold any
 /// quote character.
@@ -261,6 +264,37 @@ fn render(brief: &TeamRoleBrief, setting: Setting) -> String {
          ```\n{ROLE_HELPER} expand <<'JSON'\n{{\"ref_id\": \"<ref_id from recall>\", \"before\": 3, \"after\": 3}}\nJSON\n```"
     ));
 
+    // Outside a team, resident roles can inspect the live peer directory and
+    // collaborate across charter boundaries (or reply to `reply_to` sessions)
+    // unless `role_send` is denied for this role.
+    if !in_team && !brief.denied_tools.iter().any(|tool| tool == ROLE_SEND_TOOL) {
+        out.push_str("\n\n### Colleagues\n\n");
+        if !brief.colleagues.is_empty() {
+            out.push_str("Other resident roles currently on the roster:\n");
+            for peer in &brief.colleagues {
+                if peer.charter_summary.is_empty() {
+                    out.push_str(&format!("- **{}** (`{}`)\n", peer.name, peer.role_id));
+                } else {
+                    out.push_str(&format!(
+                        "- **{}** (`{}`): {}\n",
+                        peer.name, peer.role_id, peer.charter_summary
+                    ));
+                }
+            }
+            out.push('\n');
+        }
+        out.push_str(&format!(
+            "Run `{ROLE_HELPER} peers` (or `role_peers`) to check the live colleague roster and busy state. \
+             When a task genuinely crosses your charter boundary and needs a colleague's domain, or when the user \
+             referenced a role with `@@@`, message its thread:\n\n\
+             ```\n{ROLE_HELPER} send <<'JSON'\n{{\"to_role\": \"<role_id>\", \"message\": \"<concise context and ask>\"}}\nJSON\n```\n\n\
+             To reply to an incoming `[[AION_SESSION_MESSAGE]]`, pass `\"to_conversation\": \"<reply_to>\"` instead of \
+             `\"to_role\"`. Discipline: reach out only when necessary; include self-contained context (never relative \
+             file paths across workspaces); never send courtesy acknowledgements (\"thanks\", \"got it\"); stop and \
+             report to the user if `hop_limit_reached` or `rate_limited` is returned."
+        ));
+    }
+
     // A team member answers to its Lead, who speaks to the user, and in a
     // conversation the user reads the reply. A run on its own has nobody
     // between it and the user, so it says itself whether the user is to be
@@ -358,6 +392,7 @@ fn newest_memory(memory: &str, max_chars: usize) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ports::TeamRolePeer;
 
     fn brief() -> TeamRoleBrief {
         TeamRoleBrief {
@@ -370,6 +405,7 @@ mod tests {
             reported: Vec::new(),
             playbook: Vec::new(),
             boss_profile: String::new(),
+            colleagues: Vec::new(),
         }
     }
 
@@ -738,5 +774,43 @@ mod tests {
         );
         assert!(!enriched.contains("team_"));
         assert!(!enriched.ends_with('\n'));
+    }
+
+    #[test]
+    fn colleagues_section_renders_outside_teams_unless_role_send_is_denied() {
+        let with_peers = TeamRoleBrief {
+            colleagues: vec![TeamRolePeer {
+                role_id: "sec-officer".into(),
+                name: "安全官".into(),
+                charter_summary: "负责代码安全与权限审计".into(),
+            }],
+            ..brief()
+        };
+
+        let direct = render_direct_standing_role(&with_peers);
+        assert!(direct.contains("### Colleagues"), "{direct}");
+        assert!(
+            direct.contains("- **安全官** (`sec-officer`): 负责代码安全与权限审计"),
+            "{direct}"
+        );
+        assert!(direct.contains("\"$AIONUI_HELPER_BIN\" role send <<'JSON'"), "{direct}");
+        assert!(!direct.contains("team_"), "{direct}");
+        assert!(!direct.ends_with('\n'));
+
+        let in_team = render_standing_role(&with_peers);
+        assert!(
+            !in_team.contains("### Colleagues"),
+            "team members use team mailbox tools, not role send: {in_team}"
+        );
+
+        let isolated = TeamRoleBrief {
+            denied_tools: vec![ROLE_SEND_TOOL.into()],
+            ..with_peers
+        };
+        let isolated_direct = render_direct_standing_role(&isolated);
+        assert!(
+            !isolated_direct.contains("### Colleagues"),
+            "role_send denial hides autonomous outreach instructions: {isolated_direct}"
+        );
     }
 }

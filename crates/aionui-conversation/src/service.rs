@@ -19,22 +19,22 @@ use crate::runtime_persistence::{RuntimePersistenceCoordinator, RuntimeWriteKind
 use crate::runtime_state::{ConversationRuntimeStateService, RuntimeLifecycleState};
 use aionui_api_types::{
     ASSISTANT_MCP_BINDING_CHANGED_EVENT, ApprovalCheckResponse, AssistantConversationOverridesRequest,
-    AssistantMcpBindingChanged, CancelConversationResponse, CloneConversationRequest, ConfirmRequest,
-    ConfirmationListResponse, ConversationArtifactKind, ConversationArtifactListResponse, ConversationArtifactResponse,
-    ConversationArtifactStatus, ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind,
-    ConversationNameUpdatedPayload, ConversationResponse, ConversationRuntimeSummary, CreateConversationRequest,
-    EnsureConversationRuntimeResponse, ForkCapabilityView, ForkConversationRequest, ListConversationsQuery,
-    ListMessagesQuery, McpRuntimeSnapshot, MessageListResponse, MessageResponse, MessageSearchResponse,
-    PromptCapabilityView, SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionMcpServer,
-    SessionMcpTransport, TEAM_MCP_SERVER_NAME, TeamMcpSelection, TeamSessionBinding, UpdateConversationArtifactRequest,
-    UpdateConversationRequest, WebSocketMessage, assistant_avatar_response_value,
+    AssistantConversationRequest, AssistantMcpBindingChanged, CancelConversationResponse, CloneConversationRequest,
+    ConfirmRequest, ConfirmationListResponse, ConversationArtifactKind, ConversationArtifactListResponse,
+    ConversationArtifactResponse, ConversationArtifactStatus, ConversationListResponse, ConversationMcpStatus,
+    ConversationMcpStatusKind, ConversationNameUpdatedPayload, ConversationResponse, ConversationRuntimeSummary,
+    CreateConversationRequest, EnsureConversationRuntimeResponse, ForkCapabilityView, ForkConversationRequest,
+    ListConversationsQuery, ListMessagesQuery, McpRuntimeSnapshot, MessageListResponse, MessageResponse,
+    MessageSearchResponse, PromptCapabilityView, RoleRef, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
+    SessionMcpServer, SessionMcpTransport, TEAM_MCP_SERVER_NAME, TeamMcpSelection, TeamSessionBinding,
+    UpdateConversationArtifactRequest, UpdateConversationRequest, WebSocketMessage, assistant_avatar_response_value,
     assistant_avatar_response_value_with_version, assistant_mcp_binding_fingerprint,
 };
 use aionui_api_types::{ChatFileRef, SessionRef};
 use aionui_common::{
     AgentKillReason, AgentType, ConversationSource, ConversationStatus, ErrorChain, MessageType, OnConversationDelete,
-    OnConversationTurnCancelled, PaginatedResult, TurnCancelCause, WorkspacePathValidationError, generate_short_id,
-    now_ms, validate_workspace_path_availability,
+    OnConversationTurnCancelled, PaginatedResult, ProviderWithModel, TurnCancelCause, WorkspacePathValidationError,
+    generate_short_id, now_ms, validate_workspace_path_availability,
 };
 use aionui_db::models::{
     AssistantDefinitionRow, ConversationAssistantSnapshotRow, ConversationRow, McpServerRow, MessageRow,
@@ -235,6 +235,34 @@ pub trait ConversationRolePort: Send + Sync {
         _condensed_leaf: &str,
     ) -> bool {
         false
+    }
+
+    /// Whether `assistant_id` is an active resident role.
+    async fn is_resident_role(&self, _assistant_id: &str) -> bool {
+        false
+    }
+
+    /// Recorded `thread_conversation_id` for `assistant_id`, if any.
+    async fn role_thread(&self, _assistant_id: &str) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+
+    /// Atomically claim `conversation_id` as the role's unique thread when none
+    /// exists yet or when the previous thread conversation was deleted.
+    async fn claim_role_thread(
+        &self,
+        _assistant_id: &str,
+        _conversation_id: &str,
+        _thread_gone: bool,
+        _now: i64,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Whether the resident role `assistant_id` is permitted to send outbound
+    /// colleague/session messages (`role_send` not in `denied_tools`).
+    async fn is_role_send_allowed(&self, _assistant_id: &str) -> bool {
+        true
     }
 }
 
@@ -755,6 +783,235 @@ impl ConversationService {
         Ok(format!("{content}\n\n{block}"))
     }
 
+    /// Resolve or lazily create the unique thread conversation for resident
+    /// role `role_id` using the role assistant's own default workspace (never
+    /// inheriting a caller's project directory), serialized per `role_id`.
+    pub async fn ensure_role_thread(
+        &self,
+        user_id: &str,
+        role_id: &str,
+    ) -> Result<(String, ConversationRow), ConversationError> {
+        let role_id = role_id.trim();
+        if role_id.is_empty() {
+            return Err(ConversationError::BadRequest {
+                reason: "role_id must not be empty".into(),
+            });
+        }
+        let Some(port) = self.role_port() else {
+            return Err(ConversationError::NotFound { id: role_id.to_owned() });
+        };
+        let lock = self.role_threads.ensure_lock(role_id);
+        let _guard = lock.lock().await;
+
+        if !port.is_resident_role(role_id).await {
+            return Err(ConversationError::NotFound { id: role_id.to_owned() });
+        }
+
+        let snapshot = self
+            .resolve_assistant_snapshot(
+                user_id,
+                role_id,
+                None,
+                &AssistantConversationOverrides::default(),
+                &serde_json::Value::Null,
+            )
+            .await?;
+        let display_name = snapshot
+            .as_ref()
+            .map(|item| item.name.trim())
+            .filter(|name| !name.is_empty())
+            .unwrap_or(role_id)
+            .to_owned();
+
+        let recorded = port
+            .role_thread(role_id)
+            .await
+            .map_err(|reason| ConversationError::internal(format!("role thread lookup failed: {reason}")))?;
+        let mut thread_gone = false;
+        if let Some(thread_id) = recorded.as_deref() {
+            if let Some(existing) = self.conversation_repo.get(user_id, thread_id).await? {
+                if session_mentions::team_id_from_extra_str(&existing.extra).is_none() {
+                    let resolved_name = if existing.name.trim().is_empty() {
+                        display_name
+                    } else if snapshot.is_some() {
+                        display_name
+                    } else {
+                        existing.name.clone()
+                    };
+                    return Ok((resolved_name, existing));
+                }
+            }
+            thread_gone = true;
+        }
+
+        let Some(snapshot) = snapshot else {
+            return Err(ConversationError::NotFound { id: role_id.to_owned() });
+        };
+
+        let model = if snapshot.agent_type == AgentType::Aionrs {
+            self.resolve_aionrs_model_for_role(user_id, role_id, snapshot.resolved_defaults.model.as_deref())
+                .await?
+        } else {
+            None
+        };
+
+        let created = self
+            .create(
+                user_id,
+                CreateConversationRequest {
+                    name: Some(display_name.clone()),
+                    r#type: None,
+                    model,
+                    assistant: Some(AssistantConversationRequest {
+                        id: role_id.to_owned(),
+                        locale: None,
+                        conversation_overrides: None,
+                    }),
+                    source: Some(ConversationSource::Aionui),
+                    channel_chat_id: None,
+                    extra: serde_json::Value::Object(serde_json::Map::new()),
+                },
+            )
+            .await?;
+
+        port.claim_role_thread(role_id, &created.id, thread_gone, now_ms())
+            .await
+            .map_err(|reason| ConversationError::internal(format!("role thread claim failed: {reason}")))?;
+
+        info!(
+            role_id = %role_id,
+            conversation_id = %created.id,
+            "auto-provisioned resident role thread"
+        );
+
+        let row =
+            self.conversation_repo.get(user_id, &created.id).await?.ok_or_else(|| {
+                ConversationError::internal("created role thread row missing immediately after insert")
+            })?;
+        Ok((display_name, row))
+    }
+
+    async fn resolve_aionrs_model_for_role(
+        &self,
+        user_id: &str,
+        role_id: &str,
+        preferred_model: Option<&str>,
+    ) -> Result<Option<ProviderWithModel>, ConversationError> {
+        let Some(provider_repo) = self.provider_repo() else {
+            return Err(ConversationError::BadRequest {
+                reason: format!("provider repository unavailable to provision aionrs role `{role_id}`"),
+            });
+        };
+        let providers = provider_repo
+            .list(user_id)
+            .await
+            .map_err(|error| ConversationError::internal(format!("provider lookup failed: {error}")))?;
+        let enabled: Vec<_> = providers.into_iter().filter(|provider| provider.enabled).collect();
+
+        if let Some(model_id) = preferred_model.filter(|id| !id.trim().is_empty())
+            && let Some(provider) = enabled.iter().find(|provider| {
+                serde_json::from_str::<Vec<String>>(&provider.models)
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|candidate| candidate == model_id)
+            })
+        {
+            return Ok(Some(ProviderWithModel {
+                provider_id: provider.id.clone(),
+                model: model_id.to_owned(),
+                use_model: Some(model_id.to_owned()),
+            }));
+        }
+
+        for provider in &enabled {
+            if let Some(first_model) = serde_json::from_str::<Vec<String>>(&provider.models)
+                .unwrap_or_default()
+                .into_iter()
+                .find(|candidate| !candidate.trim().is_empty())
+            {
+                return Ok(Some(ProviderWithModel {
+                    provider_id: provider.id.clone(),
+                    model: first_model.clone(),
+                    use_model: Some(first_model),
+                }));
+            }
+        }
+
+        Err(ConversationError::BadRequest {
+            reason: format!("no enabled model provider available to provision aionrs role `{role_id}`"),
+        })
+    }
+
+    /// Resolve `@@@` resident-role references into the `[[AION_ROLES]]` block
+    /// appended to the message content, lazily creating any target role's
+    /// thread conversation if it had not been opened yet.
+    pub async fn resolve_role_mentions(
+        &self,
+        user_id: &str,
+        sender_conversation_id: &str,
+        content: &str,
+        roles: &[RoleRef],
+        sender_workspace: Option<&str>,
+    ) -> Result<String, ConversationError> {
+        if roles.is_empty() {
+            return Ok(content.to_owned());
+        }
+
+        let mut targets = Vec::with_capacity(roles.len());
+        let mut seen_roles = HashSet::new();
+        for reference in roles {
+            let role_id = reference.id.trim();
+            if role_id.is_empty() || !seen_roles.insert(role_id.to_owned()) {
+                continue;
+            }
+            let (role_name, row) = self.ensure_role_thread(user_id, role_id).await?;
+            session_mentions::reject_unusable_target(sender_conversation_id, &row.id, &row.extra)?;
+            targets.push(session_mentions::RoleMentionTargetInfo {
+                role_id: role_id.to_owned(),
+                role_name,
+                thread_conversation_id: row.id.clone(),
+                workspace: session_mentions::workspace_from_extra(&row.extra),
+            });
+        }
+        if targets.is_empty() {
+            return Ok(content.to_owned());
+        }
+
+        let block = session_mentions::build_roles_block(sender_workspace, &targets);
+        Ok(format!("{content}\n\n{block}"))
+    }
+
+    /// When `conversation_id` runs as a resident role, returns
+    /// `(role_id, role_display_name, is_role_send_allowed)`.
+    pub async fn sender_role_identity(&self, user_id: &str, conversation_id: &str) -> Option<(String, String, bool)> {
+        let port = self.role_port()?;
+        let snapshot = self
+            .conversation_repo
+            .get_assistant_snapshot(user_id, conversation_id)
+            .await
+            .ok()??;
+        if !port.is_resident_role(&snapshot.assistant_id).await {
+            return None;
+        }
+        let allowed = port.is_role_send_allowed(&snapshot.assistant_id).await;
+        let name = self.assistant_definition_repo().and_then(|repo| {
+            // Best-effort name lookup; fall back to assistant_id if unavailable.
+            Some((repo, snapshot.assistant_id.clone()))
+        });
+        let display_name = if let Some((repo, ref id)) = name {
+            repo.get_by_assistant_id_for_user(user_id, id)
+                .await
+                .ok()
+                .flatten()
+                .map(|def| def.name)
+                .filter(|n| !n.trim().is_empty())
+                .unwrap_or_else(|| snapshot.assistant_id.clone())
+        } else {
+            snapshot.assistant_id.clone()
+        };
+        Some((snapshot.assistant_id, display_name, allowed))
+    }
+
     pub fn with_assistant_definition_repo(&self, repo: Arc<dyn IAssistantDefinitionRepository>) {
         if let Ok(mut guard) = self.assistant_definition_repo.write() {
             *guard = Some(repo);
@@ -1006,7 +1263,17 @@ impl ConversationService {
                 return content;
             }
         };
-        let news = port.thread_news(user_id, &assistant_id, &row.id).await;
+        let is_cross_session_delivery = content
+            .trim_start()
+            .starts_with(aionui_common::constants::AIONUI_SESSION_MESSAGE_MARKER);
+        let news = if is_cross_session_delivery {
+            // An inbound message from another conversation or colleague role is
+            // not the human user opening the thread: leave unread scheduled-run
+            // reports (`delivered_at`) untouched for the user's own next turn.
+            None
+        } else {
+            port.thread_news(user_id, &assistant_id, &row.id).await
+        };
         if news.is_some() {
             info!(conversation_id = %row.id, assistant_id = %assistant_id, "turn brings the role's news to its thread");
         }
@@ -4242,19 +4509,35 @@ impl ConversationService {
         //    them is not one (`MessageText.tsx`, `parseFileMarker`). With the
         //    sessions block appended afterwards, a message carrying BOTH `@` and
         //    `@@` lost its file chips and rendered the raw marker as text.
+        let sender_workspace = if !req.sessions.is_empty() || !req.roles.is_empty() {
+            session_mentions::workspace_from_extra(&row.extra)
+        } else {
+            None
+        };
         let content_with_sessions = if req.sessions.is_empty() {
             req.content.clone()
         } else {
-            let sender_workspace = session_mentions::workspace_from_extra(&row.extra);
             self.resolve_session_mentions(user_id, &req.content, &req.sessions, sender_workspace.as_deref())
                 .await?
+        };
+        let content_with_mentions = if req.roles.is_empty() {
+            content_with_sessions
+        } else {
+            self.resolve_role_mentions(
+                user_id,
+                &row.id,
+                &content_with_sessions,
+                &req.roles,
+                sender_workspace.as_deref(),
+            )
+            .await?
         };
 
         // Resolve file attachments at the send boundary before any persist/claim
         // (atomic: a bad reference fails the whole send). Produces the inlined
         // `[[AION_FILES]]` content used for persistence, broadcast, and the turn.
         let resolved = self
-            .resolve_message_attachments(user_id, &content_with_sessions, &req.files)
+            .resolve_message_attachments(user_id, &content_with_mentions, &req.files)
             .await?;
 
         // ── Mid-turn delivery (B5, spec §4.3) ────────────────────────────

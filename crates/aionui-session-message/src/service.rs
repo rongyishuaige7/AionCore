@@ -17,13 +17,14 @@ use std::sync::Arc;
 
 use aionui_ai_agent::IWorkerTaskManager;
 use aionui_api_types::{
-    SendMessageRequest, SendMessageResponse, SessionDeliveryStatus, SessionMessageRateLimitedPayload, SessionRateGate,
-    SessionSendMessageRequest, SessionSendMessageResponse, WebSocketMessage,
+    MAX_ROLE_AUTO_HOPS, SendMessageRequest, SendMessageResponse, SessionDeliveryStatus,
+    SessionMessageRateLimitedPayload, SessionRateGate, SessionSendMessageRequest, SessionSendMessageResponse,
+    WebSocketMessage,
 };
 use aionui_common::constants::{AIONUI_SESSION_MESSAGE_END_MARKER, AIONUI_SESSION_MESSAGE_MARKER};
 use aionui_conversation::session_mentions::{team_id_from_extra_str, workspace_from_extra};
 use aionui_conversation::{ConversationError, ConversationService};
-use aionui_db::{IConversationRepository, ISettingsRepository};
+use aionui_db::{IConversationRepository, ISettingsRepository, MessagePageDirection, MessagePageParams};
 use aionui_realtime::EventBroadcaster;
 use async_trait::async_trait;
 use tokio::sync::Notify;
@@ -54,14 +55,67 @@ use crate::rate_limit::{RateLimiter, RateVerdict};
 /// labels separately via i18n — so its text (the reply pointer, the `workspace:`
 /// warning, and the capabilities pointer) is written in English, not localized.
 pub fn build_session_message_block(from_name: &str, from_id: &str, workspace_field: &str, reply_to: &str) -> String {
-    format!(
+    build_session_message_block_with_meta(from_name, from_id, workspace_field, reply_to, None, None)
+}
+
+/// Build the recipient-side block with optional resident-role provenance
+/// (`from_role: <role_id>\t<role_name>`) and autonomous hop counter (`hop: N/M`).
+pub fn build_session_message_block_with_meta(
+    from_name: &str,
+    from_id: &str,
+    workspace_field: &str,
+    reply_to: &str,
+    from_role: Option<(&str, &str)>,
+    hop: Option<(u32, u32)>,
+) -> String {
+    let mut out = format!(
         "{AIONUI_SESSION_MESSAGE_MARKER}\n\
-         from: {from_name}\t{from_id}\n\
-         workspace: {workspace_field}\n\
-         reply_to: {reply_to}\t(reply: session send-message, to=reply_to)\n\
+         from: {from_name}\t{from_id}\n"
+    );
+    if let Some((role_id, role_name)) = from_role {
+        out.push_str(&format!("from_role: {role_id}\t{role_name}\n"));
+    }
+    out.push_str(&format!("workspace: {workspace_field}\n"));
+    if let Some((current, max)) = hop {
+        out.push_str(&format!("hop: {current}/{max}\n"));
+    }
+    out.push_str(&format!(
+        "reply_to: {reply_to}\t(reply: session send-message, to=reply_to)\n\
          If the session-message skill is unavailable, run `\"$AIONUI_HELPER_BIN\" session capabilities` for the full delivery contract.\n\
          {AIONUI_SESSION_MESSAGE_END_MARKER}"
-    )
+    ));
+    out
+}
+
+/// Extract the inbound autonomous `hop` count from a persisted message text.
+/// Returns `0` when the message was written by a human (no `[[AION_SESSION_MESSAGE]]`
+/// block) or carries no `hop:` header.
+pub fn parse_inbound_hop_from_text(text: &str) -> u32 {
+    let trimmed = text.trim_start();
+    let Some(after_open) = trimmed.strip_prefix(AIONUI_SESSION_MESSAGE_MARKER) else {
+        return 0;
+    };
+    let Some(end_idx) = after_open.find(AIONUI_SESSION_MESSAGE_END_MARKER) else {
+        return 0;
+    };
+    for line in after_open[..end_idx].lines() {
+        if let Some(rest) = line.trim().strip_prefix("hop:") {
+            let head = rest.trim().split('/').next().unwrap_or_default().trim();
+            if let Ok(parsed) = head.parse::<u32>() {
+                return parsed;
+            }
+        }
+    }
+    0
+}
+
+/// Result of [`SessionMessageService::send_detailed`], exposing the causal hop
+/// recorded on the delivery for `role send`.
+#[derive(Debug, Clone)]
+pub struct DetailedDeliveryOutcome {
+    pub response: SessionSendMessageResponse,
+    pub hop: u32,
+    pub max_hops: u32,
 }
 
 /// Block first, then the body: the block is context, not an attachment.
@@ -145,6 +199,19 @@ impl SessionMessageService {
         from_conversation_id: &str,
         req: &SessionSendMessageRequest,
     ) -> Result<SessionSendMessageResponse, SessionMessageError> {
+        self.send_detailed(user_id, from_conversation_id, req)
+            .await
+            .map(|outcome| outcome.response)
+    }
+
+    /// Same delivery contract as [`Self::send`], additionally returning the
+    /// recorded causal hop count (`hop / max_hops`) for `role send`.
+    pub async fn send_detailed(
+        &self,
+        user_id: &str,
+        from_conversation_id: &str,
+        req: &SessionSendMessageRequest,
+    ) -> Result<DetailedDeliveryOutcome, SessionMessageError> {
         // 1
         if !self.is_enabled_for(user_id).await {
             warn!(
@@ -203,13 +270,44 @@ impl SessionMessageService {
             return Err(SessionMessageError::RateLimited);
         }
 
-        // 5 — re-checked here even though the send boundary already validated
-        // the `@@` reference: there is real elapsed time between the user
-        // picking a target and the agent calling the CLI minutes later, during
-        // which the target may have been deleted or joined a team.
+        // 5 — role permission, causal hop budget, and target checks.
         if to == from_conversation_id {
             return Err(SessionMessageError::TargetIsSelf { id: to.to_owned() });
         }
+        let sender_role = self
+            .deps
+            .conversation_service
+            .sender_role_identity(user_id, from_conversation_id)
+            .await;
+        if let Some((ref role_id, _, false)) = sender_role {
+            warn!(
+                from_conversation_id,
+                role_id = %role_id,
+                outcome = "rejected",
+                error_code = "permission_denied",
+                "resident role denied outbound message by permission table"
+            );
+            return Err(SessionMessageError::PermissionDenied);
+        }
+
+        let inbound_hop = self.current_inbound_hop(user_id, from_conversation_id).await;
+        let outbound_hop = inbound_hop.saturating_add(1);
+        if outbound_hop > MAX_ROLE_AUTO_HOPS {
+            warn!(
+                from_conversation_id,
+                to_conversation_id = to,
+                outbound_hop,
+                max_hops = MAX_ROLE_AUTO_HOPS,
+                outcome = "rejected",
+                error_code = "hop_limit_reached",
+                "autonomous cross-session hop budget exhausted"
+            );
+            return Err(SessionMessageError::HopLimitReached {
+                hop: outbound_hop,
+                max_hops: MAX_ROLE_AUTO_HOPS,
+            });
+        }
+
         let target = self
             .deps
             .conversation_repo
@@ -228,11 +326,21 @@ impl SessionMessageService {
         // 6
         let sender_workspace = workspace_from_extra(&sender.extra);
         let target_workspace = workspace_from_extra(&target.extra);
-        let block = build_session_message_block(
-            &sender.name,
+        let from_role_meta = sender_role
+            .as_ref()
+            .map(|(role_id, role_name, _)| (role_id.as_str(), role_name.as_str()));
+        let sender_label = sender_role
+            .as_ref()
+            .map(|(_, role_name, _)| role_name.as_str())
+            .filter(|label| !label.trim().is_empty())
+            .unwrap_or_else(|| sender.name.as_str());
+        let block = build_session_message_block_with_meta(
+            sender_label,
             from_conversation_id,
             &recipient_workspace_field(sender_workspace.as_deref(), target_workspace.as_deref()),
             from_conversation_id,
+            from_role_meta,
+            Some((outbound_hop, MAX_ROLE_AUTO_HOPS)),
         );
         let content = compose_delivery_content(&block, &req.message);
 
@@ -241,24 +349,22 @@ impl SessionMessageService {
                 info!(
                     from_conversation_id,
                     to_conversation_id = to,
+                    hop = outbound_hop,
                     outcome = "delivered",
-                    // `send_message` may have merged the message into the
-                    // target's already-running turn instead of opening a new
-                    // one. Both map to `delivered` on the wire, but without this
-                    // field the two are indistinguishable in production.
                     delivered_midturn = sent.delivered_midturn,
                     "cross-session delivery accepted"
                 );
-                Ok(SessionSendMessageResponse {
-                    status: SessionDeliveryStatus::Delivered,
-                    to: to.to_owned(),
+                Ok(DetailedDeliveryOutcome {
+                    response: SessionSendMessageResponse {
+                        status: SessionDeliveryStatus::Delivered,
+                        to: to.to_owned(),
+                    },
+                    hop: outbound_hop,
+                    max_hops: MAX_ROLE_AUTO_HOPS,
                 })
             }
             // 7
             Err(DeliverAttemptError::Transient(reason)) => {
-                // `content` already carries the recipient block, composed above
-                // while both rows were in hand — the drainer re-sends these
-                // bytes verbatim rather than rebuilding anything.
                 self.deps.queue.push(PendingDelivery {
                     to: to.to_owned(),
                     user_id: user_id.to_owned(),
@@ -270,21 +376,53 @@ impl SessionMessageService {
                 info!(
                     from_conversation_id,
                     to_conversation_id = to,
+                    hop = outbound_hop,
                     outcome = "queued",
-                    // Which transient condition it was — a busy turn, a pending
-                    // confirmation card, or a runtime restart. Logged once per
-                    // enqueue (never per retry, which would be one line a
-                    // second), and it is an error string, never a payload.
                     reason = %reason,
                     "cross-session delivery queued; target not ready"
                 );
-                Ok(SessionSendMessageResponse {
-                    status: SessionDeliveryStatus::Queued,
-                    to: to.to_owned(),
+                Ok(DetailedDeliveryOutcome {
+                    response: SessionSendMessageResponse {
+                        status: SessionDeliveryStatus::Queued,
+                        to: to.to_owned(),
+                    },
+                    hop: outbound_hop,
+                    max_hops: MAX_ROLE_AUTO_HOPS,
                 })
             }
             Err(DeliverAttemptError::Hard(reason)) => Err(SessionMessageError::TransportUnavailable { reason }),
         }
+    }
+
+    async fn current_inbound_hop(&self, user_id: &str, conversation_id: &str) -> u32 {
+        let Ok(page) = self
+            .deps
+            .conversation_repo
+            .list_messages_page(
+                user_id,
+                conversation_id,
+                &MessagePageParams {
+                    limit: 20,
+                    direction: MessagePageDirection::InitialLatest,
+                },
+            )
+            .await
+        else {
+            return 0;
+        };
+        let Some(latest_user_row) = page
+            .items
+            .iter()
+            .rfind(|row| !row.hidden && row.r#type == "text" && row.position.as_deref() == Some("right"))
+        else {
+            return 0;
+        };
+        if let Ok(envelope) = serde_json::from_str::<serde_json::Value>(&latest_user_row.content)
+            && let Some(text) = envelope.get("content").and_then(serde_json::Value::as_str)
+        {
+            return parse_inbound_hop_from_text(text);
+        }
+        parse_inbound_hop_from_text(&latest_user_row.content)
     }
 
     /// `list` / `targets` / `mentionable` share the send path's two most global
@@ -356,9 +494,10 @@ impl SessionMessageService {
         let request = SendMessageRequest {
             content,
             files: Vec::new(),
-            // The delivered body is already fully composed; `@@` resolution is
-            // a sender-side concern and must not re-run here.
+            // The delivered body is already fully composed; `@@` / `@@@`
+            // resolution is a sender-side concern and must not re-run here.
             sessions: Vec::new(),
+            roles: Vec::new(),
             inject_skills: Vec::new(),
             // Not hidden: the user opening the recipient conversation should
             // see this message. (cron uses hidden=true because its prompt is

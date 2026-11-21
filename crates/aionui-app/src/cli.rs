@@ -284,6 +284,8 @@ pub(crate) struct RoleArgs {
 pub(crate) enum RoleCommand {
     Capabilities,
     Show,
+    Peers,
+    Send,
     Remember,
     Curate,
     Progress,

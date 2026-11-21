@@ -11,6 +11,12 @@ pub const AIONUI_FILES_MARKER: &str = "[[AION_FILES]]";
 pub const AIONUI_SESSIONS_MARKER: &str = "[[AION_SESSIONS]]";
 pub const AIONUI_SESSIONS_END_MARKER: &str = "[[/AION_SESSIONS]]";
 
+/// Sender-side block appended to a user message that referenced resident
+/// roles with `@@@`. Carries role name + role id + thread conversation id +
+/// workspace per target.
+pub const AIONUI_ROLES_MARKER: &str = "[[AION_ROLES]]";
+pub const AIONUI_ROLES_END_MARKER: &str = "[[/AION_ROLES]]";
+
 /// Recipient-side block prepended to a cross-session delivery. Tells the
 /// receiving agent who sent it, whether the sender's workspace matches, and
 /// the reply address.

@@ -117,3 +117,26 @@ fn a_team_owned_reference_is_rejected_and_a_self_reference_is_rejected() {
         Err(ConversationError::Forbidden { .. })
     ));
 }
+
+#[test]
+fn roles_block_encodes_role_name_id_thread_and_workspace_with_no_tab_hint_line() {
+    let block = build_roles_block(
+        Some("/w/app"),
+        &[RoleMentionTargetInfo {
+            role_id: "sec-officer".to_owned(),
+            role_name: "安全官".to_owned(),
+            thread_conversation_id: "conv_role_sec".to_owned(),
+            workspace: Some("/w/roles/sec".to_owned()),
+        }],
+    );
+    let mut lines = block.lines();
+    assert_eq!(lines.next(), Some("[[AION_ROLES]]"));
+    let hint = lines.next().expect("hint line");
+    assert!(!hint.contains('\t'), "hint must not contain tabs: {hint}");
+    assert_eq!(
+        lines.next(),
+        Some("安全官\tsec-officer\tconv_role_sec\tworkspace: /w/roles/sec (differs from yours)")
+    );
+    assert_eq!(lines.next(), Some("[[/AION_ROLES]]"));
+    assert_eq!(lines.next(), None);
+}

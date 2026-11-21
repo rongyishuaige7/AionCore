@@ -539,9 +539,7 @@ pub fn build_conversation_state(
     }
     // A conversation started with a resident role opens with who it is.
     conversation_service.with_role_port(Arc::new(RoleServiceConversationPort {
-        roles: RoleServiceTeamPort {
-            service: role_service(services),
-        },
+        roles: role_team_port(services),
         conversations: conversation_service.conversation_repo().clone(),
         cron: cron_service.clone(),
     }));
@@ -644,6 +642,30 @@ pub fn build_role_state(services: &AppServices, external: Arc<dyn aionui_role::R
 /// depending on the role crate.
 struct RoleServiceTeamPort {
     service: Arc<RoleService>,
+    assistant_definitions: Arc<dyn IAssistantDefinitionRepository>,
+}
+
+fn role_team_port(services: &AppServices) -> RoleServiceTeamPort {
+    RoleServiceTeamPort {
+        service: role_service(services),
+        assistant_definitions: Arc::new(SqliteAssistantDefinitionRepository::new(
+            services.database.pool().clone(),
+        )),
+    }
+}
+
+pub(crate) fn summarize_role_charter(charter: &str) -> String {
+    let first_line = charter
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    let trimmed: String = first_line.chars().take(100).collect();
+    if first_line.chars().count() > 100 {
+        format!("{trimmed}…")
+    } else {
+        trimmed
+    }
 }
 
 #[async_trait::async_trait]
@@ -651,41 +673,65 @@ impl aionui_team::TeamRolePort for RoleServiceTeamPort {
     async fn role_brief(&self, assistant_id: &str) -> Result<Option<aionui_team::TeamRoleBrief>, String> {
         let playbook = self.service.prompt_playbook(assistant_id).await.unwrap_or_default();
         let boss_profile = self.service.boss_profile().await.unwrap_or_default();
-        match self.service.find(assistant_id).await {
-            Ok(role) => Ok(role.map(|role| aionui_team::TeamRoleBrief {
-                charter: role.charter,
-                memory: role.memory,
-                memory_dir: role.memory_dir,
-                denied_tools: role.denied_tools,
-                verifies: role.verifies,
-                progress: role
-                    .progress
-                    .into_iter()
-                    .map(|progress| aionui_team::TeamRoleProgress {
-                        task: progress.task,
-                        state: progress.state,
-                        updated_day: local_day(progress.updated_at),
-                    })
-                    .collect(),
-                reported: role
-                    .reported
+        let role = match self.service.find(assistant_id).await {
+            Ok(Some(role)) => role,
+            Ok(None) | Err(RoleError::InvalidId(_)) => return Ok(None),
+            Err(error) => return Err(error.to_string()),
+        };
+
+        let mut colleagues = Vec::new();
+        if let Ok(all_roles) = self.service.list().await {
+            let defs = self.assistant_definitions.list().await.unwrap_or_default();
+            for peer in all_roles {
+                if peer.id == role.id {
+                    continue;
+                }
+                let name = defs
                     .iter()
-                    .map(|report| {
-                        format!(
-                            "{} [{}] {}",
-                            local_minute(report.at),
-                            report.outcome.as_str(),
-                            report.summary
-                        )
-                    })
-                    .collect(),
-                playbook,
-                boss_profile,
-            })),
-            // An assistant id that cannot name a role directory is not a role.
-            Err(RoleError::InvalidId(_)) => Ok(None),
-            Err(error) => Err(error.to_string()),
+                    .find(|def| def.assistant_id == peer.id)
+                    .map(|def| def.name.trim())
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or(&peer.id)
+                    .to_owned();
+                colleagues.push(aionui_team::TeamRolePeer {
+                    role_id: peer.id,
+                    name,
+                    charter_summary: summarize_role_charter(&peer.charter),
+                });
+            }
         }
+
+        Ok(Some(aionui_team::TeamRoleBrief {
+            charter: role.charter,
+            memory: role.memory,
+            memory_dir: role.memory_dir,
+            denied_tools: role.denied_tools,
+            verifies: role.verifies,
+            progress: role
+                .progress
+                .into_iter()
+                .map(|progress| aionui_team::TeamRoleProgress {
+                    task: progress.task,
+                    state: progress.state,
+                    updated_day: local_day(progress.updated_at),
+                })
+                .collect(),
+            reported: role
+                .reported
+                .iter()
+                .map(|report| {
+                    format!(
+                        "{} [{}] {}",
+                        local_minute(report.at),
+                        report.outcome.as_str(),
+                        report.summary
+                    )
+                })
+                .collect(),
+            playbook,
+            boss_profile,
+            colleagues,
+        }))
     }
 
     async fn remember(
@@ -1048,6 +1094,43 @@ impl aionui_conversation::ConversationRolePort for RoleServiceConversationPort {
             )
             .await
             .unwrap_or(false)
+    }
+
+    async fn is_resident_role(&self, assistant_id: &str) -> bool {
+        matches!(self.roles.service.find(assistant_id).await, Ok(Some(_)))
+    }
+
+    async fn role_thread(&self, assistant_id: &str) -> Result<Option<String>, String> {
+        match self.roles.service.thread(assistant_id).await {
+            Ok(thread) => Ok(thread),
+            Err(RoleError::InvalidId(_) | RoleError::NotFound(_)) => Ok(None),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    async fn claim_role_thread(
+        &self,
+        assistant_id: &str,
+        conversation_id: &str,
+        thread_gone: bool,
+        now: i64,
+    ) -> Result<(), String> {
+        self.roles
+            .service
+            .open_thread_turn(assistant_id, conversation_id, thread_gone, now)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    async fn is_role_send_allowed(&self, assistant_id: &str) -> bool {
+        match self.roles.service.find(assistant_id).await {
+            Ok(Some(role)) => !role
+                .denied_tools
+                .iter()
+                .any(|tool| tool == aionui_api_types::ROLE_SEND_TOOL_NAME),
+            _ => true,
+        }
     }
 }
 
@@ -1721,9 +1804,7 @@ pub fn build_team_state(
     service.with_user_order_store(services.user_order_store.clone());
     // Members spawned from a resident role are woken with its charter and
     // memory and held to its team-tool permission table.
-    service.with_role_port(Arc::new(RoleServiceTeamPort {
-        service: role_service(services),
-    }));
+    service.with_role_port(Arc::new(role_team_port(services)));
     TeamRouterState {
         service,
         active_leases: services.active_lease_registry.clone(),
@@ -1755,9 +1836,7 @@ pub fn build_cron_state(services: &AppServices) -> CronRouterState {
             services.agent_registry.clone(),
         )
         .with_role_port(Arc::new(RoleServiceCronPort {
-            roles: RoleServiceTeamPort {
-                service: role_service(services),
-            },
+            roles: role_team_port(services),
         })),
     );
 

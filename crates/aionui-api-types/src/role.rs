@@ -232,6 +232,14 @@ pub struct UpdateRoleMemoryRequest {
 /// Schema version of the envelopes the agent-facing `role` helper prints.
 pub const ROLE_CLI_SCHEMA_VERSION: u32 = 1;
 
+/// Permission-table token (`denied_tools`) that keeps a resident role from
+/// autonomously messaging peer roles or conversations via `role send`.
+pub const ROLE_SEND_TOOL_NAME: &str = "role_send";
+
+/// Maximum autonomous causal hops (`A -> B -> C -> B -> A`) allowed before an
+/// agent chain must conclude or report back to the human user.
+pub const MAX_ROLE_AUTO_HOPS: u32 = 4;
+
 /// Why a `role` helper command was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -243,6 +251,12 @@ pub enum RoleCliErrorCode {
     /// The role's permission table keeps it from this write.
     PermissionDenied,
     SchemaValidationFailed,
+    TargetNotFound,
+    TargetIsSelf,
+    FeatureDisabled,
+    RateLimited,
+    HopLimitReached,
+    QueueFull,
     TransportUnavailable,
     Internal,
 }
@@ -631,4 +645,46 @@ pub struct RoleDreamResponse {
     pub curated_memory: bool,
     pub retrospective_ran: bool,
     pub condensed_batches: usize,
+}
+
+/// Summary of one peer resident role returned by `GET /api/runtime/role/peers`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RolePeerSummary {
+    pub role_id: String,
+    pub name: String,
+    pub charter_summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_conversation_id: Option<String>,
+    pub busy: bool,
+}
+
+/// Response of `GET /api/runtime/role/peers`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RolePeersResponse {
+    pub peers: Vec<RolePeerSummary>,
+}
+
+/// Body of `POST /api/runtime/role/send` — deliver a message either to a peer
+/// resident role (`to_role`, resolved or lazily provisioned to its unique
+/// thread) or to an explicit conversation id (`to_conversation`, e.g. a
+/// `reply_to` from an ordinary session).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoleSendRequest {
+    #[serde(default)]
+    pub to_role: Option<String>,
+    #[serde(default)]
+    pub to_conversation: Option<String>,
+    pub message: String,
+}
+
+/// Response of `POST /api/runtime/role/send`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleSendResponse {
+    pub status: crate::session_tools::SessionDeliveryStatus,
+    pub to_conversation_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_role_id: Option<String>,
+    pub hop: u32,
+    pub max_hops: u32,
 }

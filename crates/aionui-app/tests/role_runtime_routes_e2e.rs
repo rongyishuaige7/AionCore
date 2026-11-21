@@ -902,3 +902,201 @@ async fn proposals_gate_agent_role_and_cron_mutations_and_dismiss_cleans_up_sche
 
     fixture.services.database.close().await;
 }
+
+#[tokio::test]
+async fn role_peers_and_role_send_collaborate_lazily_provision_threads_and_preserve_boss_news() {
+    let fixture = fixture().await;
+    let assistants: Vec<(String, String)> = sqlx::query_as(
+        "SELECT assistant_id, name FROM assistant_definitions WHERE source = 'builtin' ORDER BY assistant_id LIMIT 2",
+    )
+    .fetch_all(fixture.services.database.pool())
+    .await
+    .expect("two builtin assistants");
+    assert_eq!(assistants.len(), 2);
+    let (role_a_id, role_a_name) = &assistants[0];
+    let (role_b_id, role_b_name) = &assistants[1];
+
+    // Point Role B at the seeded builtin `claude` ACP agent so `ensure_role_thread`
+    // can materialize Role B's direct conversation in the in-memory DB without
+    // needing external model provider credentials.
+    sqlx::query("UPDATE assistant_definitions SET agent_id = 'claude' WHERE assistant_id = ?")
+        .bind(role_b_id)
+        .execute(fixture.services.database.pool())
+        .await
+        .unwrap();
+
+    define_role_as(&fixture, role_a_id, &[]).await;
+    define_role_as(&fixture, role_b_id, &[]).await;
+
+    let token_a = conversation_as(&fixture, "conv-role-a", Some(role_a_id)).await;
+
+    // 1. `GET /api/runtime/role/peers` lists Role B (excluding self Role A), initially without a thread.
+    let (status, peers_before) = call(
+        &fixture,
+        "GET",
+        "/api/runtime/role/peers",
+        "conv-role-a",
+        &token_a,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{peers_before}");
+    let peer_arr = peers_before["data"]["peers"].as_array().unwrap();
+    assert_eq!(peer_arr.len(), 1, "{peer_arr:?}");
+    assert_eq!(peer_arr[0]["role_id"], json!(role_b_id));
+    assert_eq!(peer_arr[0]["name"], json!(role_b_name));
+    assert!(peer_arr[0].get("thread_conversation_id").is_none());
+
+    // 2. Validation bad paths: self-send, missing peer, ambiguous target.
+    let (status, self_err) = call(
+        &fixture,
+        "POST",
+        "/api/runtime/role/send",
+        "conv-role-a",
+        &token_a,
+        Some(json!({ "to_role": role_a_id, "message": "talk to myself" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{self_err}");
+    assert_eq!(self_err["error"]["code"], json!("target_is_self"));
+
+    let (status, missing_err) = call(
+        &fixture,
+        "POST",
+        "/api/runtime/role/send",
+        "conv-role-a",
+        &token_a,
+        Some(json!({ "to_role": "ghost-role", "message": "hello?" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{missing_err}");
+    assert_eq!(missing_err["error"]["code"], json!("target_not_found"));
+
+    let (status, schema_err) = call(
+        &fixture,
+        "POST",
+        "/api/runtime/role/send",
+        "conv-role-a",
+        &token_a,
+        Some(json!({ "to_role": role_b_id, "to_conversation": "conv-x", "message": "both?" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{schema_err}");
+    assert_eq!(schema_err["error"]["code"], json!("schema_validation_failed"));
+
+    // 3. `POST /api/runtime/role/send` lazily provisions Role B's thread and delivers `from_role` + `hop: 1/4`.
+    let (status, sent) = call(
+        &fixture,
+        "POST",
+        "/api/runtime/role/send",
+        "conv-role-a",
+        &token_a,
+        Some(json!({ "to_role": role_b_id, "message": "请协助审查鉴权改动" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{sent}");
+    let b_thread_id = sent["data"]["to_conversation_id"].as_str().unwrap().to_owned();
+    assert_eq!(sent["data"]["to_role_id"], json!(role_b_id));
+    assert_eq!(sent["data"]["hop"], json!(1));
+    assert_eq!(sent["data"]["max_hops"], json!(4));
+    assert_eq!(
+        fixture.services.role_service.thread(role_b_id).await.unwrap(),
+        Some(b_thread_id.clone()),
+        "Role B must claim the auto-provisioned conversation as its unique thread"
+    );
+
+    // Verify delivered message carries `from_role:` and `hop: 1/4`.
+    let page = fixture
+        .services
+        .conversation_repo
+        .list_messages_page(
+            USER,
+            &b_thread_id,
+            &aionui_db::MessagePageParams {
+                limit: 10,
+                direction: aionui_db::MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap();
+    let user_msg = page
+        .items
+        .iter()
+        .rfind(|m| m.position.as_deref() == Some("right"))
+        .expect("delivered message persisted in Role B thread");
+    let text = serde_json::from_str::<Value>(&user_msg.content).unwrap()["content"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        text.contains(&format!("from_role: {role_a_id}\t{role_a_name}\n")),
+        "{text}"
+    );
+    assert!(text.contains("hop: 1/4\n"), "{text}");
+
+    // 4. Record an unread scheduled-run report on Role B, send a second colleague message,
+    //    and confirm Role B's unread `<role-news>` was NOT consumed by the colleague turn!
+    let now_after = aionui_common::now_ms() + 5_000;
+    fixture
+        .services
+        .role_service
+        .record_report(
+            role_b_id,
+            aionui_api_types::RoleReportOutcome::Say,
+            "巡检发现证书将在 7 天后到期",
+            "conv-cron-run-b",
+            now_after,
+        )
+        .await
+        .unwrap();
+
+    // `resolve_role_mentions` (`@@@`) reuses the exact same `b_thread_id`!
+    let mentioned = fixture
+        .services
+        .conversation_service
+        .resolve_role_mentions(
+            USER,
+            "conv-role-a",
+            "请跟进证书续期",
+            &[aionui_api_types::RoleRef { id: role_b_id.clone() }],
+            Some("/w/caller"),
+        )
+        .await
+        .unwrap();
+    assert!(mentioned.contains("[[AION_ROLES]]"), "{mentioned}");
+    assert!(
+        mentioned.contains(&format!("{role_b_name}\t{role_b_id}\t{b_thread_id}\tworkspace: ")),
+        "{mentioned}"
+    );
+
+    // Unread report is STILL waiting for the human user (`open_thread_turn` returns 1 report)!
+    let turn = fixture
+        .services
+        .role_service
+        .open_thread_turn(role_b_id, &b_thread_id, false, now_after + 1_000)
+        .await
+        .unwrap();
+    match turn {
+        aionui_role::ThreadTurn::Thread { reports, .. } => {
+            assert_eq!(reports.len(), 1, "colleague turn must not consume boss <role-news>");
+            assert_eq!(reports[0].summary, "巡检发现证书将在 7 天后到期");
+        }
+        other => panic!("expected Thread, got {other:?}"),
+    }
+
+    // 5. Denying `role_send` on Role A immediately blocks outbound `role send` with 403 `permission_denied`.
+    define_role_as(&fixture, role_a_id, &["role_send"]).await;
+    let (status, denied_err) = call(
+        &fixture,
+        "POST",
+        "/api/runtime/role/send",
+        "conv-role-a",
+        &token_a,
+        Some(json!({ "to_role": role_b_id, "message": "blocked outreach" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{denied_err}");
+    assert_eq!(denied_err["error"]["code"], json!("permission_denied"));
+
+    fixture.services.database.close().await;
+}

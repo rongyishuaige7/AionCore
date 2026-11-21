@@ -133,6 +133,8 @@ pub enum SessionToolErrorCode {
     TargetIsTeam,
     SenderIsTeam,
     TargetIsSelf,
+    PermissionDenied,
+    HopLimitReached,
     QueueFull,
     RateLimited,
     FeatureDisabled,

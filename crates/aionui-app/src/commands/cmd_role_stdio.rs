@@ -183,6 +183,45 @@ struct ExpandParams {
     after: Option<u32>,
 }
 
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct RoleSendParams {
+    /// Peer resident role id (lazily creates its thread when needed). Provide either `to_role` or `to_conversation`, not both.
+    #[serde(default)]
+    to_role: Option<String>,
+    /// Target conversation id (e.g. `reply_to` from an incoming `[[AION_SESSION_MESSAGE]]`). Provide either `to_role` or `to_conversation`, not both.
+    #[serde(default)]
+    to_conversation: Option<String>,
+    /// Concise, self-contained message body. Never use relative file paths across workspaces.
+    message: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SessionListParams {
+    /// Optional conversation name filter.
+    #[serde(default)]
+    q: Option<String>,
+    /// Optional project id filter.
+    #[serde(default)]
+    project_id: Option<String>,
+    /// Maximum targets to return (1..=50, default 20).
+    #[serde(default)]
+    limit: Option<u32>,
+    /// Opaque pagination cursor from an earlier page.
+    #[serde(default)]
+    cursor: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SessionSendParams {
+    /// Target conversation id (`id` from `[[AION_SESSIONS]]`, `thread_conversation_id` from `[[AION_ROLES]]`, or `reply_to`). Never pass a name or `*`.
+    to: String,
+    /// Message body the target conversation receives.
+    message: String,
+}
+
 #[tool_router]
 impl RoleStdioServer {
     #[tool(
@@ -290,6 +329,110 @@ impl RoleStdioServer {
         }
         self.post("/api/runtime/role/expand", body).await
     }
+
+    #[tool(
+        name = "role_peers",
+        description = "List other resident roles on the roster with their display name, charter summary, thread_conversation_id, and whether their thread is currently busy.",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn peers(&self) -> CallToolResult {
+        self.send(self.client.get(self.env.url("/api/runtime/role/peers")))
+            .await
+    }
+
+    #[tool(
+        name = "role_send",
+        description = "Deliver a message either to a peer resident role (`to_role`, lazily creating its thread when needed) or to an explicit conversation (`to_conversation`, e.g. `reply_to` from `[[AION_SESSION_MESSAGE]]`). Reach out only across charter boundaries or when asked via `@@@`; never send courtesy acknowledgements.",
+        annotations(destructive_hint = false, open_world_hint = false)
+    )]
+    async fn role_send(&self, Parameters(params): Parameters<RoleSendParams>) -> CallToolResult {
+        let mut body = json!({ "message": params.message });
+        if let Some(to_role) = params.to_role {
+            body["to_role"] = json!(to_role);
+        }
+        if let Some(to_conversation) = params.to_conversation {
+            body["to_conversation"] = json!(to_conversation);
+        }
+        self.post("/api/runtime/role/send", body).await
+    }
+
+    #[tool(
+        name = "session_list",
+        description = "List conversations this conversation may deliver a message to. Use only when the user named a target conversation in prose instead of selecting it with `@@` or `@@@`.",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn session_list(&self, Parameters(params): Parameters<SessionListParams>) -> CallToolResult {
+        let mut query: Vec<(&str, String)> = Vec::new();
+        if let Some(q) = params.q {
+            query.push(("q", q));
+        }
+        if let Some(project_id) = params.project_id {
+            query.push(("project_id", project_id));
+        }
+        if let Some(limit) = params.limit {
+            query.push(("limit", limit.to_string()));
+        }
+        if let Some(cursor) = params.cursor {
+            query.push(("cursor", cursor));
+        }
+        self.send(
+            self.client
+                .get(self.env.url("/api/runtime/session-messages/targets"))
+                .query(&query),
+        )
+        .await
+    }
+
+    #[tool(
+        name = "session_send_message",
+        description = "Deliver a message to another conversation (`to` = conversation id from `[[AION_SESSIONS]]`, `thread_conversation_id` from `[[AION_ROLES]]`, or `reply_to` from `[[AION_SESSION_MESSAGE]]`). Reaches the backend even inside sandboxes where shell networking is disabled.",
+        annotations(destructive_hint = false, open_world_hint = false)
+    )]
+    async fn session_send_message(&self, Parameters(params): Parameters<SessionSendParams>) -> CallToolResult {
+        self.post(
+            "/api/runtime/session-messages/send",
+            json!({ "to": params.to, "message": params.message }),
+        )
+        .await
+    }
+}
+
+fn select_exposed_tools(
+    all_tools: Vec<rmcp::model::Tool>,
+    role_denied_tools: Option<&[String]>,
+    can_send_cross_session: bool,
+) -> Vec<rmcp::model::Tool> {
+    match role_denied_tools {
+        Some(denied) => {
+            let role_send_denied = denied.iter().any(|t| t == aionui_api_types::ROLE_SEND_TOOL_NAME);
+            all_tools
+                .into_iter()
+                .filter(|tool| {
+                    let name = tool.name.as_ref();
+                    if name.starts_with("session_") {
+                        return false;
+                    }
+                    if name == "role_peers" {
+                        return can_send_cross_session;
+                    }
+                    if name == "role_send" {
+                        return can_send_cross_session && !role_send_denied;
+                    }
+                    true
+                })
+                .collect()
+        }
+        None => {
+            if !can_send_cross_session {
+                Vec::new()
+            } else {
+                all_tools
+                    .into_iter()
+                    .filter(|tool| tool.name.starts_with("session_"))
+                    .collect()
+            }
+        }
+    }
 }
 
 #[rmcp::tool_handler(router = Self::tool_router())]
@@ -299,25 +442,51 @@ impl rmcp::ServerHandler for RoleStdioServer {
         _request: Option<rmcp::model::PaginatedRequestParams>,
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<ListToolsResult, rmcp::ErrorData> {
-        let tools = if self.runs_as_a_role().await {
-            Self::tool_router().list_all()
-        } else {
-            Vec::new()
-        };
+        let (role_denied, can_send) = tokio::join!(self.role_denied_tools(), self.can_send_cross_session());
+        let tools = select_exposed_tools(Self::tool_router().list_all(), role_denied.as_deref(), can_send);
         Ok(ListToolsResult::with_all_items(tools))
     }
 }
 
 impl RoleStdioServer {
-    /// Whether this conversation runs as a resident role. A backend that cannot
-    /// say counts as no: tools that could only fail are left out.
-    async fn runs_as_a_role(&self) -> bool {
+    /// When this conversation runs as a resident role, returns `Some(denied_tools)`.
+    /// Otherwise `None`.
+    async fn role_denied_tools(&self) -> Option<Vec<String>> {
+        let headers = self.env.header_map().ok()?;
+        let response = self
+            .client
+            .get(self.env.url("/api/runtime/role"))
+            .headers(headers)
+            .send()
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let body: Value = response.json().await.ok()?;
+        let denied = body
+            .get("data")
+            .and_then(|d| d.get("denied_tools"))
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        Some(denied)
+    }
+
+    /// True when cross-session messaging is enabled and this conversation is
+    /// not team-owned (`GET /api/runtime/session-messages/targets?limit=1`).
+    async fn can_send_cross_session(&self) -> bool {
         let Ok(headers) = self.env.header_map() else {
             return false;
         };
         match self
             .client
-            .get(self.env.url("/api/runtime/role"))
+            .get(self.env.url("/api/runtime/session-messages/targets?limit=1"))
             .headers(headers)
             .send()
             .await
@@ -362,12 +531,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_role_command_that_writes_or_reads_is_a_tool() {
-        let names: Vec<String> = RoleStdioServer::tool_router()
-            .list_all()
-            .into_iter()
-            .map(|tool| tool.name.to_string())
-            .collect();
+    fn every_role_and_session_bridge_command_is_registered_and_filtered_by_context() {
+        let all = RoleStdioServer::tool_router().list_all();
+        let names: Vec<String> = all.iter().map(|tool| tool.name.to_string()).collect();
         for name in [
             "role_report",
             "role_follow_up",
@@ -377,10 +543,50 @@ mod tests {
             "role_show",
             "role_recall",
             "role_expand",
+            "role_peers",
+            "role_send",
+            "session_list",
+            "session_send_message",
         ] {
             assert!(names.iter().any(|n| n == name), "{name} missing from {names:?}");
         }
-        assert_eq!(names.len(), 8);
+        assert_eq!(names.len(), 12);
+
+        // Resident role outside team: gets all 10 role_* tools, no session_* duplicates.
+        let role_open: Vec<String> = select_exposed_tools(all.clone(), Some(&[]), true)
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        assert_eq!(role_open.len(), 10);
+        assert!(role_open.iter().any(|n| n == "role_peers"));
+        assert!(role_open.iter().any(|n| n == "role_send"));
+        assert!(role_open.iter().all(|n| !n.starts_with("session_")));
+
+        // Resident role with role_send denied: keeps role_peers, drops role_send.
+        let role_denied: Vec<String> = select_exposed_tools(all.clone(), Some(&["role_send".into()]), true)
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        assert!(role_denied.iter().any(|n| n == "role_peers"));
+        assert!(!role_denied.iter().any(|n| n == "role_send"));
+
+        // Resident role inside a team (`can_send_cross_session = false`): drops both role_peers and role_send.
+        let role_in_team: Vec<String> = select_exposed_tools(all.clone(), Some(&[]), false)
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        assert_eq!(role_in_team.len(), 8);
+        assert!(!role_in_team.iter().any(|n| n == "role_peers" || n == "role_send"));
+
+        // Ordinary non-team conversation: exposes session_list + session_send_message for offline sandboxes.
+        let ordinary_open: Vec<String> = select_exposed_tools(all.clone(), None, true)
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        assert_eq!(ordinary_open, vec!["session_list", "session_send_message"]);
+
+        // Ordinary conversation inside team or feature disabled: empty.
+        assert!(select_exposed_tools(all, None, false).is_empty());
     }
 
     #[test]

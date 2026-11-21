@@ -180,6 +180,16 @@ pub struct SessionRef {
     pub id: String,
 }
 
+/// A resident role the user referenced with `@@@` in the send box.
+///
+/// Carries the role's id (`assistant_id`). At the send boundary the backend
+/// resolves or lazily provisions the role's unique thread conversation and
+/// appends the `[[AION_ROLES]]` block to `content`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct RoleRef {
+    pub id: String,
+}
+
 /// Body for `POST /api/conversations/:id/messages`.
 ///
 /// `msg_id` is server-generated — clients must not provide one.
@@ -192,6 +202,11 @@ pub struct SendMessageRequest {
     /// boundary into the `[[AION_SESSIONS]]` block appended to `content`.
     #[serde(default)]
     pub sessions: Vec<SessionRef>,
+    /// Resident roles the user referenced with `@@@`. Resolved at the send
+    /// boundary (lazily creating the role's thread when needed) into the
+    /// `[[AION_ROLES]]` block appended to `content`.
+    #[serde(default)]
+    pub roles: Vec<RoleRef>,
     #[serde(default)]
     pub inject_skills: Vec<String>,
     #[serde(default)]
