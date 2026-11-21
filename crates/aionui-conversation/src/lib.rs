@@ -48,7 +48,8 @@ pub use runtime_routes::{ConversationRuntimeRouterState, conversation_runtime_ro
 pub use service::is_temp_session_workspace;
 pub use service::{
     ConversationAgentTurnOutcome, ConversationAgentTurnRequest, ConversationAgentTurnStarted,
-    ConversationAgentTurnStartedCallback, ConversationAgentTurnStatus, ConversationRolePort, ConversationService,
+    ConversationAgentTurnStartedCallback, ConversationAgentTurnStatus, ConversationKeeperBrief, ConversationRolePort,
+    ConversationService,
 };
 pub use state::ConversationRouterState;
 pub use turn_orchestrator::ASK_FIRST_RUNTIME_MODE;

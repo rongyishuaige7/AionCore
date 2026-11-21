@@ -18,11 +18,13 @@
 //! - `POST /api/roles/{id}/dream` — run S5 dreamer maintenance on demand.
 //! - `DELETE /api/roles/{id}` — dismiss the role (and pause/clean its cron jobs).
 //! - `GET /api/roles/keepers` — every kept project and the role keeping it.
+//! - `GET /api/roles/keepers/{project_id}/brief` — what the project's keeper would hand a new conversation.
 //! - `PUT /api/roles/{id}/projects` — the projects the role keeps (agents may only let go).
 
 use aionui_api_types::{
-    ApiResponse, RoleDreamResponse, RoleKeepersResponse, RoleListResponse, RoleProposalChange, RoleResponse,
-    RoleRevertRequest, RoleTimelineResponse, SetRoleProjectsRequest, UpdateRoleMemoryRequest, UpsertRoleRequest,
+    ApiResponse, KeeperBriefResponse, RoleDreamResponse, RoleKeepersResponse, RoleListResponse, RoleProposalChange,
+    RoleResponse, RoleRevertRequest, RoleTimelineResponse, SetRoleProjectsRequest, UpdateRoleMemoryRequest,
+    UpsertRoleRequest,
 };
 use aionui_common::{ApiError, AuthenticatedUserId, RuntimeHelperCaller, now_ms};
 use axum::extract::{Extension, Path, State};
@@ -40,6 +42,7 @@ pub fn role_routes(state: RoleRouterState) -> Router {
     Router::new()
         .route("/api/roles", get(list_roles))
         .route("/api/roles/keepers", get(list_keepers))
+        .route("/api/roles/keepers/{project_id}/brief", get(get_keeper_brief))
         .route("/api/roles/{id}", get(get_role).put(put_role).delete(delete_role))
         .route("/api/roles/{id}/memory", put(put_memory))
         .route("/api/roles/{id}/projects", put(put_projects))
@@ -66,6 +69,21 @@ async fn list_keepers(
 ) -> Result<Json<ApiResponse<RoleKeepersResponse>>, ApiError> {
     let keepers = state.service.keepers().await.map_err(to_api_error)?;
     Ok(Json(ApiResponse::ok(RoleKeepersResponse { keepers })))
+}
+
+/// What the project's keeper would hand a conversation opened there now,
+/// before anything is written: the new-conversation page shows it ahead of
+/// the first message.
+async fn get_keeper_brief(
+    State(state): State<RoleRouterState>,
+    Path(project_id): Path<String>,
+) -> Result<Json<ApiResponse<KeeperBriefResponse>>, ApiError> {
+    let brief = state
+        .service
+        .keeper_brief(&project_id, "", None)
+        .await
+        .map_err(to_api_error)?;
+    Ok(Json(ApiResponse::ok(KeeperBriefResponse { brief })))
 }
 
 /// Set the projects a role keeps. Only the user hands a role a project; an

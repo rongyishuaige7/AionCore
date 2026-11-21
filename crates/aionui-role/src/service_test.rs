@@ -1597,3 +1597,54 @@ async fn when_a_revert_brings_back_an_old_claim_the_later_claim_keeps_the_projec
     assert_eq!(keepers.len(), 1);
     assert_eq!(keepers[0].role_id, "seo");
 }
+
+#[tokio::test]
+async fn a_kept_project_is_briefed_by_its_keeper_but_never_the_keepers_own_conversation() {
+    let root = tempfile::tempdir().unwrap();
+    let service = service(&root);
+    service
+        .upsert("seo", request("Watches search traffic.\n\nNever edits prices.", &[]))
+        .await
+        .unwrap();
+    assert_eq!(service.keeper_brief("project_a", "", None).await.unwrap(), None);
+
+    service
+        .set_projects("seo", claims(&[("project_a", "yipan-store")]), 1_000)
+        .await
+        .unwrap();
+    // A keeper that knows nothing of the project hands nothing over.
+    assert_eq!(service.keeper_brief("project_a", "", None).await.unwrap(), None);
+
+    service
+        .remember("seo", "robots.txt on yipan-store blocks /cart", "2026-11-16")
+        .await
+        .unwrap();
+    let brief = service
+        .keeper_brief("project_a", "fix robots", None)
+        .await
+        .unwrap()
+        .expect("a brief");
+    assert_eq!(brief.role_id, "seo");
+    assert_eq!(brief.project_name, "yipan-store");
+    assert_eq!(brief.charter, "Watches search traffic.");
+    assert_eq!(brief.memory, vec!["2026-11-16 robots.txt on yipan-store blocks /cart"]);
+    assert_eq!(brief.last_stop, None);
+
+    // The keeper's own conversations open with its whole standing section instead.
+    assert_eq!(service.keeper_brief("project_a", "", Some("seo")).await.unwrap(), None);
+    // An id no project could have is no project.
+    assert_eq!(service.keeper_brief("../seo", "", None).await.unwrap(), None);
+
+    let ledger = root.path().join("roles/seo/projects");
+    std::fs::create_dir_all(&ledger).unwrap();
+    std::fs::write(
+        ledger.join("project_a.json"),
+        r#"{"last_stop":{"text":"sitemap half submitted","conversation_id":"c9","at":5}}"#,
+    )
+    .unwrap();
+    let brief = service.keeper_brief("project_a", "", None).await.unwrap().unwrap();
+    assert_eq!(
+        brief.last_stop.map(|stop| (stop.text, stop.conversation_id)),
+        Some(("sitemap half submitted".to_owned(), "c9".to_owned()))
+    );
+}

@@ -195,6 +195,9 @@ pub enum MessageType {
     CronTrigger,
     /// What a resident role's run elsewhere told the user, left in the role's thread.
     RoleReport,
+    /// What a project's keeper handed a conversation in the project before its
+    /// first message. Shown to the user; the agent got it with that message.
+    KeeperBrief,
 }
 
 /// Display position of a message in the chat UI.

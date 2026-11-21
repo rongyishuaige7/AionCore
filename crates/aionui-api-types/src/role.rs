@@ -97,6 +97,63 @@ pub struct RoleKeepersResponse {
     pub keepers: Vec<RoleKeeper>,
 }
 
+/// Where work in a kept project last stopped, as its keeper took it in from
+/// the conversation that left it there.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeeperLastStop {
+    pub text: String,
+    /// The conversation it stopped in; empty when that is not known.
+    #[serde(default)]
+    pub conversation_id: String,
+    pub at: TimestampMs,
+}
+
+/// One playbook lesson handed over in a brief, by its playbook id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeeperBriefLesson {
+    pub id: String,
+    pub text: String,
+}
+
+/// One task under way handed over in a brief.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeeperBriefTask {
+    pub task: String,
+    pub state: String,
+}
+
+/// What a project's keeper hands a conversation started in the project,
+/// before its first message. The agent reads it as background; the user sees
+/// the same content as a card in the conversation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeeperBrief {
+    pub role_id: String,
+    pub project_id: String,
+    #[serde(default)]
+    pub project_name: String,
+    /// The first paragraph of the keeper's charter.
+    #[serde(default)]
+    pub charter: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_stop: Option<KeeperLastStop>,
+    #[serde(default)]
+    pub playbook: Vec<KeeperBriefLesson>,
+    #[serde(default)]
+    pub progress: Vec<KeeperBriefTask>,
+    /// Memory notes, most relevant first, as written (day included).
+    #[serde(default)]
+    pub memory: Vec<String>,
+}
+
+/// `GET /api/roles/keepers/{project_id}/brief` — what the project's keeper
+/// would hand a conversation opened there now; `None` when the project has no
+/// keeper, or its keeper has nothing to hand over yet.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeeperBriefResponse {
+    #[serde(default)]
+    pub brief: Option<KeeperBrief>,
+}
+
 /// How a run nobody watched ended, as the role itself declared it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

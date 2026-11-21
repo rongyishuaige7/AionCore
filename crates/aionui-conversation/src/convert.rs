@@ -464,6 +464,25 @@ mod tests {
     }
 
     #[test]
+    fn a_keeper_brief_left_before_the_first_reply_reads_back_as_a_message() {
+        let row = MessageRow {
+            id: "m2".into(),
+            conversation_id: "c1".into(),
+            msg_id: None,
+            r#type: "keeper_brief".into(),
+            content: json!({ "role_id": "seo", "memory": ["robots.txt blocks /cart"] }).to_string(),
+            position: Some("center".into()),
+            status: Some("finish".into()),
+            hidden: false,
+            created_at: 2,
+            backend_turn_id: None,
+        };
+        let message = row_to_message_response(row).unwrap();
+        assert_eq!(message.r#type, MessageType::KeeperBrief);
+        assert_eq!(message.content["role_id"], json!("seo"));
+    }
+
+    #[test]
     fn string_to_enum_invalid() {
         let err = string_to_enum::<AgentType>("not_valid").unwrap_err();
         assert!(matches!(err, ConversationError::Internal { .. }));

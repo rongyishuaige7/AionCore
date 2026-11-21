@@ -6,13 +6,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use aionui_api_types::{
-    PlaybookDeltaOp, RoleCommit, RoleExpandRequest, RoleExpandResponse, RoleKeeper, RoleKeptProject, RoleProgress,
-    RoleProjectClaim, RoleProposal, RoleProposalChange, RoleRecallRequest, RoleRecallResponse, RoleReport,
-    RoleReportOutcome, RoleResponse, SetRoleProjectsRequest, TeamToolName, UpsertRoleRequest,
+    KeeperBrief, PlaybookDeltaOp, RoleCommit, RoleExpandRequest, RoleExpandResponse, RoleKeeper, RoleKeptProject,
+    RoleProgress, RoleProjectClaim, RoleProposal, RoleProposalChange, RoleRecallRequest, RoleRecallResponse,
+    RoleReport, RoleReportOutcome, RoleResponse, SetRoleProjectsRequest, TeamToolName, UpsertRoleRequest,
 };
 use aionui_common::now_ms;
 use tokio::sync::Mutex;
 
+use crate::brief::{self, BriefSources};
 use crate::error::RoleError;
 use crate::git::{self, BOSS_TRACKED_PATHS, ROLE_TRACKED_PATHS};
 use crate::playbook::{
@@ -1108,6 +1109,64 @@ impl RoleService {
         Ok(keepers)
     }
 
+    /// What the keeper of `project_id` hands a conversation opened there,
+    /// whose first message is `opening` (empty for a preview). `None` when the
+    /// project has no keeper, when the keeper is `skip_role` (the conversation
+    /// is the keeper's own, which opens with its whole standing section), or
+    /// when the keeper has nothing on the project to hand over yet.
+    pub async fn keeper_brief(
+        &self,
+        project_id: &str,
+        opening: &str,
+        skip_role: Option<&str>,
+    ) -> Result<Option<KeeperBrief>, RoleError> {
+        if !valid_project_id(project_id) {
+            return Ok(None);
+        }
+        let Some(keeper) = self
+            .keepers()
+            .await?
+            .into_iter()
+            .find(|keeper| keeper.project_id == project_id)
+        else {
+            return Ok(None);
+        };
+        if skip_role == Some(keeper.role_id.as_str()) {
+            return Ok(None);
+        }
+        let Some(role) = self.find(&keeper.role_id).await? else {
+            return Ok(None);
+        };
+        let ledger = self.store.read_project_ledger(&role.id, project_id).await?;
+        let project_name = role
+            .projects
+            .iter()
+            .find(|kept| kept.project_id == project_id)
+            .map(|kept| kept.name.clone())
+            .unwrap_or_default();
+        let other_projects: Vec<String> = role
+            .projects
+            .iter()
+            .filter(|kept| kept.project_id != project_id)
+            .map(|kept| kept.name.clone())
+            .collect();
+        let brief = brief::compose(
+            &BriefSources {
+                role_id: &role.id,
+                project_id,
+                project_name: &project_name,
+                other_projects: &other_projects,
+                charter: &role.charter,
+                memory: &role.memory,
+                playbook: &role.playbook,
+                progress: &role.progress,
+                last_stop: ledger.and_then(|ledger| ledger.last_stop),
+            },
+            opening,
+        );
+        Ok(brief::has_content(&brief).then_some(brief))
+    }
+
     /// Replace the projects the role keeps, in the order given. A project the
     /// role already kept keeps its `claimed_at`. A project another role keeps
     /// is refused with [`RoleError::Conflict`] unless `transfer` is set; then
@@ -1294,18 +1353,23 @@ fn kept_label(kept: &RoleKeptProject) -> String {
     }
 }
 
+/// A project id the backend could have issued (`project_<uuid>`): a plain
+/// token, safe as a file name.
+fn valid_project_id(project_id: &str) -> bool {
+    !project_id.is_empty()
+        && project_id.len() <= MAX_PROJECT_ID_LEN
+        && project_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+}
+
 /// Check project ids (the backend issues `project_<uuid>`), flatten names to
 /// one short line, and drop repeats, keeping the first.
 fn normalize_project_claims(claims: &[RoleProjectClaim]) -> Result<Vec<RoleProjectClaim>, RoleError> {
     let mut normalized: Vec<RoleProjectClaim> = Vec::with_capacity(claims.len());
     for claim in claims {
         let project_id = claim.project_id.trim();
-        let valid = !project_id.is_empty()
-            && project_id.len() <= MAX_PROJECT_ID_LEN
-            && project_id
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'));
-        if !valid {
+        if !valid_project_id(project_id) {
             return Err(RoleError::InvalidRequest(format!(
                 "invalid project id: {}",
                 project_id.chars().take(MAX_PROJECT_ID_LEN).collect::<String>()

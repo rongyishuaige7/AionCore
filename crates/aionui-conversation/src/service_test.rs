@@ -63,6 +63,9 @@ mod runtime_create_test;
 #[path = "service_test/project_move_test.rs"]
 mod project_move_test;
 
+#[path = "service_test/keeper_brief_test.rs"]
+mod keeper_brief_test;
+
 #[derive(Clone, Debug)]
 struct RecordedViewSync {
     user_id: String,
@@ -548,6 +551,22 @@ impl IConversationRepository for MockRepo {
         let mut messages = self.messages.lock().unwrap();
         messages.push(message.clone());
         Ok(())
+    }
+
+    async fn latest_message_of_type(
+        &self,
+        _user_id: &str,
+        conversation_id: &str,
+        message_type: &str,
+    ) -> Result<Option<MessageRow>, aionui_db::DbError> {
+        Ok(self
+            .messages
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|message| message.conversation_id == conversation_id && message.r#type == message_type)
+            .max_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)))
+            .cloned())
     }
 
     async fn update_message(

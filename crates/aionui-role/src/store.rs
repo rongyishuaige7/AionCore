@@ -8,7 +8,7 @@
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-use aionui_api_types::{RoleKeptProject, RoleProposal, RoleReport};
+use aionui_api_types::{KeeperLastStop, RoleKeptProject, RoleProposal, RoleReport};
 use serde::{Deserialize, Serialize};
 
 use crate::error::RoleError;
@@ -31,6 +31,7 @@ const PROGRESS_ARCHIVE_DIR: &str = ".archive";
 const PROGRESS_EXTENSION: &str = "md";
 const REPORTED_FILE: &str = "reported.jsonl";
 const THREAD_FILE: &str = "thread.json";
+const PROJECTS_DIR: &str = "projects";
 const THREAD_LEAVES_DIR: &str = "thread-leaves";
 const CONDENSED_DIR: &str = "condensed";
 const LEAF_EXTENSION: &str = "md";
@@ -78,6 +79,15 @@ pub(crate) struct ThreadRecord {
     /// milliseconds since the epoch; 0 when it never has.
     #[serde(default)]
     pub rotated_at: i64,
+}
+
+/// Contents of `projects/<project_id>.json`: what the role keeps of one
+/// project it keeps, beyond its memory. Written when a conversation in the
+/// project is debriefed; kept out of the role's git history.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ProjectLedger {
+    #[serde(default)]
+    pub last_stop: Option<KeeperLastStop>,
 }
 
 /// A message in a thread, by the keys messages are ordered on.
@@ -206,6 +216,24 @@ impl RoleStore {
         serde_json::from_str(&raw)
             .map(Some)
             .map_err(|error| RoleError::Corrupt(format!("{id} thread: {error}")))
+    }
+
+    /// The ledger of one project the role keeps; `None` until anything was
+    /// written to it. `project_id` has been checked to be a plain token.
+    pub(crate) async fn read_project_ledger(
+        &self,
+        id: &str,
+        project_id: &str,
+    ) -> Result<Option<ProjectLedger>, RoleError> {
+        let path = self.role_dir(id).join(PROJECTS_DIR).join(format!("{project_id}.json"));
+        let raw = match tokio::fs::read_to_string(path).await {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        serde_json::from_str(&raw)
+            .map(Some)
+            .map_err(|error| RoleError::Corrupt(format!("{id} project {project_id}: {error}")))
     }
 
     pub(crate) async fn write_thread(&self, id: &str, record: &ThreadRecord) -> Result<(), RoleError> {

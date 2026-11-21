@@ -803,6 +803,39 @@ impl aionui_conversation::ConversationRolePort for RoleServiceConversationPort {
         }
     }
 
+    async fn keeper_brief(
+        &self,
+        project_id: &str,
+        opening: &str,
+        assistant_id: Option<&str>,
+    ) -> Option<aionui_conversation::ConversationKeeperBrief> {
+        let brief = match self.roles.service.keeper_brief(project_id, opening, assistant_id).await {
+            Ok(brief) => brief?,
+            Err(error) => {
+                // The conversation goes ahead unbriefed rather than not at all.
+                tracing::warn!(project_id, error = %error, "conversation: keeper brief unavailable");
+                return None;
+            }
+        };
+        let day = brief
+            .last_stop
+            .as_ref()
+            .map(|stop| local_day(stop.at))
+            .unwrap_or_default();
+        let card = match serde_json::to_value(&brief) {
+            Ok(card) => card,
+            Err(error) => {
+                tracing::warn!(project_id, error = %error, "conversation: keeper brief not shown");
+                return None;
+            }
+        };
+        Some(aionui_conversation::ConversationKeeperBrief {
+            role_id: brief.role_id.clone(),
+            text: aionui_role::render_keeper_brief(&brief, "", &day),
+            card,
+        })
+    }
+
     async fn thread_news(&self, user_id: &str, assistant_id: &str, conversation_id: &str) -> Option<String> {
         let roles = &self.roles.service;
         let recorded = match roles.thread(assistant_id).await {

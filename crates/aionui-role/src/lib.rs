@@ -15,12 +15,14 @@
 //! roles/<assistant_id>/memory/progress/<task>.md    where one task under way stands
 //! roles/<assistant_id>/thread.json                  the one conversation the user keeps with it
 //! roles/<assistant_id>/thread-leaves/<conv>/*.md    summaries of that conversation, oldest first
+//! roles/<assistant_id>/projects/<project>.json     where work in a kept project last stopped
 //! roles/recall.db                                   rebuildable FTS5 index over threads, runs & leaves
 //! ```
 //!
 //! The team runtime consumes roles through `aionui_team::TeamRolePort`; the
 //! composition layer adapts [`RoleService`] to that port.
 
+mod brief;
 mod error;
 mod git;
 mod playbook;
@@ -32,6 +34,7 @@ mod store;
 
 pub mod routes;
 
+pub use brief::render_keeper_brief;
 pub use error::RoleError;
 pub use playbook::{
     MAX_BOSS_ITEMS, MAX_PLAYBOOK_ITEM_CHARS, MAX_PLAYBOOK_ITEMS, PLAYBOOK_ARCHIVE_IDLE_DAYS, PLAYBOOK_GRACE_DAYS,

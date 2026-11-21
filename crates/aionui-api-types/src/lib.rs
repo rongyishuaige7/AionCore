@@ -162,7 +162,8 @@ pub use remote_agent::{
 };
 pub use response::{ApiResponse, ErrorResponse};
 pub use role::{
-    PlaybookDeltaOp, ROLE_CLI_SCHEMA_VERSION, RoleCliEnvelope, RoleCliError, RoleCliErrorCode, RoleCliMeta, RoleCommit,
+    KeeperBrief, KeeperBriefLesson, KeeperBriefResponse, KeeperBriefTask, KeeperLastStop, PlaybookDeltaOp,
+    ROLE_CLI_SCHEMA_VERSION, RoleCliEnvelope, RoleCliError, RoleCliErrorCode, RoleCliMeta, RoleCommit,
     RoleCurateRequest, RoleCurateResponse, RoleDreamResponse, RoleExpandMessage, RoleExpandRequest, RoleExpandResponse,
     RoleFollowUpRequest, RoleFollowUpResponse, RoleKeeper, RoleKeepersResponse, RoleKeptProject, RoleListResponse,
     RolePlaybookEntry, RoleProgress, RoleProgressRequest, RoleProgressResponse, RoleProjectClaim, RoleProposal,

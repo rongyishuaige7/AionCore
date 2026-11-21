@@ -159,6 +159,19 @@ pub trait ConversationRolePort: Send + Sync {
         None
     }
 
+    /// What the keeper of `project_id` hands a conversation opened there,
+    /// ahead of its first message `opening`. `None` when the project has no
+    /// keeper, when the conversation's assistant `assistant_id` is that keeper,
+    /// or when the keeper has nothing on the project to hand over.
+    async fn keeper_brief(
+        &self,
+        _project_id: &str,
+        _opening: &str,
+        _assistant_id: Option<&str>,
+    ) -> Option<ConversationKeeperBrief> {
+        None
+    }
+
     /// Where the summaries of the role's thread stand, when `conversation_id`
     /// is the thread of the role `assistant_id`; `None` for any other
     /// conversation.
@@ -224,6 +237,29 @@ pub trait ConversationRolePort: Send + Sync {
         false
     }
 }
+
+/// What a project's keeper hands a conversation in the project before its
+/// first message.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConversationKeeperBrief {
+    pub role_id: String,
+    /// What the agent reads ahead of the message.
+    pub text: String,
+    /// The same brief as the card the user sees in the conversation.
+    pub card: serde_json::Value,
+}
+
+/// `extra` key a conversation is created with when the user turned the
+/// keeper's brief off for it.
+const KEEPER_BRIEF_OFF_KEY: &str = "keeper_brief_off";
+/// `extra` keys a briefed conversation carries: when, and by which role.
+const KEEPER_BRIEFED_AT_KEY: &str = "keeper_briefed_at";
+const KEEPER_BRIEF_ROLE_KEY: &str = "keeper_brief_role";
+/// Message type of the brief's card.
+const KEEPER_BRIEF_MESSAGE: &str = "keeper_brief";
+/// Event the card arrives on: a card is no turn, so it stays off the stream
+/// the conversation's turn tracking reads.
+const KEEPER_BRIEF_EVENT: &str = "role.keeper_brief";
 
 /// `extra` keys of a conversation the user opens beside something else: never
 /// a role's thread.
@@ -982,6 +1018,116 @@ impl ConversationService {
             .flatten()
             .collect::<Vec<_>>()
             .join("\n\n")
+    }
+
+    /// Whether the turn about to start may be handed its project keeper's
+    /// brief: the conversation is in a project, is the user's own (not a
+    /// schedule's, a team's, a companion or a jot trial), was not created with
+    /// the brief turned off, has not been briefed, and has no earlier text, so
+    /// this is its first message. Checked before that message is stored.
+    async fn keeper_brief_due(&self, user_id: &str, row: &ConversationRow) -> bool {
+        if row.project_id.as_deref().is_none_or(str::is_empty) || self.role_port().is_none() {
+            return false;
+        }
+        let extra = serde_json::from_str::<serde_json::Value>(&row.extra).unwrap_or_default();
+        let aside = THREAD_ASIDE_KEYS
+            .iter()
+            .any(|key| extra.get(*key).is_some_and(|v| !v.is_null()));
+        if put_to_work(&extra)
+            || aside
+            || extra.get(KEEPER_BRIEF_OFF_KEY).and_then(serde_json::Value::as_bool) == Some(true)
+            || extra.get(KEEPER_BRIEFED_AT_KEY).is_some_and(|v| !v.is_null())
+        {
+            return false;
+        }
+        match self
+            .conversation_repo
+            .latest_message_of_type(user_id, &row.id, "text")
+            .await
+        {
+            Ok(earlier) => earlier.is_none(),
+            Err(error) => {
+                warn!(conversation_id = %row.id, error = %error, "keeper brief skipped: history unreadable");
+                false
+            }
+        }
+    }
+
+    /// `content` preceded by the brief the conversation's project keeper hands
+    /// it, when it has one. The brief is also left in the conversation as a
+    /// card after the user's message, and the conversation is marked briefed
+    /// so no later turn is briefed again. Best-effort: any failure leaves the
+    /// turn as the user wrote it.
+    async fn with_keeper_brief(
+        &self,
+        user_id: &str,
+        row: &mut ConversationRow,
+        opening: &str,
+        user_created_at: i64,
+        content: String,
+    ) -> String {
+        let (Some(port), Some(project_id)) = (self.role_port(), row.project_id.clone()) else {
+            return content;
+        };
+        let assistant_id = match self.conversation_repo.get_assistant_snapshot(user_id, &row.id).await {
+            Ok(snapshot) => snapshot.map(|snapshot| snapshot.assistant_id),
+            Err(error) => {
+                warn!(conversation_id = %row.id, error = %error, "keeper brief skipped: assistant lookup failed");
+                return content;
+            }
+        };
+        let Some(brief) = port.keeper_brief(&project_id, opening, assistant_id.as_deref()).await else {
+            return content;
+        };
+
+        let now = now_ms();
+        let mut extra = serde_json::from_str::<serde_json::Value>(&row.extra).unwrap_or_default();
+        if let Some(object) = extra.as_object_mut() {
+            object.insert(KEEPER_BRIEFED_AT_KEY.into(), serde_json::json!(now));
+            object.insert(KEEPER_BRIEF_ROLE_KEY.into(), serde_json::json!(brief.role_id));
+        }
+        let update = ConversationRowUpdate {
+            extra: Some(extra.to_string()),
+            ..Default::default()
+        };
+        if let Err(error) = self.conversation_repo.update(user_id, &row.id, &update).await {
+            warn!(conversation_id = %row.id, error = %ErrorChain(&error), "keeper brief skipped: conversation not marked");
+            return content;
+        }
+        row.extra = extra.to_string();
+
+        // Right after the user's message, so the card sits between it and the reply.
+        let card = MessageRow {
+            id: Self::mint_msg_id(),
+            conversation_id: row.id.clone(),
+            msg_id: None,
+            r#type: KEEPER_BRIEF_MESSAGE.into(),
+            content: brief.card.to_string(),
+            position: Some("center".into()),
+            status: Some("finish".into()),
+            hidden: false,
+            created_at: user_created_at + 1,
+            backend_turn_id: None,
+        };
+        match self.conversation_repo.insert_message(user_id, &card).await {
+            Ok(()) => self.broadcaster.broadcast(WebSocketMessage::new(
+                KEEPER_BRIEF_EVENT,
+                serde_json::json!({
+                    "user_id": user_id,
+                    "id": card.id,
+                    "conversation_id": row.id,
+                    "type": card.r#type,
+                    "content": brief.card,
+                    "position": card.position,
+                    "status": card.status,
+                    "created_at": card.created_at,
+                }),
+            )),
+            // The agent is briefed all the same; only the card is missing.
+            Err(error) => warn!(conversation_id = %row.id, error = %ErrorChain(&error), "keeper brief: card not left"),
+        }
+        info!(conversation_id = %row.id, role_id = %brief.role_id, project_id = %project_id, "turn opens with its project keeper's brief");
+        format!("{}\n\n{content}", brief.text)
     }
 
     fn assistant_dispatcher(&self) -> Option<Arc<dyn AssistantRuleDispatcher>> {
@@ -4164,6 +4310,9 @@ impl ConversationService {
         // A mid-turn TurnEnded fallback already persisted + broadcast the
         // message — reuse its id instead of writing a duplicate row.
         let was_fallback = fallback_user_msg.is_some();
+        // Asked before the message is stored: only a conversation's first
+        // message is handed the brief.
+        let keeper_due = !was_fallback && self.keeper_brief_due(user_id, &row).await;
         let user_msg_id = fallback_user_msg.unwrap_or_else(Self::mint_msg_id);
         let user_msg = aionui_db::models::MessageRow {
             id: user_msg_id.clone(),
@@ -4216,9 +4365,17 @@ impl ConversationService {
         // A role's thread may move to a fresh session here, which clears the
         // resume anchor and refreshes the opening rules the options read.
         let mut row = row;
+        let opening = keeper_due.then(|| resolved.content.clone());
         let content = self
             .with_thread_news(user_id, &mut row, &user_msg_id, resolved.content)
             .await;
+        let content = match opening {
+            Some(opening) => {
+                self.with_keeper_brief(user_id, &mut row, &opening, user_msg.created_at, content)
+                    .await
+            }
+            None => content,
+        };
 
         // Build task options from conversation row
         let mut build_opts = match self.build_task_options(&row).await {
