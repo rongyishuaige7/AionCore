@@ -1079,11 +1079,18 @@ impl SessionBackend for AntigravitySessionBackend {
     }
 
     fn capabilities(&self) -> Capabilities {
+        let has_deferred_mode = self.deferred_mode_confirm.try_lock().is_ok_and(|g| g.is_some());
+        let current_mode = if has_deferred_mode {
+            self.config.mode.clone()
+        } else {
+            self.effective_mode()
+        }
+        .or_else(|| Some("default".to_owned()));
         Capabilities {
             available_models: self.models.read().map(|m| m.clone()).unwrap_or_default(),
             available_modes: antigravity_modes(),
             current_model: self.requested_model(),
-            current_mode: self.config.mode.clone(),
+            current_mode,
             slash_commands: self.slash_commands.clone(),
             // agy runs one process per turn and `--mode` is a spawn flag, so a turn
             // already running keeps the mode it was spawned with; the switch reaches agy
@@ -1900,6 +1907,53 @@ mod tests {
             vec!["default", "accept-edits", "plan", "yolo"]
         );
         assert_eq!(caps.current_mode.as_deref(), Some("plan"));
+    }
+
+    #[tokio::test]
+    async fn capabilities_report_default_when_mode_unset_and_respect_deferred_switch() {
+        let (event_tx, _) = broadcast::channel(16);
+        let backend = AntigravitySessionBackend {
+            session_id: "conv-default".into(),
+            models: Arc::new(std::sync::RwLock::new(Vec::new())),
+            slash_commands: Vec::new(),
+            mode_override: Arc::new(std::sync::RwLock::new(None)),
+            model_override: Arc::new(std::sync::RwLock::new(None)),
+            config: SessionConfig {
+                cwd: Some("/w".into()),
+                mode: None,
+                ..Default::default()
+            },
+            spawner: Arc::new(FakeSpawner::new()),
+            event_tx,
+            turn_gen: AtomicU64::new(0),
+            anchor: Arc::new(Mutex::new(None)),
+            current: Arc::new(Mutex::new(None)),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            permission_seq: AtomicU64::new(0),
+            weak_self: std::sync::OnceLock::new(),
+            in_flight: Arc::new(AtomicBool::new(false)),
+            turn_started_hooked: Arc::new(AtomicBool::new(false)),
+            deferred_mode_confirm: Arc::new(Mutex::new(None)),
+            queued: Arc::new(Mutex::new(VecDeque::new())),
+        };
+
+        assert!(!backend.is_full_auto());
+        assert_eq!(backend.capabilities().current_mode.as_deref(), Some("default"));
+
+        backend
+            .dispatch(Command::SetMode { mode: "yolo".into() })
+            .await
+            .unwrap();
+        assert!(backend.is_full_auto());
+        assert_eq!(backend.capabilities().current_mode.as_deref(), Some("yolo"));
+
+        // Simulate an unhooked in-flight turn where tightening to `default` is deferred:
+        // capabilities() must still report the governing `config.mode` until turn end.
+        backend.in_flight.store(true, Ordering::SeqCst);
+        backend.turn_started_hooked.store(false, Ordering::SeqCst);
+        *backend.mode_override.write().unwrap() = Some("plan".into());
+        *backend.deferred_mode_confirm.lock().await = Some("plan".into());
+        assert_eq!(backend.capabilities().current_mode.as_deref(), Some("default"));
     }
 
     #[test]

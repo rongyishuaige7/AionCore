@@ -15,11 +15,12 @@ use aionui_api_types::{
     ConfigOptionConfirmation, GetConfigOptionsResponse, SetConfigOptionRequest, SetConfigOptionResponse,
     SideQuestionRequest, SideQuestionResponse, SlashCommandItem, WorkspaceBrowseQuery, WorkspaceEntry,
 };
-use aionui_common::{AgentKillReason, ErrorChain};
+use aionui_common::{AgentKillReason, AgentType, ErrorChain};
 use aionui_db::SaveRuntimeStateParams;
 use tracing::warn;
 
 use crate::ConversationError;
+use crate::convert::string_to_enum;
 use crate::service::{AssistantRuntimePreferenceUpdate, ConversationService};
 
 const MAX_DIR_DEPTH: usize = 10;
@@ -221,7 +222,7 @@ impl ConversationService {
                     permission: Some(req.value.as_str()),
                     thought_level: None,
                 }),
-                "thought_level" | "reasoning_effort" => Some(AssistantRuntimePreferenceUpdate {
+                "thought_level" | "reasoning_effort" | "effort" => Some(AssistantRuntimePreferenceUpdate {
                     model: None,
                     permission: None,
                     thought_level: Some(req.value.as_str()),
@@ -229,6 +230,17 @@ impl ConversationService {
                 _ => None,
             };
             if let Some(updates) = updates {
+                if let Err(err) = self
+                    .persist_runtime_config_to_conversation(user_id, conversation_id, updates)
+                    .await
+                {
+                    warn!(
+                        conversation_id,
+                        option_id,
+                        error = %ErrorChain(&err),
+                        "Failed to mirror runtime config option onto conversation extra",
+                    );
+                }
                 if let Err(err) = self
                     .persist_runtime_assistant_snapshot(user_id, conversation_id, updates)
                     .await
@@ -255,6 +267,47 @@ impl ConversationService {
         }
 
         Ok(response)
+    }
+
+    async fn persist_runtime_config_to_conversation(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        updates: AssistantRuntimePreferenceUpdate<'_>,
+    ) -> Result<(), ConversationError> {
+        let Some(row) = self.conversation_repo().get(user_id, conversation_id).await? else {
+            return Ok(());
+        };
+        let agent_type: AgentType = string_to_enum(&row.r#type)?;
+        let mut patch = serde_json::Map::new();
+
+        if let Some(mode) = updates.permission.map(str::trim).filter(|value| !value.is_empty()) {
+            patch.insert("session_mode".to_owned(), serde_json::Value::String(mode.to_owned()));
+            if matches!(agent_type, AgentType::Acp | AgentType::Antigravity) {
+                patch.insert("current_mode_id".to_owned(), serde_json::Value::String(mode.to_owned()));
+                let _ = self.save_acp_runtime_mode(user_id, conversation_id, mode).await;
+            }
+        }
+        if let Some(model) = updates.model.map(str::trim).filter(|value| !value.is_empty())
+            && agent_type != AgentType::Aionrs
+        {
+            patch.insert(
+                "current_model_id".to_owned(),
+                serde_json::Value::String(model.to_owned()),
+            );
+        }
+        if let Some(thought) = updates.thought_level.map(str::trim).filter(|value| !value.is_empty()) {
+            patch.insert(
+                "thought_level".to_owned(),
+                serde_json::Value::String(thought.to_owned()),
+            );
+        }
+
+        if !patch.is_empty() {
+            self.update_extra(user_id, conversation_id, serde_json::Value::Object(patch))
+                .await?;
+        }
+        Ok(())
     }
 
     // ── Usage / Slash commands ──────────────────────────────────────

@@ -1138,6 +1138,13 @@ impl aionui_conversation::ConversationRolePort for RoleServiceConversationPort {
             _ => true,
         }
     }
+
+    async fn asks_when_scheduled(&self, assistant_id: &str) -> bool {
+        match self.roles.service.find(assistant_id).await {
+            Ok(Some(role)) => role.asks_when_scheduled,
+            _ => true,
+        }
+    }
 }
 
 struct RoleGovernanceAdapter {

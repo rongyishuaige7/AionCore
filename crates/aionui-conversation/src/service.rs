@@ -37,7 +37,8 @@ use aionui_common::{
     generate_short_id, now_ms, validate_workspace_path_availability,
 };
 use aionui_db::models::{
-    AssistantDefinitionRow, ConversationAssistantSnapshotRow, ConversationRow, McpServerRow, MessageRow,
+    AgentMetadataRow, AssistantDefinitionRow, ConversationAssistantSnapshotRow, ConversationRow, McpServerRow,
+    MessageRow,
 };
 use aionui_db::{
     AgentBindingResolution, ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, IAcpSessionRepository,
@@ -262,6 +263,12 @@ pub trait ConversationRolePort: Send + Sync {
     /// Whether the resident role `assistant_id` is permitted to send outbound
     /// colleague/session messages (`role_send` not in `denied_tools`).
     async fn is_role_send_allowed(&self, _assistant_id: &str) -> bool {
+        true
+    }
+
+    /// Whether autonomous runs of `assistant_id` require explicit permission
+    /// prompts (`true` = conservative default when unknown).
+    async fn asks_when_scheduled(&self, _assistant_id: &str) -> bool {
         true
     }
 }
@@ -536,7 +543,7 @@ pub struct ConversationService {
 
     // Repos for conversation, acp_session and agent_metadata access.
     conversation_repo: Arc<dyn IConversationRepository>,
-    agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
+    pub(crate) agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
     acp_session_repo: Arc<dyn IAcpSessionRepository>,
 }
 
@@ -873,6 +880,19 @@ impl ConversationService {
             None
         };
 
+        let default_permission_empty = snapshot
+            .resolved_defaults
+            .permission
+            .as_deref()
+            .map(str::trim)
+            .is_none_or(str::is_empty);
+        let initial_permission_override = if default_permission_empty && !port.asks_when_scheduled(role_id).await {
+            self.resolve_role_target_full_auto_mode(user_id, &snapshot.agent_type, &snapshot.agent_id)
+                .await
+        } else {
+            None
+        };
+
         let created = self
             .create(
                 user_id,
@@ -883,7 +903,12 @@ impl ConversationService {
                     assistant: Some(AssistantConversationRequest {
                         id: role_id.to_owned(),
                         locale: None,
-                        conversation_overrides: None,
+                        conversation_overrides: initial_permission_override.map(|perm| {
+                            AssistantConversationOverridesRequest {
+                                permission: Some(perm),
+                                ..Default::default()
+                            }
+                        }),
                     }),
                     source: Some(ConversationSource::Aionui),
                     channel_chat_id: None,
@@ -1643,32 +1668,37 @@ impl ConversationService {
         let current_definition = self
             .current_assistant_definition(user_id, &snapshot.assistant_id)
             .await?;
-        let (source, name, avatar) = match current_definition {
-            Some(definition) => (
-                definition.source,
-                definition.name,
-                assistant_avatar_response_value_with_version(
-                    definition.avatar_type.as_str(),
-                    definition.avatar_value.as_deref(),
-                    definition.assistant_id.as_str(),
-                    definition.updated_at,
-                )
-                .unwrap_or_default(),
-            ),
-            None => (
-                snapshot.assistant_source.clone(),
-                snapshot.assistant_id.clone(),
-                String::new(),
-            ),
-        };
+        Ok(build_assistant_identity_response(
+            snapshot,
+            runtime_backend,
+            current_definition,
+        ))
+    }
 
-        Ok(aionui_api_types::ConversationAssistantIdentityResponse {
-            id: snapshot.assistant_id.clone(),
-            source,
-            name,
-            avatar,
-            backend: runtime_backend,
-        })
+    async fn assistant_identity_from_snapshot_cached(
+        &self,
+        user_id: &str,
+        snapshot: &ConversationAssistantSnapshotRow,
+        agent_metadata_rows: &[AgentMetadataRow],
+        definition_cache: &mut HashMap<String, Option<AssistantDefinitionRow>>,
+    ) -> Result<aionui_api_types::ConversationAssistantIdentityResponse, ConversationError> {
+        let runtime_backend = resolve_agent_binding_from_rows(agent_metadata_rows, &snapshot.agent_id)
+            .map(|binding| binding.runtime_backend)
+            .unwrap_or_else(|| snapshot.agent_id.clone());
+        let current_definition = if let Some(cached) = definition_cache.get(&snapshot.assistant_id) {
+            cached.clone()
+        } else {
+            let fetched = self
+                .current_assistant_definition(user_id, &snapshot.assistant_id)
+                .await?;
+            definition_cache.insert(snapshot.assistant_id.clone(), fetched.clone());
+            fetched
+        };
+        Ok(build_assistant_identity_response(
+            snapshot,
+            runtime_backend,
+            current_definition,
+        ))
     }
 
     async fn current_assistant_definition(
@@ -2888,6 +2918,7 @@ impl ConversationService {
         // must not take down the whole listing. Skip-and-log is the
         // explicit resilience contract from the Gemini→ACP migration spec.
         let mut items = Vec::with_capacity(result.items.len());
+        let mut auto_inject_cache: Option<Vec<String>> = None;
         for row in result.items {
             let row_id = row.id.clone();
             let mut extra: serde_json::Value = match serde_json::from_str(&row.extra) {
@@ -2901,17 +2932,62 @@ impl ConversationService {
                     continue;
                 }
             };
-            self.backfill_extra_inplace(user_id, &row_id, &mut extra).await;
+            self.backfill_extra_inplace_cached(user_id, &row_id, &mut extra, &mut auto_inject_cache)
+                .await;
             match row_to_response_with_extra(row, extra, &self.workspace_root) {
-                Ok(mut resp) => {
-                    self.attach_assistant_identity(user_id, &mut resp).await?;
-                    items.push(resp);
-                }
+                Ok(resp) => items.push(resp),
                 Err(err) => warn!(
                     conversation_id = %row_id,
                     error = %ErrorChain(&err),
                     "Skipping unreadable conversation row in list"
                 ),
+            }
+        }
+
+        // Batch-resolve assistant identities across all listed rows so listing N
+        // conversations executes O(1) metadata queries instead of O(N) serial queries.
+        let needs_identity_ids: Vec<String> = items
+            .iter()
+            .filter(|resp| resp.assistant.is_none())
+            .map(|resp| resp.id.clone())
+            .collect();
+        if !needs_identity_ids.is_empty() {
+            let snapshots = self
+                .conversation_repo
+                .list_assistant_snapshots_for_conversations(user_id, &needs_identity_ids)
+                .await?;
+            if !snapshots.is_empty() {
+                let agent_metadata_rows = self
+                    .agent_metadata_repo
+                    .list_all_for_user(user_id)
+                    .await
+                    .map_err(|e| ConversationError::internal(format!("agent_metadata lookup failed: {e}")))?;
+                let mut definition_cache: HashMap<String, Option<AssistantDefinitionRow>> = HashMap::new();
+                if let Some(definition_repo) = self.assistant_definition_repo() {
+                    let defs = definition_repo
+                        .list_for_user(user_id)
+                        .await
+                        .map_err(|e| ConversationError::internal(format!("assistant definition list failed: {e}")))?;
+                    for def in defs {
+                        definition_cache.entry(def.assistant_id.clone()).or_insert(Some(def));
+                    }
+                }
+                for resp in &mut items {
+                    if resp.assistant.is_some() {
+                        continue;
+                    }
+                    if let Some(snapshot) = snapshots.get(&resp.id) {
+                        resp.assistant = Some(
+                            self.assistant_identity_from_snapshot_cached(
+                                user_id,
+                                snapshot,
+                                &agent_metadata_rows,
+                                &mut definition_cache,
+                            )
+                            .await?,
+                        );
+                    }
+                }
             }
         }
 
@@ -5687,8 +5763,31 @@ impl ConversationService {
     /// swallowed so a read path never 500s because of a backfill write
     /// failure.
     async fn backfill_extra_inplace(&self, user_id: &str, conversation_id: &str, extra: &mut serde_json::Value) {
-        let auto_inject = self.skill_resolver.auto_inject_names().await;
-        let mut mutated = backfill_skills_if_missing(extra, &auto_inject);
+        let mut auto_inject_cache = None;
+        self.backfill_extra_inplace_cached(user_id, conversation_id, extra, &mut auto_inject_cache)
+            .await;
+    }
+
+    async fn backfill_extra_inplace_cached(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        extra: &mut serde_json::Value,
+        auto_inject_cache: &mut Option<Vec<String>>,
+    ) {
+        // Only resolve auto-inject skills from disk/DB when a row actually lacks
+        // `extra.skills`; otherwise pass an empty slice so legacy-field cleanup
+        // runs in memory with zero I/O.
+        let needs_skills = extra.as_object().is_some_and(|obj| !obj.contains_key("skills"));
+        let auto_inject: &[String] = if needs_skills {
+            if auto_inject_cache.is_none() {
+                *auto_inject_cache = Some(self.skill_resolver.auto_inject_names().await);
+            }
+            auto_inject_cache.as_deref().unwrap_or(&[])
+        } else {
+            &[]
+        };
+        let mut mutated = backfill_skills_if_missing(extra, auto_inject);
         mutated |= backfill_cron_job_id_alias(extra);
         if !mutated {
             return;
@@ -5715,6 +5814,39 @@ impl ConversationService {
                 "backfill persist failed; returning in-memory value"
             );
         }
+    }
+}
+
+fn build_assistant_identity_response(
+    snapshot: &ConversationAssistantSnapshotRow,
+    runtime_backend: String,
+    current_definition: Option<AssistantDefinitionRow>,
+) -> aionui_api_types::ConversationAssistantIdentityResponse {
+    let (source, name, avatar) = match current_definition {
+        Some(definition) => (
+            definition.source,
+            definition.name,
+            assistant_avatar_response_value_with_version(
+                definition.avatar_type.as_str(),
+                definition.avatar_value.as_deref(),
+                definition.assistant_id.as_str(),
+                definition.updated_at,
+            )
+            .unwrap_or_default(),
+        ),
+        None => (
+            snapshot.assistant_source.clone(),
+            snapshot.assistant_id.clone(),
+            String::new(),
+        ),
+    };
+
+    aionui_api_types::ConversationAssistantIdentityResponse {
+        id: snapshot.assistant_id.clone(),
+        source,
+        name,
+        avatar,
+        backend: runtime_backend,
     }
 }
 

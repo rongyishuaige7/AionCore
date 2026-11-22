@@ -215,7 +215,189 @@ impl ConversationService {
             .map(ToOwned::to_owned);
         let agent_changed =
             existing_type != snapshot.agent_type || previous_agent_id.as_deref() != Some(snapshot.agent_id.as_str());
-        if only_when_agent_changed && !agent_changed {
+
+        let existing_acp_runtime = self
+            .acp_session_repo()
+            .load_runtime_state_for_user(user_id, &existing.id)
+            .await
+            .map_err(|e| ConversationError::internal(format!("Failed to load acp_session runtime state: {e}")))?;
+        let existing_acp_selections = existing_acp_runtime
+            .as_ref()
+            .and_then(|state| state.config_selections_json.as_deref())
+            .and_then(|raw| serde_json::from_str::<HashMap<String, String>>(raw).ok())
+            .unwrap_or_default();
+
+        let acp_current_mode = existing_acp_runtime
+            .as_ref()
+            .and_then(|state| state.current_mode_id.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let acp_selected_mode = existing_acp_selections
+            .get("mode")
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let snap_permission = existing_snapshot
+            .as_ref()
+            .and_then(|row| row.resolved_permission_value.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let extra_current_mode = extra
+            .get("current_mode_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let extra_session_mode = extra
+            .get("session_mode")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let thread_permission = acp_current_mode
+            .or(acp_selected_mode)
+            .or(snap_permission)
+            .or(extra_current_mode)
+            .or(extra_session_mode)
+            .map(ToOwned::to_owned);
+
+        let thread_model = existing_acp_runtime
+            .as_ref()
+            .and_then(|state| state.current_model_id.as_deref())
+            .or_else(|| existing_acp_selections.get("model").map(String::as_str))
+            .or_else(|| {
+                existing_snapshot
+                    .as_ref()
+                    .and_then(|row| row.resolved_model_id.as_deref())
+            })
+            .or_else(|| extra.get("current_model_id").and_then(serde_json::Value::as_str))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        let thread_thought = existing_snapshot
+            .as_ref()
+            .and_then(|row| row.resolved_thought_level_value.as_deref())
+            .or_else(|| extra.get("thought_level").and_then(serde_json::Value::as_str))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+
+        let role_defaults_to_full_auto = snapshot.default_modes.permission != "fixed"
+            && match self.role_port() {
+                Some(port) => !port.asks_when_scheduled(role_id).await,
+                None => false,
+            };
+        let target_full_auto = self
+            .resolve_role_target_full_auto_mode(user_id, &snapshot.agent_type, &snapshot.agent_id)
+            .await;
+
+        let effective_model = if snapshot.default_modes.model == "fixed" {
+            snapshot
+                .resolved_defaults
+                .model
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        } else if !only_when_agent_changed {
+            snapshot
+                .resolved_defaults
+                .model
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        } else if agent_changed {
+            None
+        } else {
+            thread_model
+        };
+
+        let effective_permission = if snapshot.default_modes.permission == "fixed" {
+            snapshot
+                .resolved_defaults
+                .permission
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        } else if agent_changed {
+            let prev_yolo_id = match previous_agent_id.as_deref() {
+                Some(prev_id) => self
+                    .agent_metadata_repo
+                    .get_for_user(user_id, prev_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|meta| meta.yolo_id),
+                None => None,
+            };
+            match thread_permission.as_deref() {
+                Some(prev_mode) if is_full_auto_permission(prev_mode, prev_yolo_id.as_deref()) => target_full_auto,
+                Some(prev_mode)
+                    if existing_type == snapshot.agent_type
+                        && !snapshot.runtime_backend.is_empty()
+                        && extra.get("backend").and_then(serde_json::Value::as_str)
+                            == Some(snapshot.runtime_backend.as_str()) =>
+                {
+                    Some(prev_mode.to_owned())
+                }
+                Some(_) => None,
+                None if role_defaults_to_full_auto => target_full_auto,
+                None => None,
+            }
+        } else {
+            let role_default_perm = if role_defaults_to_full_auto {
+                target_full_auto
+            } else {
+                None
+            };
+            thread_permission.or(role_default_perm).or_else(|| {
+                snapshot
+                    .resolved_defaults
+                    .permission
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned)
+            })
+        };
+
+        let effective_thought = if snapshot.default_modes.thought_level == "fixed" {
+            snapshot
+                .resolved_defaults
+                .thought_level
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        } else if !agent_changed {
+            thread_thought.or_else(|| {
+                snapshot
+                    .resolved_defaults
+                    .thought_level
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned)
+            })
+        } else {
+            None
+        };
+
+        let permission_drifted = match effective_permission.as_deref() {
+            Some(expected) => match snapshot.agent_type {
+                AgentType::Aionrs => extra_session_mode != Some(expected) || snap_permission != Some(expected),
+                AgentType::Acp | AgentType::Antigravity => {
+                    extra_session_mode != Some(expected)
+                        || extra_current_mode != Some(expected)
+                        || acp_current_mode != Some(expected)
+                        || snap_permission != Some(expected)
+                }
+                _ => false,
+            },
+            None => false,
+        };
+
+        if only_when_agent_changed && !agent_changed && !permission_drifted {
             return Ok(false);
         }
 
@@ -280,47 +462,20 @@ impl ConversationService {
                 obj.remove("cli_path");
             }
 
-            // When healing a pre-existing agent drift (`only_when_agent_changed && agent_changed`),
-            // `assistant_preferences` may still carry `last_model_id` / `last_permission_value` /
-            // `last_thought_level_value` recorded on the previous agent before the drift occurred.
-            // Only carry values explicitly pinned via `"fixed"` mode onto the drifted agent.
-            let ignore_stale_auto_prefs = only_when_agent_changed && agent_changed;
-            let resolved_model = snapshot
-                .resolved_defaults
-                .model
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .filter(|_| !ignore_stale_auto_prefs || snapshot.default_modes.model == "fixed");
-            let resolved_permission = snapshot
-                .resolved_defaults
-                .permission
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .filter(|_| !ignore_stale_auto_prefs || snapshot.default_modes.permission == "fixed");
-            let resolved_thought = snapshot
-                .resolved_defaults
-                .thought_level
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .filter(|_| !ignore_stale_auto_prefs || snapshot.default_modes.thought_level == "fixed");
-
             if snapshot.agent_type == AgentType::Aionrs {
                 obj.remove("model");
                 obj.remove("current_model_id");
                 obj.remove("current_mode_id");
-                if let Some(permission) = resolved_permission {
+                if let Some(permission) = effective_permission.as_deref() {
                     obj.insert(
                         "session_mode".to_owned(),
                         serde_json::Value::String(permission.to_owned()),
                     );
-                } else if agent_changed {
+                } else {
                     obj.remove("session_mode");
                 }
             } else {
-                if let Some(model_id) = resolved_model {
+                if let Some(model_id) = effective_model.as_deref() {
                     obj.insert(
                         "current_model_id".to_owned(),
                         serde_json::Value::String(model_id.to_owned()),
@@ -329,7 +484,7 @@ impl ConversationService {
                     obj.remove("current_model_id");
                 }
 
-                if let Some(permission) = resolved_permission {
+                if let Some(permission) = effective_permission.as_deref() {
                     obj.insert(
                         "session_mode".to_owned(),
                         serde_json::Value::String(permission.to_owned()),
@@ -340,13 +495,13 @@ impl ConversationService {
                             serde_json::Value::String(permission.to_owned()),
                         );
                     }
-                } else if agent_changed {
+                } else {
                     obj.remove("session_mode");
                     obj.remove("current_mode_id");
                 }
             }
 
-            if let Some(thought) = resolved_thought {
+            if let Some(thought) = effective_thought.as_deref() {
                 obj.insert(
                     "thought_level".to_owned(),
                     serde_json::Value::String(thought.to_owned()),
@@ -421,33 +576,10 @@ impl ConversationService {
             }
         }
 
-        let ignore_stale_auto_prefs = only_when_agent_changed && agent_changed;
-        let effective_model = snapshot
-            .resolved_defaults
-            .model
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .filter(|_| !ignore_stale_auto_prefs || snapshot.default_modes.model == "fixed");
-        let effective_permission = snapshot
-            .resolved_defaults
-            .permission
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .filter(|_| !ignore_stale_auto_prefs || snapshot.default_modes.permission == "fixed");
-        let effective_thought = snapshot
-            .resolved_defaults
-            .thought_level
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .filter(|_| !ignore_stale_auto_prefs || snapshot.default_modes.thought_level == "fixed");
-
         let new_type_str = snapshot.agent_type.serde_name().to_owned();
         let model_json = if snapshot.agent_type == AgentType::Aionrs {
             match self
-                .resolve_aionrs_model_for_role(user_id, role_id, effective_model)
+                .resolve_aionrs_model_for_role(user_id, role_id, effective_model.as_deref())
                 .await
             {
                 Ok(Some(provider_model)) => Some(
@@ -504,11 +636,11 @@ impl ConversationService {
                     agent_id: &snapshot.agent_id,
                     rules_content: &snapshot.rules.content,
                     default_model_mode: &snapshot.default_modes.model,
-                    resolved_model_id: effective_model,
+                    resolved_model_id: effective_model.as_deref(),
                     default_permission_mode: &snapshot.default_modes.permission,
-                    resolved_permission_value: effective_permission,
+                    resolved_permission_value: effective_permission.as_deref(),
                     default_thought_level_mode: &snapshot.default_modes.thought_level,
-                    resolved_thought_level_value: effective_thought,
+                    resolved_thought_level_value: effective_thought.as_deref(),
                     default_skills_mode: &snapshot.default_modes.skills,
                     resolved_skill_ids: &resolved_skill_ids,
                     resolved_disabled_builtin_skill_ids: &resolved_disabled_builtin_skill_ids,
@@ -534,31 +666,23 @@ impl ConversationService {
                     self.create_acp_session_row(user_id, &existing.id, &extra, Some(snapshot))
                         .await?;
                 } else {
-                    let runtime_state = self
-                        .acp_session_repo()
-                        .load_runtime_state_for_user(user_id, &existing.id)
-                        .await
-                        .map_err(|e| {
-                            ConversationError::internal(format!("Failed to load acp_session runtime state: {e}"))
-                        })?;
-                    let mut selections = runtime_state
-                        .and_then(|state| state.config_selections_json)
-                        .and_then(|raw| serde_json::from_str::<HashMap<String, String>>(&raw).ok())
-                        .unwrap_or_default();
-                    if let Some(model_id) = effective_model {
+                    let mut selections = existing_acp_selections;
+                    if let Some(model_id) = effective_model.as_deref() {
                         selections.insert("model".to_owned(), model_id.to_owned());
                     } else {
                         selections.remove("model");
                     }
-                    if let Some(mode_id) = effective_permission {
+                    if let Some(mode_id) = effective_permission.as_deref() {
                         selections.insert("mode".to_owned(), mode_id.to_owned());
+                    } else {
+                        selections.remove("mode");
                     }
                     let selections_json = serde_json::to_string(&selections).map_err(|e| {
                         ConversationError::internal(format!("Failed to serialize runtime selections: {e}"))
                     })?;
                     let params = SaveRuntimeStateParams {
-                        current_model_id: Some(effective_model),
-                        current_mode_id: effective_permission.map(Some),
+                        current_model_id: Some(effective_model.as_deref()),
+                        current_mode_id: Some(effective_permission.as_deref()),
                         config_selections_json: Some(Some(&selections_json)),
                         context_usage_json: None,
                     };
@@ -589,8 +713,66 @@ impl ConversationService {
             agent_id = %snapshot.agent_id,
             agent_type = %new_type_str,
             agent_changed,
+            permission_drifted,
             "synchronized resident role thread runtime"
         );
         Ok(true)
     }
+
+    /// Resolve the full-auto permission mode ID for a target role engine.
+    ///
+    /// Never invents `"yolo"` for `AgentType::Acp` rows whose `yolo_id` is
+    /// `None` (e.g. Hermes / Pi / MiniMax / OMP), because their `session/set_mode`
+    /// rejects unknown mode names.
+    pub(crate) async fn resolve_role_target_full_auto_mode(
+        &self,
+        user_id: &str,
+        agent_type: &AgentType,
+        agent_id: &str,
+    ) -> Option<String> {
+        let meta_yolo = if agent_id.trim().is_empty() {
+            None
+        } else {
+            self.agent_metadata_repo
+                .get_for_user(user_id, agent_id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|meta| meta.yolo_id)
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+        };
+        match agent_type {
+            AgentType::Aionrs | AgentType::Antigravity => Some(meta_yolo.unwrap_or_else(|| "yolo".to_owned())),
+            AgentType::Acp => meta_yolo,
+            AgentType::Gemini
+            | AgentType::Codex
+            | AgentType::OpenclawGateway
+            | AgentType::Remote
+            | AgentType::Nanobot => None,
+        }
+    }
+}
+
+pub(crate) fn is_full_auto_permission(mode: &str, prev_yolo_id: Option<&str>) -> bool {
+    let trimmed = mode.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if matches!(
+        trimmed,
+        "yolo" | "yoloNoSandbox" | "bypassPermissions" | "agent-full-access" | "full-access" | ":danger-full-access"
+    ) || trimmed.eq_ignore_ascii_case("yolo")
+        || trimmed.eq_ignore_ascii_case("yolonosandbox")
+        || trimmed.eq_ignore_ascii_case("bypasspermissions")
+    {
+        return true;
+    }
+    if let Some(prev_yolo) = prev_yolo_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !matches!(*value, "default" | "auto"))
+    {
+        return trimmed.eq_ignore_ascii_case(prev_yolo);
+    }
+    false
 }

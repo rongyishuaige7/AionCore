@@ -1158,6 +1158,12 @@ async fn role_runtime_switch_syncs_existing_thread_session_and_cron_jobs_and_hea
         .unwrap();
     let thread_id = thread_row.id.clone();
     assert_eq!(thread_row.r#type, "antigravity");
+    let initial_thread_extra: Value = serde_json::from_str(&thread_row.extra).unwrap();
+    assert_eq!(
+        initial_thread_extra["session_mode"],
+        json!("yolo"),
+        "autonomous resident role (`asks_when_scheduled == false`) must seed full-auto on thread creation"
+    );
 
     let acp_repo = aionui_db::SqliteAcpSessionRepository::new(fixture.services.database.pool().clone());
     use aionui_db::IAcpSessionRepository;
@@ -1324,6 +1330,15 @@ async fn role_runtime_switch_syncs_existing_thread_session_and_cron_jobs_and_hea
         conv_json["data"]["extra"]["current_model_id"],
         json!("claude-sonnet-4-6")
     );
+    assert_eq!(
+        conv_json["data"]["extra"]["session_mode"],
+        json!("bypassPermissions"),
+        "switching an autonomous role from Antigravity to Claude must map full-auto `yolo` -> `bypassPermissions`"
+    );
+    assert_eq!(
+        conv_json["data"]["extra"]["current_mode_id"],
+        json!("bypassPermissions")
+    );
     assert_eq!(conv_json["data"]["assistant"]["backend"], json!("claude"));
     assert!(
         conv_json["data"]["extra"].get("preset_context").is_none(),
@@ -1365,6 +1380,11 @@ async fn role_runtime_switch_syncs_existing_thread_session_and_cron_jobs_and_hea
         .unwrap()
         .unwrap();
     assert_eq!(runtime_state.current_model_id.as_deref(), Some("claude-sonnet-4-6"));
+    assert_eq!(runtime_state.current_mode_id.as_deref(), Some("bypassPermissions"));
+    assert_eq!(
+        stored_snapshot.resolved_permission_value.as_deref(),
+        Some("bypassPermissions")
+    );
 
     // Verify the scheduled Cron Job bound to this role also updated its full-auto `mode` (`bypassPermissions`)
     // and `model_id` (`claude-sonnet-4-6`).
@@ -1442,6 +1462,11 @@ async fn role_runtime_switch_syncs_existing_thread_session_and_cron_jobs_and_hea
         .unwrap()
         .unwrap();
     assert_eq!(runtime_after_model.current_model_id.as_deref(), Some("claude-opus-4-7"));
+    assert_eq!(
+        runtime_after_model.current_mode_id.as_deref(),
+        Some("bypassPermissions"),
+        "switching default model on the same agent must preserve the thread's full-auto permission"
+    );
 
     // 4. Simulate pre-existing DB drift (e.g. an offline or pre-fix edit setting `agent_id = '8e1acf31'` Codex)
     //    and rebuild the app router: startup drift reconciliation heals `thread_id` automatically!
@@ -1464,6 +1489,61 @@ async fn role_runtime_switch_syncs_existing_thread_session_and_cron_jobs_and_hea
     assert_eq!(healed_extra["agent_id"], json!("8e1acf31"));
     assert_eq!(healed_extra["backend"], json!("codex"));
     assert!(healed_extra.get("current_model_id").is_none());
+    assert_eq!(
+        healed_extra["session_mode"],
+        json!("agent-full-access"),
+        "startup drift heal onto Codex must map full-auto `bypassPermissions` -> `agent-full-access`"
+    );
+
+    // 5. Simulate wiped thread permission (matching live `8e34e0ba`) while `assistant_preferences`
+    //    carries a stale `"plan"` from an unrelated conversation: startup reconciliation restores
+    //    `agent-full-access` without letting `assistant_preferences` downgrade the role thread!
+    sqlx::query(
+        "UPDATE conversations SET extra = json_remove(extra, '$.session_mode', '$.current_mode_id') WHERE id = ?",
+    )
+    .bind(&thread_id)
+    .execute(fixture.services.database.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE conversation_assistant_snapshots SET resolved_permission_value = NULL WHERE conversation_id = ?",
+    )
+    .bind(&thread_id)
+    .execute(fixture.services.database.pool())
+    .await
+    .unwrap();
+    acp_repo
+        .save_runtime_state_for_user(
+            USER,
+            &thread_id,
+            &aionui_db::SaveRuntimeStateParams {
+                current_mode_id: Some(None),
+                config_selections_json: Some(Some("{}")),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    sqlx::query("UPDATE assistant_preferences SET last_permission_value = 'plan'")
+        .execute(fixture.services.database.pool())
+        .await
+        .unwrap();
+    let _restarted_again = create_router(&fixture.services).await.expect("rebuild router 2");
+    let restored_row = fixture
+        .services
+        .conversation_repo
+        .get(USER, &thread_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let restored_extra: Value = serde_json::from_str(&restored_row.extra).unwrap();
+    assert_eq!(restored_extra["session_mode"], json!("agent-full-access"));
+    let restored_acp = acp_repo
+        .load_runtime_state_for_user(USER, &thread_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(restored_acp.current_mode_id.as_deref(), Some("agent-full-access"));
 
     fixture.services.database.close().await;
 }
