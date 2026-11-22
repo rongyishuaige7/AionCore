@@ -604,6 +604,8 @@ impl ConversationService {
     ) -> Option<String> {
         let state = port.thread_state(assistant_id, &row.id).await?;
         self.role_threads.note(&row.id, assistant_id);
+        self.sync_role_thread_row_if_agent_drifted(user_id, row, assistant_id)
+            .await;
         // Only engines that resume from the session anchor can be moved; the
         // others keep (and compact) their own history.
         if !matches!(row.r#type.as_str(), "acp" | "antigravity") {

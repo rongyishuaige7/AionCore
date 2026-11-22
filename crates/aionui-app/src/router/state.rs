@@ -255,6 +255,9 @@ pub async fn build_module_states(
         conversations: services.conversation_repo.clone(),
         task_manager: services.worker_task_manager.clone(),
     });
+    assistant
+        .service
+        .with_runtime_sync_port(role_governance.clone() as Arc<dyn aionui_assistant::AssistantRuntimeSyncPort>);
     cron.cron_service
         .set_role_proposal_port(role_governance.clone() as Arc<dyn aionui_cron::CronRoleProposalPort>);
     cron.cron_service.init().await;
@@ -390,6 +393,9 @@ pub async fn build_module_states(
         .service
         .recover_stale_runtime_state_on_startup()
         .await;
+    if services.identity_mode != IdentityMode::AionPro {
+        reconcile_drifted_role_threads(&role_governance).await;
+    }
 
     Ok((states, channel_components))
 }
@@ -1345,6 +1351,68 @@ impl aionui_cron::CronRoleProposalPort for RoleGovernanceAdapter {
             )
             .await
             .map_err(|e| e.to_string())
+    }
+}
+
+#[async_trait::async_trait]
+impl aionui_assistant::AssistantRuntimeSyncPort for RoleGovernanceAdapter {
+    async fn on_assistant_runtime_updated(&self, user_id: &str, assistant_id: &str) -> Result<(), String> {
+        let mut errors = Vec::new();
+        if let Err(error) = self
+            .conversation
+            .sync_role_thread_runtime(user_id, assistant_id, false, &self.task_manager)
+            .await
+        {
+            errors.push(format!("role thread sync failed: {error}"));
+        }
+        if let Err(error) = self.cron.sync_jobs_for_assistant_runtime(user_id, assistant_id).await {
+            errors.push(format!("cron runtime sync failed: {error}"));
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+}
+
+async fn reconcile_drifted_role_threads(adapter: &RoleGovernanceAdapter) {
+    let Ok(roles) = adapter.roles.list().await else {
+        return;
+    };
+    for role in roles {
+        let owner_user_id = match role.thread_conversation_id.as_deref() {
+            Some(thread_id) => adapter
+                .conversations
+                .owner_user_id(thread_id)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "system_default_user".to_owned()),
+            None => "system_default_user".to_owned(),
+        };
+        if let Err(error) = adapter
+            .conversation
+            .sync_role_thread_runtime(&owner_user_id, &role.id, true, &adapter.task_manager)
+            .await
+        {
+            tracing::warn!(
+                role_id = %role.id,
+                error = %error,
+                "startup: failed to reconcile drifted resident role thread"
+            );
+        }
+        if let Err(error) = adapter
+            .cron
+            .sync_jobs_for_assistant_runtime(&owner_user_id, &role.id)
+            .await
+        {
+            tracing::warn!(
+                role_id = %role.id,
+                error = %error,
+                "startup: failed to reconcile resident role cron jobs"
+            );
+        }
     }
 }
 

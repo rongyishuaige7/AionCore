@@ -435,6 +435,35 @@ impl IConversationRepository for SqliteConversationRepository {
         Ok(())
     }
 
+    async fn update_runtime_binding(
+        &self,
+        user_id: &str,
+        id: &str,
+        agent_type: &str,
+        model: Option<&str>,
+        extra: &str,
+        updated_at: TimestampMs,
+    ) -> Result<(), DbError> {
+        let result = sqlx::query(
+            "UPDATE conversations SET type = ?, model = ?, extra = ?, updated_at = ? \
+             WHERE user_id = ? AND id = ?",
+        )
+        .bind(agent_type)
+        .bind(model)
+        .bind(extra)
+        .bind(updated_at)
+        .bind(user_id)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound(format!("Conversation '{id}' not found")));
+        }
+
+        Ok(())
+    }
+
     async fn delete(&self, user_id: &str, id: &str) -> Result<(), DbError> {
         let result = sqlx::query("DELETE FROM conversations WHERE user_id = ? AND id = ?")
             .bind(user_id)

@@ -11,6 +11,7 @@ mod message_persistence;
 pub mod response_middleware;
 mod role_retrospective;
 mod role_thread;
+mod role_thread_sync;
 pub mod routes;
 pub mod routes_aux;
 mod runtime_completion;

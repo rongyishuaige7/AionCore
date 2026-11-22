@@ -105,6 +105,15 @@ where
     )))
 }
 
+/// Callback port notified after an assistant's runtime binding (`agent_id` or
+/// `defaults.model` / `permission` / `thought_level`) is updated so composition
+/// domains (resident-role threads, scheduled tasks) can synchronize their live
+/// bindings without `aionui-assistant` depending on those crates.
+#[async_trait::async_trait]
+pub trait AssistantRuntimeSyncPort: Send + Sync {
+    async fn on_assistant_runtime_updated(&self, user_id: &str, assistant_id: &str) -> Result<(), String>;
+}
+
 /// Aggregated business logic for `/api/assistants/*` and rule/skill dispatch.
 pub struct AssistantService {
     pool: SqlitePool,
@@ -121,6 +130,7 @@ pub struct AssistantService {
     builtin: Arc<BuiltinAssistantRegistry>,
     agent_catalog: Option<Arc<dyn AssistantAgentCatalogPort>>,
     event_broadcaster: RwLock<Option<Arc<dyn EventBroadcaster>>>,
+    runtime_sync_port: RwLock<Option<Arc<dyn AssistantRuntimeSyncPort>>>,
     /// Root directory holding user-authored rule/skill md files and avatars.
     /// Defaults to `~/.aionui/` but can be overridden for tests.
     user_data_dir: PathBuf,
@@ -183,6 +193,7 @@ impl AssistantService {
             builtin,
             agent_catalog,
             event_broadcaster: RwLock::new(None),
+            runtime_sync_port: RwLock::new(None),
             user_data_dir,
         }
     }
@@ -190,6 +201,12 @@ impl AssistantService {
     pub fn with_event_broadcaster(&self, broadcaster: Arc<dyn EventBroadcaster>) {
         if let Ok(mut guard) = self.event_broadcaster.write() {
             *guard = Some(broadcaster);
+        }
+    }
+
+    pub fn with_runtime_sync_port(&self, port: Arc<dyn AssistantRuntimeSyncPort>) {
+        if let Ok(mut guard) = self.runtime_sync_port.write() {
+            *guard = Some(port);
         }
     }
 
@@ -1068,12 +1085,30 @@ impl AssistantService {
         user_id: &str,
         assistant_id: &str,
         publish_mcp_change: bool,
+        sync_runtime_binding: bool,
     ) -> Result<AssistantResponse, AssistantError> {
         let response = self.get_for_user(user_id, assistant_id).await?;
         if publish_mcp_change
             && let Err(error) = self.publish_assistant_mcp_binding_changed(user_id, assistant_id).await
         {
             warn!(user_id, assistant_id, error = %error, "failed to publish assistant MCP binding change");
+        }
+        if sync_runtime_binding {
+            let sync_port = self
+                .runtime_sync_port
+                .read()
+                .ok()
+                .and_then(|guard| guard.as_ref().cloned());
+            if let Some(port) = sync_port
+                && let Err(error) = port.on_assistant_runtime_updated(user_id, assistant_id).await
+            {
+                warn!(
+                    user_id,
+                    assistant_id,
+                    error = %error,
+                    "failed to synchronize assistant runtime binding to downstream consumers"
+                );
+            }
         }
         Ok(response)
     }
@@ -1184,10 +1219,16 @@ impl AssistantService {
             .get_by_assistant_id_for_user(user_id, &row.id)
             .await?
         {
-            self.sync_preferences_from_defaults_request_for_user(user_id, &definition, None, req.defaults.as_ref())
-                .await?;
+            self.sync_preferences_from_defaults_request_for_user(
+                user_id,
+                &definition,
+                None,
+                req.defaults.as_ref(),
+                false,
+            )
+            .await?;
         }
-        self.finish_assistant_mutation(user_id, &id, true).await
+        self.finish_assistant_mutation(user_id, &id, true, false).await
     }
 
     pub async fn update(&self, id: &str, req: UpdateAssistantRequest) -> Result<AssistantResponse, AssistantError> {
@@ -1201,6 +1242,10 @@ impl AssistantService {
         req: UpdateAssistantRequest,
     ) -> Result<AssistantResponse, AssistantError> {
         let mcp_binding_changed = req.defaults.as_ref().is_some_and(|defaults| defaults.mcps.is_some());
+        let runtime_binding_changed = req.agent_id.is_some()
+            || req.defaults.as_ref().is_some_and(|defaults| {
+                defaults.model.is_some() || defaults.permission.is_some() || defaults.thought_level.is_some()
+            });
         match self.classify_source_for_user(user_id, id).await {
             AssistantSource::Builtin => {
                 let detail_overrides = SerializedDetailOverrides::from_update(&req)?;
@@ -1234,7 +1279,7 @@ impl AssistantService {
                     ));
                 }
 
-                let definition = self
+                let previous_definition = self
                     .definition_repo
                     .get_by_assistant_id_for_user(user_id, id)
                     .await?
@@ -1247,11 +1292,11 @@ impl AssistantService {
                 let requested_agent_id = req.agent_id.as_deref().map(|agent_id| agent_id.trim().to_string());
                 let current_agent_id = self
                     .state_repo
-                    .get_for_user(user_id, &definition.id)
+                    .get_for_user(user_id, &previous_definition.id)
                     .await
                     .map_err(|e| AssistantError::Internal(format!("get assistant overlay: {e}")))?
                     .and_then(|row| row.agent_id_override)
-                    .unwrap_or_else(|| definition.agent_id.clone());
+                    .unwrap_or_else(|| previous_definition.agent_id.clone());
                 let reset_model_and_permission = requested_agent_id
                     .as_deref()
                     .is_some_and(|agent_id| agent_id != current_agent_id);
@@ -1284,11 +1329,14 @@ impl AssistantService {
                 self.sync_preferences_from_defaults_request_for_user(
                     user_id,
                     &definition,
-                    Some(&definition),
+                    Some(&previous_definition),
                     req.defaults.as_ref(),
+                    reset_model_and_permission,
                 )
                 .await?;
-                return self.finish_assistant_mutation(user_id, id, mcp_binding_changed).await;
+                return self
+                    .finish_assistant_mutation(user_id, id, mcp_binding_changed, runtime_binding_changed)
+                    .await;
             }
             AssistantSource::Generated => {
                 if req.name.is_some()
@@ -1347,9 +1395,12 @@ impl AssistantService {
                     &patched,
                     Some(&current_definition),
                     req.defaults.as_ref(),
+                    false,
                 )
                 .await?;
-                return self.finish_assistant_mutation(user_id, id, mcp_binding_changed).await;
+                return self
+                    .finish_assistant_mutation(user_id, id, mcp_binding_changed, runtime_binding_changed)
+                    .await;
             }
             AssistantSource::User => {}
         }
@@ -1406,10 +1457,12 @@ impl AssistantService {
                 &definition,
                 Some(&current_definition),
                 req.defaults.as_ref(),
+                reset_model_and_permission,
             )
             .await?;
         }
-        self.finish_assistant_mutation(user_id, id, mcp_binding_changed).await
+        self.finish_assistant_mutation(user_id, id, mcp_binding_changed, runtime_binding_changed)
+            .await
     }
 
     async fn sync_preferences_from_defaults_request_for_user(
@@ -1418,10 +1471,11 @@ impl AssistantService {
         definition: &AssistantDefinitionRow,
         previous_definition: Option<&AssistantDefinitionRow>,
         defaults: Option<&AssistantDefaultsRequest>,
+        reset_model_and_permission: bool,
     ) -> Result<(), AssistantError> {
-        let Some(defaults) = defaults else {
+        if defaults.is_none() && !reset_model_and_permission {
             return Ok(());
-        };
+        }
 
         let existing = self
             .preference_repo
@@ -1429,9 +1483,21 @@ impl AssistantService {
             .await
             .map_err(|e| AssistantError::Internal(format!("get assistant preference: {e}")))?;
 
-        let mut last_model_id = existing.as_ref().and_then(|row| row.last_model_id.clone());
-        let mut last_permission_value = existing.as_ref().and_then(|row| row.last_permission_value.clone());
-        let mut last_thought_level_value = existing.as_ref().and_then(|row| row.last_thought_level_value.clone());
+        let mut last_model_id = if reset_model_and_permission {
+            None
+        } else {
+            existing.as_ref().and_then(|row| row.last_model_id.clone())
+        };
+        let mut last_permission_value = if reset_model_and_permission {
+            None
+        } else {
+            existing.as_ref().and_then(|row| row.last_permission_value.clone())
+        };
+        let mut last_thought_level_value = if reset_model_and_permission {
+            None
+        } else {
+            existing.as_ref().and_then(|row| row.last_thought_level_value.clone())
+        };
         let mut last_skill_ids = existing
             .as_ref()
             .map(|row| decode_str_list(Some(row.last_skill_ids.as_str())))
@@ -1448,94 +1514,96 @@ impl AssistantService {
             .transpose()?
             .unwrap_or_default();
 
-        if let Some(model) = defaults.model.as_ref() {
-            match model.mode.as_str() {
-                "fixed" => {
-                    last_model_id = model.value.clone().filter(|value| !value.trim().is_empty());
-                }
-                "auto" => {
-                    if previous_definition.is_some_and(|current| current.default_model_mode == "fixed") {
-                        last_model_id = None;
+        if let Some(defaults) = defaults {
+            if let Some(model) = defaults.model.as_ref() {
+                match model.mode.as_str() {
+                    "fixed" => {
+                        last_model_id = model.value.clone().filter(|value| !value.trim().is_empty());
+                    }
+                    "auto" => {
+                        if previous_definition.is_some_and(|current| current.default_model_mode == "fixed") {
+                            last_model_id = None;
+                        }
+                    }
+                    other => {
+                        return Err(AssistantError::BadRequest(format!(
+                            "defaults.model.mode must be 'auto' or 'fixed', got '{other}'"
+                        )));
                     }
                 }
-                other => {
-                    return Err(AssistantError::BadRequest(format!(
-                        "defaults.model.mode must be 'auto' or 'fixed', got '{other}'"
-                    )));
-                }
             }
-        }
 
-        if let Some(permission) = defaults.permission.as_ref() {
-            match permission.mode.as_str() {
-                "fixed" => {
-                    last_permission_value = permission.value.clone().filter(|value| !value.trim().is_empty());
-                }
-                "auto" => {
-                    if previous_definition.is_some_and(|current| current.default_permission_mode == "fixed") {
-                        last_permission_value = None;
+            if let Some(permission) = defaults.permission.as_ref() {
+                match permission.mode.as_str() {
+                    "fixed" => {
+                        last_permission_value = permission.value.clone().filter(|value| !value.trim().is_empty());
+                    }
+                    "auto" => {
+                        if previous_definition.is_some_and(|current| current.default_permission_mode == "fixed") {
+                            last_permission_value = None;
+                        }
+                    }
+                    other => {
+                        return Err(AssistantError::BadRequest(format!(
+                            "defaults.permission.mode must be 'auto' or 'fixed', got '{other}'"
+                        )));
                     }
                 }
-                other => {
-                    return Err(AssistantError::BadRequest(format!(
-                        "defaults.permission.mode must be 'auto' or 'fixed', got '{other}'"
-                    )));
-                }
             }
-        }
 
-        if let Some(thought_level) = defaults.thought_level.as_ref() {
-            match thought_level.mode.as_str() {
-                "fixed" => {
-                    last_thought_level_value = thought_level.value.clone().filter(|value| !value.trim().is_empty());
-                }
-                "auto" => {
-                    if previous_definition.is_some_and(|current| current.default_thought_level_mode == "fixed") {
-                        last_thought_level_value = None;
+            if let Some(thought_level) = defaults.thought_level.as_ref() {
+                match thought_level.mode.as_str() {
+                    "fixed" => {
+                        last_thought_level_value = thought_level.value.clone().filter(|value| !value.trim().is_empty());
+                    }
+                    "auto" => {
+                        if previous_definition.is_some_and(|current| current.default_thought_level_mode == "fixed") {
+                            last_thought_level_value = None;
+                        }
+                    }
+                    other => {
+                        return Err(AssistantError::BadRequest(format!(
+                            "defaults.thought_level.mode must be 'auto' or 'fixed', got '{other}'"
+                        )));
                     }
                 }
-                other => {
-                    return Err(AssistantError::BadRequest(format!(
-                        "defaults.thought_level.mode must be 'auto' or 'fixed', got '{other}'"
-                    )));
-                }
             }
-        }
 
-        if let Some(skills) = defaults.skills.as_ref() {
-            match skills.mode.as_str() {
-                "fixed" => {
-                    last_skill_ids = skills.value.clone();
-                    last_disabled_builtin_skill_ids.clear();
-                }
-                "auto" => {
-                    if previous_definition.is_some_and(|current| current.default_skills_mode == "fixed") {
-                        last_skill_ids.clear();
+            if let Some(skills) = defaults.skills.as_ref() {
+                match skills.mode.as_str() {
+                    "fixed" => {
+                        last_skill_ids = skills.value.clone();
                         last_disabled_builtin_skill_ids.clear();
                     }
-                }
-                other => {
-                    return Err(AssistantError::BadRequest(format!(
-                        "defaults.skills.mode must be 'auto' or 'fixed', got '{other}'"
-                    )));
-                }
-            }
-        }
-
-        if let Some(mcps) = defaults.mcps.as_ref() {
-            match mcps.mode.as_str() {
-                "fixed" => {
-                    last_mcp_ids = mcps.value.clone();
-                }
-                "auto" => {
-                    if previous_definition.is_some_and(|current| current.default_mcps_mode == "fixed") {
-                        last_mcp_ids.clear();
+                    "auto" => {
+                        if previous_definition.is_some_and(|current| current.default_skills_mode == "fixed") {
+                            last_skill_ids.clear();
+                            last_disabled_builtin_skill_ids.clear();
+                        }
+                    }
+                    other => {
+                        return Err(AssistantError::BadRequest(format!(
+                            "defaults.skills.mode must be 'auto' or 'fixed', got '{other}'"
+                        )));
                     }
                 }
-                other => {
-                    return Err(AssistantError::BadRequest(format!(
-                        "defaults.mcps.mode must be 'auto' or 'fixed', got '{other}'"
-                    )));
+            }
+
+            if let Some(mcps) = defaults.mcps.as_ref() {
+                match mcps.mode.as_str() {
+                    "fixed" => {
+                        last_mcp_ids = mcps.value.clone();
+                    }
+                    "auto" => {
+                        if previous_definition.is_some_and(|current| current.default_mcps_mode == "fixed") {
+                            last_mcp_ids.clear();
+                        }
+                    }
+                    other => {
+                        return Err(AssistantError::BadRequest(format!(
+                            "defaults.mcps.mode must be 'auto' or 'fixed', got '{other}'"
+                        )));
+                    }
                 }
             }
         }
@@ -6225,6 +6293,95 @@ mod tests {
 
         let definition = fx.definition_repo.get_by_assistant_id("u1").await.unwrap().unwrap();
         assert!(fx.preference_repo.get(&definition.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn update_switching_agent_clears_stale_model_and_permission_preferences_and_notifies_sync_port() {
+        struct RecordingSyncPort {
+            calls: std::sync::Mutex<Vec<(String, String)>>,
+        }
+
+        #[async_trait::async_trait]
+        impl AssistantRuntimeSyncPort for RecordingSyncPort {
+            async fn on_assistant_runtime_updated(&self, user_id: &str, assistant_id: &str) -> Result<(), String> {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push((user_id.to_owned(), assistant_id.to_owned()));
+                Ok(())
+            }
+        }
+
+        let fx = fixture().await;
+        let port = Arc::new(RecordingSyncPort {
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        fx.service.with_runtime_sync_port(port.clone());
+
+        fx.service
+            .create(CreateAssistantRequest {
+                id: Some("u1".into()),
+                name: "Planner".into(),
+                agent_id: Some("a9f3c21e".into()),
+                defaults: Some(AssistantDefaultsRequest {
+                    model: Some(AssistantDefaultScalarRequest {
+                        mode: "fixed".into(),
+                        value: Some("gemini-4-hydrogen-high".into()),
+                    }),
+                    permission: Some(AssistantDefaultScalarRequest {
+                        mode: "fixed".into(),
+                        value: Some("yolo".into()),
+                    }),
+                    thought_level: None,
+                    skills: Some(AssistantDefaultListRequest {
+                        mode: "fixed".into(),
+                        value: vec!["skill-z".into()],
+                    }),
+                    mcps: None,
+                }),
+                ..req_default()
+            })
+            .await
+            .unwrap();
+
+        // Avatar-only update should NOT fire runtime sync port.
+        fx.service
+            .update(
+                "u1",
+                UpdateAssistantRequest {
+                    avatar: Some("🧭".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(port.calls.lock().unwrap().is_empty());
+
+        // Switching agent without explicit `defaults` resets model/permission preferences while keeping skills,
+        // and notifies `AssistantRuntimeSyncPort`.
+        fx.service
+            .update(
+                "u1",
+                UpdateAssistantRequest {
+                    agent_id: Some("2d23ff1c".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let definition = fx.definition_repo.get_by_assistant_id("u1").await.unwrap().unwrap();
+        assert_eq!(definition.agent_id, "2d23ff1c");
+        assert_eq!(definition.default_model_mode, "auto");
+        assert_eq!(definition.default_model_value, None);
+        let pref = fx.preference_repo.get(&definition.id).await.unwrap().unwrap();
+        assert_eq!(pref.last_model_id, None);
+        assert_eq!(pref.last_permission_value, None);
+        assert_eq!(pref.last_skill_ids, r#"["skill-z"]"#);
+        assert_eq!(
+            *port.calls.lock().unwrap(),
+            vec![("system_default_user".to_owned(), "u1".to_owned())]
+        );
     }
 
     #[tokio::test]

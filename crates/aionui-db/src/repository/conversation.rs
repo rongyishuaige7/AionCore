@@ -30,6 +30,32 @@ pub trait IConversationRepository: Send + Sync {
     /// Partially updates a conversation. Returns `DbError::NotFound` if ID is missing for the user.
     async fn update(&self, user_id: &str, id: &str, updates: &ConversationRowUpdate) -> Result<(), DbError>;
 
+    /// Atomically updates a conversation's runtime engine `type`, top-level
+    /// `model` JSON, and `extra` JSON (used when syncing a resident role's
+    /// thread conversation after its assistant runtime binding changes).
+    async fn update_runtime_binding(
+        &self,
+        user_id: &str,
+        id: &str,
+        agent_type: &str,
+        model: Option<&str>,
+        extra: &str,
+        updated_at: TimestampMs,
+    ) -> Result<(), DbError> {
+        let _ = agent_type;
+        self.update(
+            user_id,
+            id,
+            &ConversationRowUpdate {
+                model: Some(model.map(ToOwned::to_owned)),
+                extra: Some(extra.to_owned()),
+                updated_at: Some(updated_at),
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
     /// Atomically rename only an unchanged, automatically named conversation.
     /// A manual rename or newly persisted activity invalidates the snapshot.
     async fn update_agent_title(

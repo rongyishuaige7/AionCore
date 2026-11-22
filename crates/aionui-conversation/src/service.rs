@@ -110,34 +110,34 @@ pub(crate) struct AssistantSnapshotResolvedDefaults {
     #[serde(default)]
     pub(crate) model: Option<String>,
     #[serde(default)]
-    permission: Option<String>,
+    pub(crate) permission: Option<String>,
     #[serde(default)]
-    thought_level: Option<String>,
+    pub(crate) thought_level: Option<String>,
     #[serde(default)]
-    skill_ids: Vec<String>,
+    pub(crate) skill_ids: Vec<String>,
     #[serde(default)]
-    disabled_builtin_skill_ids: Vec<String>,
+    pub(crate) disabled_builtin_skill_ids: Vec<String>,
     #[serde(default)]
-    mcp_ids: Vec<String>,
+    pub(crate) mcp_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
-struct AssistantSnapshotDefaultModes {
+pub(crate) struct AssistantSnapshotDefaultModes {
     #[serde(default)]
-    model: String,
+    pub(crate) model: String,
     #[serde(default)]
-    permission: String,
+    pub(crate) permission: String,
     #[serde(default)]
-    thought_level: String,
+    pub(crate) thought_level: String,
     #[serde(default)]
-    skills: String,
+    pub(crate) skills: String,
     #[serde(default)]
-    mcps: String,
+    pub(crate) mcps: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct AssistantSnapshotRules {
-    content: String,
+pub(crate) struct AssistantSnapshotRules {
+    pub(crate) content: String,
 }
 
 /// Gives a conversation the user starts with a resident role that role's
@@ -300,9 +300,9 @@ const PUT_TO_WORK_EXTRA_KEYS: [&str; 4] = ["cron_job_id", "cronJobId", "teamId",
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct AssistantSnapshot {
-    assistant_definition_id: String,
-    assistant_id: String,
-    assistant_source: String,
+    pub(crate) assistant_definition_id: String,
+    pub(crate) assistant_id: String,
+    pub(crate) assistant_source: String,
     #[serde(default)]
     pub(crate) name: String,
     #[serde(default)]
@@ -310,16 +310,16 @@ pub(crate) struct AssistantSnapshot {
     #[serde(default)]
     avatar: Option<String>,
     #[serde(default, deserialize_with = "deserialize_string_or_null")]
-    agent_id: String,
+    pub(crate) agent_id: String,
     #[serde(default, deserialize_with = "deserialize_string_or_null")]
-    agent_source: String,
+    pub(crate) agent_source: String,
     #[serde(default, alias = "agent_backend", deserialize_with = "deserialize_string_or_null")]
     pub(crate) runtime_backend: String,
     #[serde(default = "default_assistant_snapshot_agent_type")]
     pub(crate) agent_type: AgentType,
-    rules: AssistantSnapshotRules,
+    pub(crate) rules: AssistantSnapshotRules,
     #[serde(default)]
-    default_modes: AssistantSnapshotDefaultModes,
+    pub(crate) default_modes: AssistantSnapshotDefaultModes,
     pub(crate) resolved_defaults: AssistantSnapshotResolvedDefaults,
     created_at: i64,
 }
@@ -829,17 +829,35 @@ impl ConversationService {
             .map_err(|reason| ConversationError::internal(format!("role thread lookup failed: {reason}")))?;
         let mut thread_gone = false;
         if let Some(thread_id) = recorded.as_deref() {
-            if let Some(existing) = self.conversation_repo.get(user_id, thread_id).await? {
-                if session_mentions::team_id_from_extra_str(&existing.extra).is_none() {
-                    let resolved_name = if existing.name.trim().is_empty() {
-                        display_name
-                    } else if snapshot.is_some() {
-                        display_name
-                    } else {
-                        existing.name.clone()
-                    };
-                    return Ok((resolved_name, existing));
+            if let Some(mut existing) = self.conversation_repo.get(user_id, thread_id).await?
+                && session_mentions::team_id_from_extra_str(&existing.extra).is_none()
+            {
+                if let Some(base_snapshot) = snapshot.as_ref() {
+                    let existing_extra: serde_json::Value =
+                        serde_json::from_str(&existing.extra).unwrap_or_else(|_| serde_json::json!({}));
+                    let mut full_snapshot = base_snapshot.clone();
+                    self.add_standing_role(&mut full_snapshot, &existing_extra).await;
+                    if self
+                        .apply_role_thread_runtime_snapshot(
+                            user_id,
+                            role_id,
+                            &existing,
+                            &full_snapshot,
+                            true,
+                            &self.task_manager,
+                        )
+                        .await?
+                        && let Some(refreshed) = self.conversation_repo.get(user_id, thread_id).await?
+                    {
+                        existing = refreshed;
+                    }
                 }
+                let resolved_name = if existing.name.trim().is_empty() || snapshot.is_some() {
+                    display_name
+                } else {
+                    existing.name.clone()
+                };
+                return Ok((resolved_name, existing));
             }
             thread_gone = true;
         }
@@ -891,7 +909,7 @@ impl ConversationService {
         Ok((display_name, row))
     }
 
-    async fn resolve_aionrs_model_for_role(
+    pub async fn resolve_aionrs_model_for_role(
         &self,
         user_id: &str,
         role_id: &str,
@@ -1215,7 +1233,7 @@ impl ConversationService {
     /// Append the standing section of the role the conversation is started
     /// with to the rules it opens with. The rules are a snapshot, so the memory
     /// the conversation sees is the memory as it stands now.
-    async fn add_standing_role(&self, snapshot: &mut AssistantSnapshot, extra: &serde_json::Value) {
+    pub(crate) async fn add_standing_role(&self, snapshot: &mut AssistantSnapshot, extra: &serde_json::Value) {
         if put_to_work(extra) {
             return;
         }
@@ -2184,7 +2202,7 @@ impl ConversationService {
     }
 
     #[tracing::instrument(skip_all, fields(conversation_id = %conversation_id))]
-    async fn create_acp_session_row(
+    pub(crate) async fn create_acp_session_row(
         &self,
         user_id: &str,
         conversation_id: &str,
@@ -5036,7 +5054,7 @@ impl ConversationService {
         .await
     }
 
-    async fn cancel_with_cause(
+    pub(crate) async fn cancel_with_cause(
         &self,
         user_id: &str,
         conversation_id: &str,
@@ -5766,7 +5784,7 @@ fn strip_request_fork_spec(extra: &mut serde_json::Value) {
     }
 }
 
-fn team_id_from_extra(extra: &str) -> Option<String> {
+pub(crate) fn team_id_from_extra(extra: &str) -> Option<String> {
     TeamSessionBinding::team_id_marker_from_extra_str(extra)
 }
 
@@ -6002,7 +6020,7 @@ impl ConversationService {
     /// `None`), deduped by name and classified against the agent's transport
     /// support. Shared by `create()` and the team refresh path so both persist
     /// the exact same snapshot shape.
-    async fn build_runtime_mcp_snapshot(
+    pub(crate) async fn build_runtime_mcp_snapshot(
         &self,
         user_id: &str,
         selected_ids: Option<&[String]>,
