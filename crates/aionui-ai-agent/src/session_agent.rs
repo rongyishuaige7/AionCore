@@ -416,6 +416,12 @@ impl SessionAgentTask {
         if !self.runtime.title_reply_succeeded.load(Ordering::SeqCst) {
             return None;
         }
+        self.summarizer()
+    }
+
+    /// The isolated runner on the current model, whether or not a reply has
+    /// succeeded yet.
+    pub fn summarizer(&self) -> Option<Arc<dyn aionui_session::TitleGenerator>> {
         let model = self
             .runtime
             .model_override()

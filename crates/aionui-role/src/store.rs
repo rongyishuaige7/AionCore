@@ -8,7 +8,7 @@
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-use aionui_api_types::{KeeperLastStop, RoleKeptProject, RoleProposal, RoleReport};
+use aionui_api_types::{KeeperDebrief, KeeperLastStop, RoleKeptProject, RoleProposal, RoleReport};
 use serde::{Deserialize, Serialize};
 
 use crate::error::RoleError;
@@ -32,6 +32,7 @@ const PROGRESS_EXTENSION: &str = "md";
 const REPORTED_FILE: &str = "reported.jsonl";
 const THREAD_FILE: &str = "thread.json";
 const PROJECTS_DIR: &str = "projects";
+const DEBRIEFS_FILE: &str = "debriefs.jsonl";
 const THREAD_LEAVES_DIR: &str = "thread-leaves";
 const CONDENSED_DIR: &str = "condensed";
 const LEAF_EXTENSION: &str = "md";
@@ -234,6 +235,40 @@ impl RoleStore {
         serde_json::from_str(&raw)
             .map(Some)
             .map_err(|error| RoleError::Corrupt(format!("{id} project {project_id}: {error}")))
+    }
+
+    pub(crate) async fn write_project_ledger(
+        &self,
+        id: &str,
+        project_id: &str,
+        ledger: &ProjectLedger,
+    ) -> Result<(), RoleError> {
+        let raw = serde_json::to_vec_pretty(ledger).map_err(|error| RoleError::Corrupt(format!("{id}: {error}")))?;
+        let path = self.role_dir(id).join(PROJECTS_DIR).join(format!("{project_id}.json"));
+        write_atomic(&path, &raw).await
+    }
+
+    /// The role's automatic saves, oldest first, one JSON object per line of
+    /// `debriefs.jsonl`. A line that does not parse is skipped.
+    pub(crate) async fn read_debriefs(&self, id: &str) -> Result<Vec<KeeperDebrief>, RoleError> {
+        let raw = match tokio::fs::read_to_string(self.role_dir(id).join(DEBRIEFS_FILE)).await {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        Ok(raw
+            .lines()
+            .filter_map(|line| serde_json::from_str::<KeeperDebrief>(line).ok())
+            .collect())
+    }
+
+    pub(crate) async fn write_debriefs(&self, id: &str, debriefs: &[KeeperDebrief]) -> Result<(), RoleError> {
+        let mut contents = String::new();
+        for debrief in debriefs {
+            contents.push_str(&serde_json::to_string(debrief).map_err(std::io::Error::other)?);
+            contents.push('\n');
+        }
+        write_atomic(&self.role_dir(id).join(DEBRIEFS_FILE), contents.as_bytes()).await
     }
 
     pub(crate) async fn write_thread(&self, id: &str, record: &ThreadRecord) -> Result<(), RoleError> {

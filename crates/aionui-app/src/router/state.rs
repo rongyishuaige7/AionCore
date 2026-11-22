@@ -836,6 +836,49 @@ impl aionui_conversation::ConversationRolePort for RoleServiceConversationPort {
         })
     }
 
+    async fn keeper_debrief_context(
+        &self,
+        project_id: &str,
+        assistant_id: Option<&str>,
+        since: i64,
+    ) -> Option<aionui_api_types::KeeperDebriefContext> {
+        match self
+            .roles
+            .service
+            .keeper_debrief_context(project_id, assistant_id, since)
+            .await
+        {
+            Ok(context) => context,
+            Err(error) => {
+                tracing::warn!(project_id, error = %error, "conversation: keeper save context unavailable");
+                None
+            }
+        }
+    }
+
+    async fn record_keeper_debrief(
+        &self,
+        input: aionui_conversation::KeeperDebriefInput<'_>,
+    ) -> Option<aionui_api_types::KeeperDebrief> {
+        let record = aionui_role::DebriefRecord {
+            role_id: input.role_id,
+            project_id: input.project_id,
+            conversation_id: input.conversation_id,
+            message_id: input.message_id,
+            status: input.status,
+            draft: input.draft,
+            day: input.day,
+            at: input.at,
+        };
+        match self.roles.service.record_debrief(record).await {
+            Ok(debrief) => Some(debrief),
+            Err(error) => {
+                tracing::warn!(role_id = input.role_id, error = %error, "conversation: keeper save not recorded");
+                None
+            }
+        }
+    }
+
     async fn thread_news(&self, user_id: &str, assistant_id: &str, conversation_id: &str) -> Option<String> {
         let roles = &self.roles.service;
         let recorded = match roles.thread(assistant_id).await {
@@ -1066,6 +1109,9 @@ impl RoleGovernanceAdapter {
         role_id: &str,
         force_retrospective: bool,
     ) -> Result<aionui_api_types::RoleDreamResponse, String> {
+        // One memory pass of the role at a time: the keeper's automatic saves
+        // and the thread's summaries wait while the dreamer runs.
+        let _pass = aionui_conversation::lock_role_pass(role_id).await;
         let role = self.roles.get(role_id).await.map_err(|e| e.to_string())?;
         let now = aionui_common::now_ms();
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
@@ -1090,10 +1136,13 @@ impl RoleGovernanceAdapter {
         let mut curated_memory = false;
         if let Some(tidied) = llm_outcome.curated_memory {
             let stamp = chrono::Local::now().format("%Y-%m-%d-%H%M%S").to_string();
-            if let Ok(done) = self
+            // Only over the memory the dreamer read: a note the user took
+            // back meanwhile is not brought back by the tidied copy.
+            if let Ok(Some(done)) = self
                 .roles
-                .curate_memory_as(
+                .curate_memory_from(
                     role_id,
+                    &role.memory,
                     &tidied,
                     &stamp,
                     "dreamer",
@@ -1172,6 +1221,10 @@ impl aionui_role::RoleExternalPort for RoleGovernanceAdapter {
             }
             aionui_api_types::RoleProposalChange::UpdateRole { .. } => Ok(()),
         }
+    }
+
+    async fn on_debrief_changed(&self, user_id: &str, debrief: &aionui_api_types::KeeperDebrief) {
+        self.conversation.refresh_keeper_debrief_card(user_id, debrief).await;
     }
 
     async fn on_role_dismissed(&self, user_id: &str, role_id: &str) {

@@ -681,6 +681,12 @@ impl ConversationTurnOrchestrator {
             .complete_released_turn(&input.user_id, &conv_id, &turn_id, was_deleting)
             .await;
 
+        // The project's keeper saves what happened once the conversation goes
+        // quiet, on its own engine: no title runner of this turn is needed.
+        if !was_deleting {
+            self.service.schedule_keeper_debrief(&input.user_id, &conv_id);
+        }
+
         // Completion updates activity recency. Snapshot only after that write,
         // otherwise our own completion would invalidate every slow summary.
         if !was_deleting && let Some(generator) = title_generator {

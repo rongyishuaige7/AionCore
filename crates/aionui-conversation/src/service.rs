@@ -225,6 +225,25 @@ pub trait ConversationRolePort: Send + Sync {
         None
     }
 
+    /// What the keeper of `project_id` already knows of the project, as
+    /// material for an automatic save of a conversation there with
+    /// `assistant_id`, and how many saves it made since `since` (ms). `None`
+    /// when the project has no keeper, or the keeper is that assistant.
+    async fn keeper_debrief_context(
+        &self,
+        _project_id: &str,
+        _assistant_id: Option<&str>,
+        _since: i64,
+    ) -> Option<aionui_api_types::KeeperDebriefContext> {
+        None
+    }
+
+    /// Keep what an automatic save took in and record the save; `None` when
+    /// it could not be recorded.
+    async fn record_keeper_debrief(&self, _input: KeeperDebriefInput<'_>) -> Option<aionui_api_types::KeeperDebrief> {
+        None
+    }
+
     /// Persist a condensed leaf summarizing `consumed_count` `D0` leaves.
     async fn record_condensed_leaf(
         &self,
@@ -236,6 +255,31 @@ pub trait ConversationRolePort: Send + Sync {
     ) -> bool {
         false
     }
+}
+
+/// What an automatic save hands the keeper to record.
+#[derive(Debug, Clone, Copy)]
+pub struct KeeperDebriefInput<'a> {
+    pub role_id: &'a str,
+    pub project_id: &'a str,
+    pub conversation_id: &'a str,
+    /// The card the conversation shows for the save.
+    pub message_id: &'a str,
+    /// `Saved` when `draft` came back whole, else why there is none.
+    pub status: aionui_api_types::KeeperDebriefStatus,
+    pub draft: Option<&'a aionui_api_types::KeeperDebriefDraft>,
+    /// The local date (`YYYY-MM-DD`) the notes are written under.
+    pub day: &'a str,
+    pub at: i64,
+}
+
+/// A keeper's engine as an automatic save needs it: which backend it runs
+/// on, and a conversation row a runtime can be built from that is never
+/// stored, for a keeper with no conversation of its own.
+pub(crate) struct KeeperEngine {
+    pub(crate) backend: String,
+    pub(crate) agent_type: AgentType,
+    pub(crate) row: ConversationRow,
 }
 
 /// What a project's keeper hands a conversation in the project before its
@@ -251,7 +295,7 @@ pub struct ConversationKeeperBrief {
 
 /// `extra` key a conversation is created with when the user turned the
 /// keeper's brief off for it.
-const KEEPER_BRIEF_OFF_KEY: &str = "keeper_brief_off";
+pub(crate) const KEEPER_BRIEF_OFF_KEY: &str = "keeper_brief_off";
 /// `extra` keys a briefed conversation carries: when, and by which role.
 const KEEPER_BRIEFED_AT_KEY: &str = "keeper_briefed_at";
 const KEEPER_BRIEF_ROLE_KEY: &str = "keeper_brief_role";
@@ -263,7 +307,7 @@ const KEEPER_BRIEF_EVENT: &str = "role.keeper_brief";
 
 /// `extra` keys of a conversation the user opens beside something else: never
 /// a role's thread.
-const THREAD_ASIDE_KEYS: [&str; 2] = ["companion_of", "jot_trial"];
+pub(crate) const THREAD_ASIDE_KEYS: [&str; 2] = ["companion_of", "jot_trial"];
 
 /// `extra` keys of a conversation a schedule or a team creates. Those put the
 /// role to work with their own wording of its section, so such a conversation
@@ -297,7 +341,7 @@ pub(crate) struct AssistantSnapshot {
 }
 
 /// Whether a schedule or a team created the conversation `extra` belongs to.
-fn put_to_work(extra: &serde_json::Value) -> bool {
+pub(crate) fn put_to_work(extra: &serde_json::Value) -> bool {
     PUT_TO_WORK_EXTRA_KEYS.iter().any(|key| extra.get(key).is_some())
 }
 
@@ -505,6 +549,9 @@ pub struct ConversationService {
     pub(crate) titles: crate::title_service::ConversationTitles,
     /// Role threads seen this run, and their pending summary jobs.
     pub(crate) role_threads: crate::role_thread::RoleThreads,
+    /// Conversations in kept projects waiting to go quiet before their keeper
+    /// saves what happened in them.
+    pub(crate) keeper_debriefs: crate::keeper_debrief::KeeperDebriefs,
 
     // Repos for conversation, acp_session and agent_metadata access.
     conversation_repo: Arc<dyn IConversationRepository>,
@@ -568,6 +615,7 @@ impl ConversationService {
         Self {
             titles,
             role_threads: crate::role_thread::RoleThreads::default(),
+            keeper_debriefs: crate::keeper_debrief::KeeperDebriefs::default(),
             workspace_root,
             broadcaster,
             skill_resolver,
@@ -904,6 +952,73 @@ impl ConversationService {
 
     pub fn conversation_repo(&self) -> &Arc<dyn IConversationRepository> {
         &self.conversation_repo
+    }
+
+    /// The keeper `role_id`'s engine; `None` when the role is no assistant.
+    /// The row's workspace is a fresh scratch folder the caller removes once
+    /// done with the runtime and anything it spawned.
+    pub(crate) async fn keeper_engine(
+        &self,
+        user_id: &str,
+        role_id: &str,
+    ) -> Result<Option<KeeperEngine>, ConversationError> {
+        let Some(snapshot) = self
+            .resolve_assistant_snapshot(
+                user_id,
+                role_id,
+                None,
+                &AssistantConversationOverrides::default(),
+                &serde_json::json!({}),
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let id = format!("{}{}", crate::keeper_debrief::SCRATCH_PREFIX, generate_short_id());
+        let workspace = auto_workspace_parent(&self.workspace_root, user_id).join(&id);
+        std::fs::create_dir_all(&workspace)
+            .map_err(|e| ConversationError::internal(format!("Failed to create workspace: {e}")))?;
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "workspace".into(),
+            serde_json::Value::String(workspace.to_string_lossy().into_owned()),
+        );
+        extra.insert("preset_assistant_id".into(), serde_json::json!(role_id));
+        for (key, value) in [
+            ("backend", &snapshot.runtime_backend),
+            ("agent_id", &snapshot.agent_id),
+            ("agent_source", &snapshot.agent_source),
+        ] {
+            if !value.is_empty() {
+                extra.insert(key.into(), serde_json::json!(value));
+            }
+        }
+        if let Some(model) = snapshot.resolved_defaults.model.as_ref() {
+            extra.insert("current_model_id".into(), serde_json::json!(model));
+        }
+        let now = now_ms();
+        Ok(Some(KeeperEngine {
+            backend: snapshot.runtime_backend.clone(),
+            agent_type: snapshot.agent_type,
+            row: ConversationRow {
+                id,
+                user_id: user_id.to_owned(),
+                name: String::new(),
+                r#type: snapshot.agent_type.serde_name().to_owned(),
+                extra: serde_json::Value::Object(extra).to_string(),
+                model: None,
+                status: None,
+                source: None,
+                channel_chat_id: None,
+                pinned: false,
+                pinned_at: None,
+                created_at: now,
+                updated_at: now,
+                project_id: None,
+                folder_id: None,
+                name_source: None,
+            },
+        }))
     }
 
     pub(crate) fn broadcaster(&self) -> &Arc<dyn EventBroadcaster> {

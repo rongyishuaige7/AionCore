@@ -131,6 +131,36 @@ pub(crate) fn compose(sources: &BriefSources<'_>, opening: &str) -> KeeperBrief 
     }
 }
 
+/// Every lesson of the playbook that bears on the project, net-helpful
+/// first, up to `max`.
+pub(crate) fn project_lessons(sources: &BriefSources<'_>, max: usize) -> Vec<KeeperBriefLesson> {
+    let lens = Lens::new(sources.project_name, sources.other_projects, "");
+    let mut lessons: Vec<_> = sources
+        .playbook
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| lens.belongs(&entry.content))
+        .map(|(index, entry)| {
+            let net = i64::from(entry.helpful) - i64::from(entry.harmful);
+            ((lens.weight(&entry.content), net, -(index as i64)), entry)
+        })
+        .collect();
+    lessons.sort_by_key(|lesson| std::cmp::Reverse(lesson.0));
+    lessons
+        .into_iter()
+        .take(max)
+        .map(|(_, entry)| KeeperBriefLesson {
+            id: entry.id.clone(),
+            text: cut(&one_line(&entry.content), ITEM_CHARS),
+        })
+        .collect()
+}
+
+/// `text` flattened to one line and cut to `max` characters.
+pub(crate) fn one_line_cut(text: &str, max: usize) -> String {
+    cut(&one_line(text), max)
+}
+
 /// Whether the keeper has anything to hand over. Its charter alone is no
 /// brief: it says who the keeper is, not what it knows of the project.
 pub(crate) fn has_content(brief: &KeeperBrief) -> bool {

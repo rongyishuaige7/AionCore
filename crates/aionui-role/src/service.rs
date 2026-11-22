@@ -25,6 +25,10 @@ use crate::recall::{RecallIndex, RecallSync, RecallWatermark};
 pub use crate::store::ThreadMark;
 use crate::store::{RoleDefinition, RoleStore, ThreadRecord};
 
+#[path = "debrief.rs"]
+mod debrief;
+pub use debrief::{DebriefRecord, MAX_KEPT_DEBRIEFS};
+
 /// Cap on a charter, in characters.
 pub const MAX_CHARTER_CHARS: usize = 4_000;
 /// Cap on `MEMORY.md`, in bytes.
@@ -60,7 +64,7 @@ pub struct RememberedNote {
 }
 
 /// What [`RoleService::curate_memory`] did with the memory.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CuratedMemory {
     /// File the replaced memory was kept as, under `memory/archive/`. `None`
     /// when nothing was replaced: the memory was empty or already read the same.
@@ -343,6 +347,37 @@ impl RoleService {
         actor: &str,
         commit_msg: &str,
     ) -> Result<CuratedMemory, RoleError> {
+        self.curate_memory_checked(id, None, memory, stamp, actor, commit_msg)
+            .await
+            .map(|curated| curated.unwrap_or_default())
+    }
+
+    /// Like [`Self::curate_memory_as`], but only while the memory still reads
+    /// `seen`, the version the tidied one was made from: a note saved or taken
+    /// back while the curation ran is never written over. `None` when the
+    /// memory changed meanwhile and nothing was written.
+    pub async fn curate_memory_from(
+        &self,
+        id: &str,
+        seen: &str,
+        memory: &str,
+        stamp: &str,
+        actor: &str,
+        commit_msg: &str,
+    ) -> Result<Option<CuratedMemory>, RoleError> {
+        self.curate_memory_checked(id, Some(seen), memory, stamp, actor, commit_msg)
+            .await
+    }
+
+    async fn curate_memory_checked(
+        &self,
+        id: &str,
+        seen: Option<&str>,
+        memory: &str,
+        stamp: &str,
+        actor: &str,
+        commit_msg: &str,
+    ) -> Result<Option<CuratedMemory>, RoleError> {
         validate_role_id(id)?;
         let curated = memory.trim_end();
         if curated.trim().is_empty() {
@@ -363,13 +398,16 @@ impl RoleService {
 
         let _guard = self.memory_lock.lock().await;
         let previous = self.store.read_memory(id).await?;
+        if seen.is_some_and(|seen| seen.trim_end() != previous.trim_end()) {
+            return Ok(None);
+        }
         let bytes_before = previous.len();
         if previous.trim_end() == curated.trim_end() {
-            return Ok(CuratedMemory {
+            return Ok(Some(CuratedMemory {
                 archived_as: None,
                 bytes_before,
                 bytes_after: bytes_before,
-            });
+            }));
         }
         let now = now_ms();
         let role_dir = self.store.role_dir(id);
@@ -392,11 +430,11 @@ impl RoleService {
             now,
         )
         .await?;
-        Ok(CuratedMemory {
+        Ok(Some(CuratedMemory {
             archived_as,
             bytes_before,
             bytes_after: curated.len(),
-        })
+        }))
     }
 
     /// Record where a task stands, replacing what was recorded for it before.

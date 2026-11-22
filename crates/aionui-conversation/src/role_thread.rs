@@ -243,7 +243,7 @@ fn render_lines(lines: &[Line], cap: usize) -> String {
 
 /// The newest of `lines` that fit in `budget` characters, rendered in order,
 /// and whether older ones were left out.
-fn render_tail(lines: &[Line], cap: usize, budget: usize) -> (String, bool) {
+pub(crate) fn render_tail(lines: &[Line], cap: usize, budget: usize) -> (String, bool) {
     let mut kept = Vec::new();
     let mut used = 0;
     for line in lines.iter().rev() {
@@ -751,6 +751,7 @@ impl ConversationService {
             let Ok(_slot) = UPKEEP_SLOTS.acquire().await else {
                 return;
             };
+            let _pass = crate::keeper_debrief::lock_role_pass(&assistant_id).await;
             this.maybe_run_retrospective(
                 &user_id,
                 &assistant_id,
@@ -851,6 +852,7 @@ impl ConversationService {
             let Ok(_slot) = UPKEEP_SLOTS.acquire().await else {
                 return;
             };
+            let _pass = crate::keeper_debrief::lock_role_pass(&assistant_id).await;
             this.summarize_thread(&user_id, &conversation_id, &assistant_id, generator.as_ref())
                 .await;
         });

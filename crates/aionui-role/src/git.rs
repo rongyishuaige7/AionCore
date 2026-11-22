@@ -23,6 +23,8 @@ dreamer.json
 memory/archive/
 memory/progress/
 memory/reported.jsonl
+projects/
+debriefs.jsonl
 *.tmp
 ";
 
@@ -96,10 +98,41 @@ fn git_err(err: git2::Error) -> RoleError {
 fn ensure_gitignore(repo_dir: &Path) -> Result<(), RoleError> {
     std::fs::create_dir_all(repo_dir)?;
     let ignore_path = repo_dir.join(".gitignore");
-    if !ignore_path.exists() {
-        std::fs::write(&ignore_path, GITIGNORE_CONTENT)?;
+    let current = match std::fs::read_to_string(&ignore_path) {
+        Ok(current) => current,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::write(&ignore_path, GITIGNORE_CONTENT)?;
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if let Some(updated) = with_ignored_runtime_files(&current) {
+        std::fs::write(&ignore_path, updated)?;
     }
     Ok(())
+}
+
+/// `current` with every runtime path a newer release keeps out of history
+/// appended, keeping whatever the file already holds; `None` when nothing is
+/// missing. Repositories made before a path was added learn it this way.
+fn with_ignored_runtime_files(current: &str) -> Option<String> {
+    let present: std::collections::HashSet<&str> = current.lines().map(str::trim).collect();
+    let missing: Vec<&str> = GITIGNORE_CONTENT
+        .lines()
+        .filter(|line| !line.is_empty() && !present.contains(line))
+        .collect();
+    if missing.is_empty() {
+        return None;
+    }
+    let mut updated = current.to_owned();
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    for line in missing {
+        updated.push_str(line);
+        updated.push('\n');
+    }
+    Some(updated)
 }
 
 fn open_or_init(repo_dir: &Path) -> Result<(Repository, bool), RoleError> {
@@ -342,4 +375,23 @@ fn describe_commit(repo: &Repository, commit: &git2::Commit<'_>) -> Result<RoleC
         diff: rendered.trim_end().to_owned(),
         can_revert,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_old_ignore_file_learns_the_runtime_paths_it_misses_and_keeps_its_own() {
+        let old = "thread.json\nmy-notes/\n";
+        let updated = with_ignored_runtime_files(old).expect("paths missing");
+        assert!(updated.starts_with(old));
+        for line in ["projects/", "debriefs.jsonl", "memory/progress/"] {
+            assert!(updated.lines().any(|l| l == line), "{line} missing");
+        }
+        assert_eq!(updated.matches("thread.json").count(), 1);
+        assert_eq!(with_ignored_runtime_files(&updated), None);
+        assert_eq!(with_ignored_runtime_files(GITIGNORE_CONTENT), None);
+        assert!(with_ignored_runtime_files("thread.json").is_some_and(|u| u.starts_with("thread.json\n")));
+    }
 }

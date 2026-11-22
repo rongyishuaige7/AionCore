@@ -154,6 +154,165 @@ pub struct KeeperBriefResponse {
     pub brief: Option<KeeperBrief>,
 }
 
+/// What became of one automatic save of a conversation into its project's
+/// memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeeperDebriefStatus {
+    /// Something new was kept, or a lesson may have been stepped on.
+    Saved,
+    /// The conversation held nothing new worth keeping.
+    Nothing,
+    /// The keeper's engine cannot write a summary, so nothing was kept.
+    Unsupported,
+    /// The summary did not come back whole, so nothing was kept.
+    Failed,
+}
+
+/// Where one kept item went in the keeper's memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeeperDebriefItemKind {
+    /// A line of `MEMORY.md`.
+    Note,
+    /// A playbook lesson.
+    Lesson,
+    /// The state of a task under way.
+    Progress,
+}
+
+/// One thing an automatic save kept, which the user can take back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeeperDebriefItem {
+    /// What the item is kept under: the memory line for a note, the playbook
+    /// id for a lesson, the task name for progress.
+    pub key: String,
+    pub kind: KeeperDebriefItemKind,
+    pub text: String,
+    /// The user took it back.
+    #[serde(default)]
+    pub forgotten: bool,
+    /// For progress: where the task stood before this save; absent when the
+    /// task was new.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous: Option<String>,
+}
+
+/// A lesson the conversation may have run against.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeeperDebriefWarning {
+    pub lesson_id: String,
+    /// The lesson as the playbook holds it.
+    pub lesson: String,
+    /// Files the conversation changed that bear on the lesson.
+    #[serde(default)]
+    pub files: Vec<String>,
+    /// Why the lesson may apply, in a sentence.
+    #[serde(default)]
+    pub note: String,
+    /// The user said the lesson no longer holds.
+    #[serde(default)]
+    pub outdated: bool,
+}
+
+/// One automatic save of a conversation into its project keeper's memory, as
+/// the keeper records it and the conversation shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeeperDebrief {
+    pub id: String,
+    pub role_id: String,
+    pub project_id: String,
+    #[serde(default)]
+    pub project_name: String,
+    pub conversation_id: String,
+    /// The card it left in the conversation; empty when it left none.
+    #[serde(default)]
+    pub message_id: String,
+    pub at: TimestampMs,
+    pub status: KeeperDebriefStatus,
+    /// Where work stopped, as the save took it in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_stop: Option<String>,
+    #[serde(default)]
+    pub items: Vec<KeeperDebriefItem>,
+    #[serde(default)]
+    pub warnings: Vec<KeeperDebriefWarning>,
+}
+
+/// `GET /api/roles/{id}/debriefs` — the role's automatic saves, newest first.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeeperDebriefsResponse {
+    pub debriefs: Vec<KeeperDebrief>,
+}
+
+/// `POST /api/roles/{id}/debriefs/{debrief_id}/forget` — take one kept item back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForgetKeeperDebriefItemRequest {
+    pub key: String,
+}
+
+/// `POST /api/roles/{id}/debriefs/{debrief_id}/outdated` — the lesson a
+/// warning pointed at no longer holds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutdatedKeeperLessonRequest {
+    pub lesson_id: String,
+}
+
+/// The save as it stands after the user changed it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeeperDebriefResponse {
+    pub debrief: KeeperDebrief,
+}
+
+/// A lesson the summarizer thinks the conversation ran against.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeeperDebriefDraftWarning {
+    pub lesson_id: String,
+    #[serde(default)]
+    pub files: Vec<String>,
+    #[serde(default)]
+    pub note: String,
+}
+
+/// What the keeper's summarizer took from a conversation, before any of it is
+/// kept.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeeperDebriefDraft {
+    #[serde(default)]
+    pub last_stop: String,
+    #[serde(default)]
+    pub notes: Vec<String>,
+    #[serde(default)]
+    pub lessons: Vec<String>,
+    #[serde(default)]
+    pub progress: Vec<KeeperBriefTask>,
+    #[serde(default)]
+    pub warnings: Vec<KeeperDebriefDraftWarning>,
+}
+
+/// What a project's keeper already knows of the project, as material for an
+/// automatic save, and how many saves it made since the caller's day began.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeeperDebriefContext {
+    pub role_id: String,
+    pub project_id: String,
+    #[serde(default)]
+    pub project_name: String,
+    #[serde(default)]
+    pub charter: String,
+    #[serde(default)]
+    pub notes: Vec<String>,
+    #[serde(default)]
+    pub lessons: Vec<KeeperBriefLesson>,
+    #[serde(default)]
+    pub progress: Vec<KeeperBriefTask>,
+    #[serde(default)]
+    pub saves_today: usize,
+    /// The keeper's own thread with the user, whose engine can do the save.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_conversation_id: Option<String>,
+}
+
 /// How a run nobody watched ended, as the role itself declared it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

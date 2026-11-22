@@ -6,6 +6,7 @@ mod agent_health_policy;
 mod background_stream;
 mod convert;
 pub mod error;
+mod keeper_debrief;
 pub(crate) mod message_cursor;
 mod message_persistence;
 pub mod response_middleware;
@@ -36,6 +37,7 @@ mod turn_recovery_policy;
 
 pub use convert::row_to_response_with_extra;
 pub use error::ConversationError;
+pub use keeper_debrief::lock_role_pass;
 pub use response_middleware::{MessageMiddleware, MiddlewareResult, strip_think_tags};
 pub use role_retrospective::{
     CONDENSE_BATCH_SIZE, DREAMER_CURATE_THRESHOLD_BYTES, RoleDreamTasksOutcome, RoleRetrospectiveContext,
@@ -49,7 +51,7 @@ pub use service::is_temp_session_workspace;
 pub use service::{
     ConversationAgentTurnOutcome, ConversationAgentTurnRequest, ConversationAgentTurnStarted,
     ConversationAgentTurnStartedCallback, ConversationAgentTurnStatus, ConversationKeeperBrief, ConversationRolePort,
-    ConversationService,
+    ConversationService, KeeperDebriefInput,
 };
 pub use state::ConversationRouterState;
 pub use turn_orchestrator::ASK_FIRST_RUNTIME_MODE;

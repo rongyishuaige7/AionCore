@@ -20,11 +20,15 @@
 //! - `GET /api/roles/keepers` — every kept project and the role keeping it.
 //! - `GET /api/roles/keepers/{project_id}/brief` — what the project's keeper would hand a new conversation.
 //! - `PUT /api/roles/{id}/projects` — the projects the role keeps (agents may only let go).
+//! - `GET /api/roles/{id}/debriefs` — the role's automatic saves of kept projects' conversations.
+//! - `POST /api/roles/{id}/debriefs/{debrief_id}/forget` — the user takes back one item a save kept.
+//! - `POST /api/roles/{id}/debriefs/{debrief_id}/outdated` — the user says a lesson a save warned about no longer holds.
 
 use aionui_api_types::{
-    ApiResponse, KeeperBriefResponse, RoleDreamResponse, RoleKeepersResponse, RoleListResponse, RoleProposalChange,
-    RoleResponse, RoleRevertRequest, RoleTimelineResponse, SetRoleProjectsRequest, UpdateRoleMemoryRequest,
-    UpsertRoleRequest,
+    ApiResponse, ForgetKeeperDebriefItemRequest, KeeperBriefResponse, KeeperDebrief, KeeperDebriefResponse,
+    KeeperDebriefsResponse, OutdatedKeeperLessonRequest, RoleDreamResponse, RoleKeepersResponse, RoleListResponse,
+    RoleProposalChange, RoleResponse, RoleRevertRequest, RoleTimelineResponse, SetRoleProjectsRequest,
+    UpdateRoleMemoryRequest, UpsertRoleRequest,
 };
 use aionui_common::{ApiError, AuthenticatedUserId, RuntimeHelperCaller, now_ms};
 use axum::extract::{Extension, Path, State};
@@ -56,6 +60,15 @@ pub fn role_routes(state: RoleRouterState) -> Router {
         .route("/api/roles/{id}/timeline", get(get_timeline))
         .route("/api/roles/{id}/revert", post(revert_role))
         .route("/api/roles/{id}/dream", post(dream_role))
+        .route("/api/roles/{id}/debriefs", get(list_debriefs))
+        .route(
+            "/api/roles/{id}/debriefs/{debrief_id}/forget",
+            post(forget_debrief_item),
+        )
+        .route(
+            "/api/roles/{id}/debriefs/{debrief_id}/outdated",
+            post(outdated_debrief_lesson),
+        )
         .with_state(state)
 }
 
@@ -331,6 +344,74 @@ fn require_human_caller(helper: &Option<Extension<RuntimeHelperCaller>>) -> Resu
         ));
     }
     Ok(())
+}
+
+async fn list_debriefs(
+    State(state): State<RoleRouterState>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<KeeperDebriefsResponse>>, ApiError> {
+    let debriefs = state.service.debriefs(&id).await.map_err(to_api_error)?;
+    Ok(Json(ApiResponse::ok(KeeperDebriefsResponse { debriefs })))
+}
+
+/// Taking back what a save kept is the user's call; an agent cannot.
+async fn forget_debrief_item(
+    State(state): State<RoleRouterState>,
+    user: Option<Extension<AuthenticatedUserId>>,
+    helper: Option<Extension<RuntimeHelperCaller>>,
+    Path((id, debrief_id)): Path<(String, String)>,
+    Json(body): Json<ForgetKeeperDebriefItemRequest>,
+) -> Result<Json<ApiResponse<KeeperDebriefResponse>>, ApiError> {
+    if helper.is_some() {
+        return Err(user_only());
+    }
+    let debrief = state
+        .service
+        .forget_debrief_item(&id, &debrief_id, &body.key, now_ms())
+        .await
+        .map_err(to_api_error)?;
+    debrief_changed(&state, &user, &debrief).await;
+    Ok(Json(ApiResponse::ok(KeeperDebriefResponse { debrief })))
+}
+
+/// Saying a lesson no longer holds is the user's call; an agent cannot.
+async fn outdated_debrief_lesson(
+    State(state): State<RoleRouterState>,
+    user: Option<Extension<AuthenticatedUserId>>,
+    helper: Option<Extension<RuntimeHelperCaller>>,
+    Path((id, debrief_id)): Path<(String, String)>,
+    Json(body): Json<OutdatedKeeperLessonRequest>,
+) -> Result<Json<ApiResponse<KeeperDebriefResponse>>, ApiError> {
+    if helper.is_some() {
+        return Err(user_only());
+    }
+    let debrief = state
+        .service
+        .mark_debrief_lesson_outdated(&id, &debrief_id, body.lesson_id.trim(), now_ms())
+        .await
+        .map_err(to_api_error)?;
+    debrief_changed(&state, &user, &debrief).await;
+    Ok(Json(ApiResponse::ok(KeeperDebriefResponse { debrief })))
+}
+
+/// The card the save left in its conversation follows the change.
+async fn debrief_changed(
+    state: &RoleRouterState,
+    user: &Option<Extension<AuthenticatedUserId>>,
+    debrief: &KeeperDebrief,
+) {
+    if let Some(ref external) = state.external {
+        external.on_debrief_changed(&caller_user_id(user), debrief).await;
+    }
+}
+
+fn user_only() -> ApiError {
+    ApiError::coded(
+        StatusCode::FORBIDDEN,
+        "role_user_only",
+        "only the user can take back what a role saved",
+        None,
+    )
 }
 
 fn caller_user_id(user: &Option<Extension<AuthenticatedUserId>>) -> String {

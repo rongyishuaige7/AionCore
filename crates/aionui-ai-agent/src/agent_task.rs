@@ -225,6 +225,16 @@ impl AgentInstance {
             Self::Mock(m) => m.title_generator(),
         }
     }
+    /// The same isolated runner, without waiting for one of this
+    /// conversation's replies to have succeeded first: for digests made on
+    /// someone else's behalf, which have nothing to do with this
+    /// conversation's title.
+    pub async fn summarizer(&self) -> Option<Arc<dyn aionui_session::TitleGenerator>> {
+        match self {
+            Self::Session(m) => m.summarizer(),
+            other => other.title_generator().await,
+        }
+    }
     /// Common `IAgentTask` view, regardless of variant.
     pub fn as_task(&self) -> &dyn IAgentTask {
         match self {

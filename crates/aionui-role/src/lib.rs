@@ -16,6 +16,7 @@
 //! roles/<assistant_id>/thread.json                  the one conversation the user keeps with it
 //! roles/<assistant_id>/thread-leaves/<conv>/*.md    summaries of that conversation, oldest first
 //! roles/<assistant_id>/projects/<project>.json     where work in a kept project last stopped
+//! roles/<assistant_id>/debriefs.jsonl               automatic saves of kept projects' conversations
 //! roles/recall.db                                   rebuildable FTS5 index over threads, runs & leaves
 //! ```
 //!
@@ -46,8 +47,8 @@ pub use recall::{
 };
 pub use routes::role_routes;
 pub use service::{
-    CuratedMemory, MAX_CHARTER_CHARS, MAX_MEMORY_ARCHIVES, MAX_MEMORY_BYTES, MAX_NOTE_CHARS, MAX_PROGRESS_STATE_CHARS,
-    MAX_PROGRESS_TASKS, MAX_TASK_NAME_CHARS, ProgressUpdate, RememberedNote, RoleService, ThreadMark, ThreadTurn,
-    ThreadUpkeep,
+    CuratedMemory, DebriefRecord, MAX_CHARTER_CHARS, MAX_KEPT_DEBRIEFS, MAX_MEMORY_ARCHIVES, MAX_MEMORY_BYTES,
+    MAX_NOTE_CHARS, MAX_PROGRESS_STATE_CHARS, MAX_PROGRESS_TASKS, MAX_TASK_NAME_CHARS, ProgressUpdate, RememberedNote,
+    RoleService, ThreadMark, ThreadTurn, ThreadUpkeep,
 };
 pub use state::{RoleExternalPort, RoleRouterState};
