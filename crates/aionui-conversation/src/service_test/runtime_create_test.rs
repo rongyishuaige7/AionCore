@@ -529,3 +529,59 @@ async fn an_aionrs_assistant_in_auto_mode_with_no_preference_is_model_unresolved
         .await;
     assert_code(result, ConversationToolErrorCode::AssistantModelUnresolved, 422);
 }
+
+#[tokio::test]
+async fn an_aionrs_keepers_engine_carries_the_provider_of_its_model_and_makes_no_folder_yet() {
+    let (svc, _broadcaster, _repo, definition_repo, _overlay_repo, _preference_repo) =
+        make_service_with_mock_task_manager_and_assistant_support(Arc::new(MockTaskManager::new())).await;
+    upsert_assistant_with_fixed_model(&definition_repo, "def-rs", "seo", "632f31d2", Some("model-b")).await;
+    svc.with_provider_repo(
+        provider_repo_with(&[
+            ("prov-disabled", r#"["model-b"]"#, false),
+            ("prov-match", r#"["model-a","model-b"]"#, true),
+        ])
+        .await,
+    );
+
+    let engine = svc.keeper_engine(USER, "seo").await.unwrap().expect("an engine");
+
+    assert_eq!(engine.agent_type, AgentType::Aionrs);
+    let model: ProviderWithModel = serde_json::from_str(engine.row.model.as_deref().expect("a model")).unwrap();
+    assert_eq!(model.provider_id, "prov-match");
+    assert_eq!(model.model, "model-b");
+    assert_eq!(model.use_model.as_deref(), Some("model-b"));
+    assert!(
+        engine
+            .workspace
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(crate::keeper_debrief::SCRATCH_PREFIX))
+    );
+    assert!(!engine.workspace.exists(), "made only when a runtime is built from it");
+}
+
+#[tokio::test]
+async fn an_aionrs_keeper_whose_model_no_provider_offers_has_an_engine_without_a_model() {
+    let (svc, _broadcaster, _repo, definition_repo, _overlay_repo, _preference_repo) =
+        make_service_with_mock_task_manager_and_assistant_support(Arc::new(MockTaskManager::new())).await;
+    upsert_assistant_with_fixed_model(&definition_repo, "def-rs", "seo", "632f31d2", Some("model-b")).await;
+    svc.with_provider_repo(provider_repo_with(&[("prov-1", r#"["model-a"]"#, true)]).await);
+
+    let engine = svc.keeper_engine(USER, "seo").await.unwrap().expect("an engine");
+
+    assert_eq!(engine.agent_type, AgentType::Aionrs);
+    assert!(engine.row.model.is_none());
+}
+
+#[tokio::test]
+async fn a_claude_keepers_engine_carries_no_model() {
+    let (svc, _broadcaster, _repo, definition_repo, _overlay_repo, _preference_repo) =
+        make_service_with_mock_task_manager_and_assistant_support(Arc::new(MockTaskManager::new())).await;
+    upsert_assistant_with_fixed_model(&definition_repo, "def-claude", "seo", "2d23ff1c", None).await;
+
+    let engine = svc.keeper_engine(USER, "seo").await.unwrap().expect("an engine");
+
+    assert_eq!(engine.backend, "claude");
+    assert!(engine.row.model.is_none());
+    assert!(!engine.workspace.exists());
+}

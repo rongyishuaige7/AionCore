@@ -80,7 +80,7 @@ fn notes_are_tagged_with_their_project_and_never_written_twice() {
         written,
         vec![(
             "- 2026-11-21 [store] Product pages use JSON-LD".to_owned(),
-            "[store] Product pages use JSON-LD".to_owned()
+            "Product pages use JSON-LD".to_owned()
         )]
     );
     assert_eq!(
@@ -202,7 +202,15 @@ async fn a_save_lands_in_memory_playbook_progress_and_the_project_ledger() {
             (KeeperDebriefItemKind::Progress, "sitemap"),
         ]
     );
+    assert_eq!(
+        saved.items[0].text, "Product pages use JSON-LD",
+        "shown without day or tag"
+    );
     assert_eq!(saved.items[2].previous.as_deref(), Some("generator drafted"));
+    assert_eq!(
+        saved.last_stop.as_deref(),
+        Some("Sitemap submitted; waiting on Search Console")
+    );
     assert_eq!(saved.warnings.len(), 1);
     assert_eq!(saved.warnings[0].lesson, "Check robots.txt on staging before shipping");
     assert_eq!(saved.warnings[0].files, vec!["public/robots.txt"]);
@@ -243,6 +251,23 @@ async fn a_save_lands_in_memory_playbook_progress_and_the_project_ledger() {
         .unwrap();
     assert_eq!(again.status, KeeperDebriefStatus::Nothing);
     assert!(again.items.is_empty());
+    assert_eq!(again.last_stop, None, "the same stop is not news");
+
+    // Only where the work stopped moved on: still a save.
+    let moved = service
+        .record_debrief(record(
+            Some(&KeeperDebriefDraft {
+                last_stop: "Search Console accepted the sitemap".into(),
+                ..KeeperDebriefDraft::default()
+            }),
+            KeeperDebriefStatus::Saved,
+            5_000,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(moved.status, KeeperDebriefStatus::Saved);
+    assert!(moved.items.is_empty());
+    assert_eq!(moved.last_stop.as_deref(), Some("Search Console accepted the sitemap"));
 }
 
 #[tokio::test]

@@ -198,6 +198,9 @@ pub enum MessageType {
     /// What a project's keeper handed a conversation in the project before its
     /// first message. Shown to the user; the agent got it with that message.
     KeeperBrief,
+    /// What a project's keeper kept once a conversation in the project went
+    /// quiet, left under the reply it followed. Shown to the user only.
+    KeeperDebrief,
 }
 
 /// Display position of a message in the chat UI.
@@ -463,6 +466,9 @@ mod tests {
         let val = MessageType::AgentStatus;
         let json = serde_json::to_string(&val).unwrap();
         assert_eq!(json, r#""agent_status""#);
+
+        let parsed: MessageType = serde_json::from_str(r#""keeper_debrief""#).unwrap();
+        assert_eq!(parsed, MessageType::KeeperDebrief);
     }
 
     #[test]

@@ -66,6 +66,9 @@ mod project_move_test;
 #[path = "service_test/keeper_brief_test.rs"]
 mod keeper_brief_test;
 
+#[path = "service_test/keeper_debrief_card_test.rs"]
+mod keeper_debrief_card_test;
+
 #[derive(Clone, Debug)]
 struct RecordedViewSync {
     user_id: String,

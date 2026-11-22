@@ -183,38 +183,74 @@ pub(crate) fn parse_debrief(answer: &str) -> Option<KeeperDebriefDraft> {
     serde_json::from_str(&body[start..=end]).ok()
 }
 
-/// Every file the rows changed, by path, in the order first changed.
+/// Every file the rows changed, by path, in the order first changed: the
+/// diffs of ACP tool calls and the WriteFile results of tool groups, read the
+/// way the conversation's own change list reads them.
 pub(crate) fn changed_files(rows: &[MessageRow]) -> Vec<String> {
     let mut files: Vec<String> = Vec::new();
-    for row in rows.iter().filter(|row| row.r#type == "acp_tool_call") {
+    for row in rows {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&row.content) else {
             continue;
         };
-        let Some(entries) = value
-            .get("update")
-            .and_then(|update| update.get("content"))
-            .and_then(serde_json::Value::as_array)
-        else {
-            continue;
+        let paths = match row.r#type.as_str() {
+            "acp_tool_call" => diff_paths(&value),
+            "tool_group" => written_paths(&value),
+            _ => continue,
         };
-        for entry in entries {
-            if entry.get("type").and_then(serde_json::Value::as_str) != Some("diff") {
-                continue;
-            }
-            let Some(path) = entry
-                .get("path")
-                .and_then(serde_json::Value::as_str)
-                .map(str::trim)
-                .filter(|path| !path.is_empty())
-            else {
-                continue;
-            };
+        for path in paths.into_iter().map(str::trim).filter(|path| !path.is_empty()) {
             if !files.iter().any(|file| file == path) {
                 files.push(path.to_owned());
             }
         }
     }
     files
+}
+
+/// The paths an ACP tool call's diffs changed.
+fn diff_paths(value: &serde_json::Value) -> Vec<&str> {
+    value
+        .get("update")
+        .and_then(|update| update.get("content"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|entry| entry.get("type").and_then(serde_json::Value::as_str) == Some("diff"))
+        .filter_map(|entry| entry.get("path").and_then(serde_json::Value::as_str))
+        .collect()
+}
+
+/// The files a tool group's WriteFile calls wrote: the path in the diff's
+/// header, else the file name the result gives.
+fn written_paths(value: &serde_json::Value) -> Vec<&str> {
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|item| item.get("name").and_then(serde_json::Value::as_str) == Some("WriteFile"))
+        .filter_map(|item| item.get("result_display"))
+        .filter_map(|result| {
+            let diff = result
+                .get("file_diff")
+                .and_then(serde_json::Value::as_str)
+                .filter(|diff| !diff.is_empty())?;
+            let name = result.get("file_name").and_then(serde_json::Value::as_str)?;
+            Some(diff_header_path(diff).unwrap_or(name))
+        })
+        .collect()
+}
+
+/// The file a unified diff names in its header: `diff --git a/…`, an
+/// `Index:` line, then `+++ b/…`, then `--- a/…`.
+fn diff_header_path(diff: &str) -> Option<&str> {
+    let git = diff.lines().find_map(|line| {
+        let rest = line.strip_prefix("diff --git a/")?;
+        rest.split_once(" b/").map(|(path, _)| path)
+    });
+    git.or_else(|| diff.lines().find_map(|line| line.strip_prefix("Index: ")))
+        .or_else(|| diff.lines().find_map(|line| line.strip_prefix("+++ b/")))
+        .or_else(|| diff.lines().find_map(|line| line.strip_prefix("--- a/")))
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
 }
 
 /// The request: the instructions, what the keeper knows of the project, the
@@ -274,25 +310,28 @@ enum Summarizer {
 
 /// The scratch folder of a keeper runtime built for one save, removed with
 /// whatever the engine left in it once the save is done. Only a folder named
-/// like the ones [`ConversationService::keeper_engine`] makes is ever removed.
+/// like the ones [`ConversationService::keeper_engine`] picks is ever made or
+/// removed.
 struct Scratch(Option<std::path::PathBuf>);
 
 impl Scratch {
-    fn of(extra: &str) -> Self {
-        let path = serde_json::from_str::<serde_json::Value>(extra)
-            .ok()
-            .and_then(|extra| {
-                extra
-                    .get("workspace")
-                    .and_then(serde_json::Value::as_str)
-                    .map(std::path::PathBuf::from)
-            })
-            .filter(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with(SCRATCH_PREFIX))
-            });
-        Self(path)
+    fn none() -> Self {
+        Self(None)
+    }
+
+    fn make(path: &std::path::Path) -> std::io::Result<Self> {
+        let named = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(SCRATCH_PREFIX));
+        if !named {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "not a keeper scratch folder",
+            ));
+        }
+        std::fs::create_dir_all(path)?;
+        Ok(Self(Some(path.to_owned())))
     }
 }
 
@@ -384,14 +423,6 @@ impl ConversationService {
                 return;
             }
         };
-        let (day, day_start) = local_day();
-        let Some(context) = port
-            .keeper_debrief_context(&project_id, assistant_id.as_deref(), day_start)
-            .await
-        else {
-            return;
-        };
-
         let after = mark_of(&extra);
         let rows = match self.rows_after(user_id, conversation_id, after.as_ref()).await {
             Ok(rows) => rows,
@@ -411,12 +442,30 @@ impl ConversationService {
         if new_chars < MIN_NEW_CHARS {
             return;
         }
+
+        // Which keeper, then what it knows, read again once its other memory
+        // passes are done: a retrospective or the dreamer may be rewriting its
+        // memory, and today's saves, right now.
+        let Some(keeper) = port
+            .keeper_debrief_context(&project_id, assistant_id.as_deref(), local_day().1)
+            .await
+        else {
+            return;
+        };
+        let _pass = lock_role_pass(&keeper.role_id).await;
+        let (day, day_start) = local_day();
+        let Some(context) = port
+            .keeper_debrief_context(&project_id, assistant_id.as_deref(), day_start)
+            .await
+            .filter(|context| context.role_id == keeper.role_id)
+        else {
+            return;
+        };
         if context.saves_today >= MAX_SAVES_PER_DAY {
             info!(conversation_id, role_id = %context.role_id, "keeper save skipped: daily limit reached");
             return;
         }
 
-        let _pass = lock_role_pass(&context.role_id).await;
         self.broadcaster().broadcast(WebSocketMessage::new(
             KEEPER_DEBRIEF_EVENT,
             serde_json::json!({
@@ -472,10 +521,9 @@ impl ConversationService {
                 at,
             })
             .await;
-        // Covered either way: a save that could not be made is not retried on
-        // the same stretch.
-        self.mark_debriefed(user_id, conversation_id, &through, at).await;
         let Some(debrief) = recorded else {
+            // Not recorded, so not marked: the stretch is read again after the
+            // next turn.
             self.broadcaster().broadcast(WebSocketMessage::new(
                 KEEPER_DEBRIEF_EVENT,
                 serde_json::json!({
@@ -487,6 +535,12 @@ impl ConversationService {
             ));
             return;
         };
+        // A save that was made, found nothing new, or cannot be made on this
+        // engine covers the stretch; one that failed (timed out, cut off) does
+        // not, and the stretch is read again after the next turn.
+        if debrief.status != KeeperDebriefStatus::Failed {
+            self.mark_debriefed(user_id, conversation_id, &through, at).await;
+        }
         self.leave_debrief_card(user_id, &debrief, through.created_at + 1).await;
         info!(
             conversation_id,
@@ -544,31 +598,21 @@ impl ConversationService {
     /// scheduled runs, or else from a runtime built for the purpose and torn
     /// down at once. Claude and Codex cannot write digests.
     ///
-    /// The scratch folder a runtime built for the purpose works in comes back
-    /// with it: the summary runs there, so it must outlive the summary.
+    /// A runtime built for the purpose works in a scratch folder made only
+    /// then, which comes back with it: the summary runs there, so the folder
+    /// must outlive the summary.
     async fn keeper_summarizer(&self, user_id: &str, context: &KeeperDebriefContext) -> (Summarizer, Scratch) {
         let role_id = context.role_id.as_str();
         let engine = match self.keeper_engine(user_id, role_id).await {
             Ok(Some(engine)) => engine,
-            Ok(None) => return (Summarizer::Unavailable, Scratch(None)),
+            Ok(None) => return (Summarizer::Unavailable, Scratch::none()),
             Err(error) => {
                 warn!(role_id, error = %error, "keeper save: engine unknown");
-                return (Summarizer::Unavailable, Scratch(None));
+                return (Summarizer::Unavailable, Scratch::none());
             }
         };
-        let scratch = Scratch::of(&engine.row.extra);
-        (self.summarizer_for(user_id, context, engine).await, scratch)
-    }
-
-    async fn summarizer_for(
-        &self,
-        user_id: &str,
-        context: &KeeperDebriefContext,
-        engine: crate::service::KeeperEngine,
-    ) -> Summarizer {
-        let role_id = context.role_id.as_str();
         if !digests_on(&engine.backend, engine.agent_type) {
-            return Summarizer::Unsupported;
+            return (Summarizer::Unsupported, Scratch::none());
         }
         let task_manager: Arc<dyn IWorkerTaskManager> = Arc::clone(self.task_manager());
         let mut candidates: Vec<String> = context.thread_conversation_id.iter().cloned().collect();
@@ -584,7 +628,7 @@ impl ConversationService {
             if let Some(live) = task_manager.get_task(candidate)
                 && let Some(generator) = live.summarizer().await
             {
-                return Summarizer::Ready(generator);
+                return (Summarizer::Ready(generator), Scratch::none());
             }
         }
         for candidate in &candidates {
@@ -594,7 +638,7 @@ impl ConversationService {
             {
                 Ok((agent, _)) => {
                     if let Some(generator) = agent.summarizer().await {
-                        return Summarizer::Ready(generator);
+                        return (Summarizer::Ready(generator), Scratch::none());
                     }
                 }
                 Err(error) => {
@@ -604,12 +648,23 @@ impl ConversationService {
         }
 
         // No conversation of its own: a runtime built for this one save.
+        if engine.agent_type == AgentType::Aionrs && engine.row.model.is_none() {
+            debug!(role_id, "keeper save: no enabled provider offers the keeper's model");
+            return (Summarizer::Unavailable, Scratch::none());
+        }
+        let scratch = match Scratch::make(&engine.workspace) {
+            Ok(scratch) => scratch,
+            Err(error) => {
+                warn!(role_id, error = %error, "keeper save: scratch folder not made");
+                return (Summarizer::Unavailable, Scratch::none());
+            }
+        };
         let row = engine.row;
         let options = match self.build_task_options(&row).await {
             Ok(options) => options,
             Err(error) => {
                 debug!(role_id, error = %error, "keeper save: engine cannot be started");
-                return Summarizer::Unavailable;
+                return (Summarizer::Unavailable, scratch);
             }
         };
         let summarizer = match task_manager.get_or_build_task(&row.id, options).await {
@@ -623,7 +678,7 @@ impl ConversationService {
         if let Err(error) = self.acp_session_repo().delete_for_user(user_id, &row.id).await {
             debug!(role_id, error = %error, "keeper save: scratch session row left behind");
         }
-        summarizer.map_or(Summarizer::Unavailable, Summarizer::Ready)
+        (summarizer.map_or(Summarizer::Unavailable, Summarizer::Ready), scratch)
     }
 
     async fn mark_debriefed(&self, user_id: &str, conversation_id: &str, through: &RoleThreadMark, at: i64) {
@@ -663,7 +718,7 @@ impl ConversationService {
 
     /// The card right after the last message the save covered, so it sits
     /// under the reply it followed. Shares id and msg_id like the brief's card.
-    async fn leave_debrief_card(&self, user_id: &str, debrief: &KeeperDebrief, created_at: i64) {
+    pub(crate) async fn leave_debrief_card(&self, user_id: &str, debrief: &KeeperDebrief, created_at: i64) {
         let Ok(content) = serde_json::to_value(debrief) else {
             return;
         };
@@ -685,22 +740,25 @@ impl ConversationService {
         self.broadcast_debrief_card(user_id, &card, content, "done");
     }
 
+    /// A card as the stream merges it. A changed card keeps the place it was
+    /// left in, so it goes out without `created_at`.
     fn broadcast_debrief_card(&self, user_id: &str, card: &MessageRow, content: serde_json::Value, phase: &str) {
-        self.broadcaster().broadcast(WebSocketMessage::new(
-            KEEPER_DEBRIEF_EVENT,
-            serde_json::json!({
-                "user_id": user_id,
-                "id": card.id,
-                "msg_id": card.msg_id,
-                "conversation_id": card.conversation_id,
-                "type": card.r#type,
-                "content": content,
-                "position": card.position,
-                "status": card.status,
-                "created_at": card.created_at,
-                "phase": phase,
-            }),
-        ));
+        let mut payload = serde_json::json!({
+            "user_id": user_id,
+            "id": card.id,
+            "msg_id": card.msg_id,
+            "conversation_id": card.conversation_id,
+            "type": card.r#type,
+            "content": content,
+            "position": card.position,
+            "status": card.status,
+            "phase": phase,
+        });
+        if phase == "done" {
+            payload["created_at"] = serde_json::json!(card.created_at);
+        }
+        self.broadcaster()
+            .broadcast(WebSocketMessage::new(KEEPER_DEBRIEF_EVENT, payload));
     }
 
     /// The card a save left follows a change the user made to the save.

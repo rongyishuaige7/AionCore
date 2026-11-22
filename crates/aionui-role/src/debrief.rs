@@ -132,8 +132,8 @@ impl RoleService {
 
     /// Keep what a pass took from a conversation and record the save. Only a
     /// `Saved` pass with a draft writes anything to memory; it ends up
-    /// `Nothing` when all it brought was already known. Every pass is
-    /// recorded, so a skipped one shows why.
+    /// `Nothing` when all it brought was already known, where work stopped
+    /// included. Every pass is recorded, so a skipped one shows why.
     pub async fn record_debrief(&self, record: DebriefRecord<'_>) -> Result<KeeperDebrief, RoleError> {
         let id = record.role_id;
         validate_role_id(id)?;
@@ -164,7 +164,7 @@ impl RoleService {
         };
         if let (KeeperDebriefStatus::Saved, Some(draft)) = (record.status, record.draft) {
             self.keep_draft(&record, &project_name, draft, &mut debrief).await?;
-            if debrief.items.is_empty() && debrief.warnings.is_empty() {
+            if debrief.items.is_empty() && debrief.warnings.is_empty() && debrief.last_stop.is_none() {
                 debrief.status = KeeperDebriefStatus::Nothing;
             }
         } else if record.status == KeeperDebriefStatus::Saved {
@@ -268,12 +268,13 @@ impl RoleService {
         }
 
         let stop = brief::one_line_cut(&draft.last_stop, LAST_STOP_CHARS);
-        if !stop.is_empty() {
-            let mut ledger = self
-                .store
-                .read_project_ledger(id, record.project_id)
-                .await?
-                .unwrap_or_default();
+        let mut ledger = self
+            .store
+            .read_project_ledger(id, record.project_id)
+            .await?
+            .unwrap_or_default();
+        let known_stop = ledger.last_stop.as_ref().map(|known| known.text.trim());
+        if !stop.is_empty() && known_stop != Some(stop.as_str()) {
             ledger.last_stop = Some(KeeperLastStop {
                 text: stop.clone(),
                 conversation_id: record.conversation_id.to_owned(),
@@ -499,7 +500,8 @@ fn new_debrief_id(at: i64, existing: &[KeeperDebrief]) -> String {
 
 /// `memory` with `notes` appended as `- <day> [<project>] <note>`, skipping
 /// notes it already holds (tagged or not) and stopping when the memory is
-/// full. Also returns each line written with its text.
+/// full. Also returns each line written (what a forget looks for) with the
+/// note as the user reads it: no day, no project tag.
 pub(crate) fn with_notes(
     memory: &str,
     day: &str,
@@ -516,15 +518,15 @@ pub(crate) fn with_notes(
         let Some(plain) = plain_note(note, project_name) else {
             continue;
         };
-        let text = if project_name.trim().is_empty() {
+        let tagged = if project_name.trim().is_empty() {
             plain.clone()
         } else {
             format!("[{}] {plain}", project_name.trim())
         };
-        if known.contains(&text) || known.contains(&plain) {
+        if known.contains(&tagged) || known.contains(&plain) {
             continue;
         }
-        let line = format!("- {day} {text}");
+        let line = format!("- {day} {tagged}");
         let grown = updated.len() + line.len() + 2;
         if grown > MAX_MEMORY_BYTES {
             break;
@@ -533,8 +535,8 @@ pub(crate) fn with_notes(
             updated.push('\n');
         }
         updated.push_str(&line);
-        known.insert(text.clone());
-        written.push((line, text));
+        known.insert(tagged);
+        written.push((line, plain));
     }
     if !updated.is_empty() {
         updated.push('\n');

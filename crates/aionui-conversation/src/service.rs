@@ -275,11 +275,13 @@ pub struct KeeperDebriefInput<'a> {
 
 /// A keeper's engine as an automatic save needs it: which backend it runs
 /// on, and a conversation row a runtime can be built from that is never
-/// stored, for a keeper with no conversation of its own.
+/// stored, for a keeper with no conversation of its own. The row's workspace
+/// folder is not made until a runtime is actually built from it.
 pub(crate) struct KeeperEngine {
     pub(crate) backend: String,
     pub(crate) agent_type: AgentType,
     pub(crate) row: ConversationRow,
+    pub(crate) workspace: PathBuf,
 }
 
 /// What a project's keeper hands a conversation in the project before its
@@ -955,8 +957,11 @@ impl ConversationService {
     }
 
     /// The keeper `role_id`'s engine; `None` when the role is no assistant.
-    /// The row's workspace is a fresh scratch folder the caller removes once
-    /// done with the runtime and anything it spawned.
+    /// The row's workspace is a scratch folder path, not yet made: whoever
+    /// builds a runtime from the row makes it, and removes it once done with
+    /// the runtime and anything it spawned. An Aionrs keeper's row carries the
+    /// provider that offers its default model, as a conversation created for
+    /// it would; without one the row has no model.
     pub(crate) async fn keeper_engine(
         &self,
         user_id: &str,
@@ -976,8 +981,21 @@ impl ConversationService {
         };
         let id = format!("{}{}", crate::keeper_debrief::SCRATCH_PREFIX, generate_short_id());
         let workspace = auto_workspace_parent(&self.workspace_root, user_id).join(&id);
-        std::fs::create_dir_all(&workspace)
-            .map_err(|e| ConversationError::internal(format!("Failed to create workspace: {e}")))?;
+        let model = match (snapshot.agent_type, snapshot.resolved_defaults.model.as_ref()) {
+            (AgentType::Aionrs, Some(model_id)) => self
+                .match_provider_for_model(user_id, model_id)
+                .await
+                .map_err(|e| ConversationError::internal(format!("Failed to match a provider: {e}")))?
+                .map(|provider_id| aionui_common::ProviderWithModel {
+                    provider_id,
+                    model: model_id.clone(),
+                    use_model: Some(model_id.clone()),
+                })
+                .map(|model| serde_json::to_string(&model))
+                .transpose()
+                .map_err(|e| ConversationError::internal(format!("Failed to serialize model: {e}")))?,
+            _ => None,
+        };
         let mut extra = serde_json::Map::new();
         extra.insert(
             "workspace".into(),
@@ -1006,7 +1024,7 @@ impl ConversationService {
                 name: String::new(),
                 r#type: snapshot.agent_type.serde_name().to_owned(),
                 extra: serde_json::Value::Object(extra).to_string(),
-                model: None,
+                model,
                 status: None,
                 source: None,
                 channel_chat_id: None,
@@ -1018,6 +1036,7 @@ impl ConversationService {
                 folder_id: None,
                 name_source: None,
             },
+            workspace,
         }))
     }
 

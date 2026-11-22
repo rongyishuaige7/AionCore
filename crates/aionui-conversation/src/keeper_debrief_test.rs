@@ -113,6 +113,35 @@ fn changed_files_come_from_diffs_once_each_in_order() {
 }
 
 #[test]
+fn files_an_aionrs_turn_wrote_count_too() {
+    let write = |file_name: &str, diff: &str| json!({ "name": "WriteFile", "result_display": { "file_name": file_name, "file_diff": diff } });
+    let rows = vec![
+        row(
+            "1",
+            "tool_group",
+            json!([
+                write("robots.txt", "diff --git a/public/robots.txt b/public/robots.txt\n+Disallow: /cart"),
+                { "name": "ReadFile", "result_display": { "file_name": "a.ts", "file_diff": "x" } },
+                write("sitemap.ts", "Index: src/sitemap.ts\n+x"),
+                write("feed.ts", "--- a/src/feed.ts\n+++ b/src/feed.ts\n+x"),
+                write("notes.md", "+just a line"),
+                write("empty.md", ""),
+            ]),
+        ),
+        row("2", "tool_group", json!([write("public/robots.txt", "+again")])),
+        row(
+            "3",
+            "acp_tool_call",
+            json!({ "update": { "content": [diff("src/feed.ts")] } }),
+        ),
+    ];
+    assert_eq!(
+        changed_files(&rows),
+        vec!["public/robots.txt", "src/sitemap.ts", "src/feed.ts", "notes.md"]
+    );
+}
+
+#[test]
 fn prompt_carries_what_the_keeper_knows_and_the_files() {
     let context = KeeperDebriefContext {
         role_id: "seo".into(),
@@ -185,21 +214,18 @@ async fn passes_of_one_role_wait_for_each_other() {
 }
 
 #[test]
-fn only_a_keepers_scratch_folder_is_removed_and_only_when_done() {
+fn only_a_keepers_scratch_folder_is_made_and_removed_and_only_when_done() {
     let root = tempfile::tempdir().expect("tempdir");
     let scratch = root.path().join(format!("{SCRATCH_PREFIX}abc"));
     let other = root.path().join("my-project");
-    for dir in [&scratch, &other] {
-        std::fs::create_dir_all(dir.join(".engine")).expect("mkdir");
-    }
-    let extra = |path: &std::path::Path| json!({ "workspace": path.to_string_lossy() }).to_string();
 
-    let held = Scratch::of(&extra(&scratch));
+    let held = Scratch::make(&scratch).expect("made when a runtime is built");
+    std::fs::create_dir_all(scratch.join(".engine")).expect("the engine writes");
     assert!(scratch.exists(), "still there while the summary runs");
     drop(held);
     assert!(!scratch.exists(), "gone with what the engine left in it");
 
-    drop(Scratch::of(&extra(&other)));
-    assert!(other.exists(), "a folder not named like a scratch one stays");
-    drop(Scratch::of("not json"));
+    assert!(Scratch::make(&other).is_err(), "never a folder named otherwise");
+    assert!(!other.exists());
+    drop(Scratch::none());
 }

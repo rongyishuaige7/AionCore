@@ -459,7 +459,7 @@ impl ConversationService {
     /// First ENABLED provider whose `models` JSON array lists `model_id` — the
     /// same rule as team provisioning's `resolve_provider_for_model` and the
     /// picker's `modelList[0]` default. `None` when no provider matches.
-    async fn match_provider_for_model(
+    pub(crate) async fn match_provider_for_model(
         &self,
         user_id: &str,
         model_id: &str,

@@ -354,3 +354,162 @@ async fn keepers_over_http_where_only_the_user_hands_out_projects() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["data"]["projects"], json!([]));
 }
+
+/// Records which saves the conversation side was told changed.
+#[derive(Default)]
+struct FollowedCards(std::sync::Mutex<Vec<String>>);
+
+#[async_trait::async_trait]
+impl crate::RoleExternalPort for FollowedCards {
+    async fn apply_cron_proposal(
+        &self,
+        _user_id: &str,
+        _role_id: &str,
+        _change: &aionui_api_types::RoleProposalChange,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn on_role_dismissed(&self, _user_id: &str, _role_id: &str) {}
+
+    async fn run_dreamer(&self, _user_id: &str, _role_id: &str) -> Result<aionui_api_types::RoleDreamResponse, String> {
+        Err("not in this test".into())
+    }
+
+    async fn on_debrief_changed(&self, _user_id: &str, debrief: &aionui_api_types::KeeperDebrief) {
+        self.0.lock().unwrap().push(debrief.id.clone());
+    }
+}
+
+/// A keeper of `p_store` with one lesson, and one save that kept a note and
+/// warned about that lesson.
+async fn keeper_with_a_save(root: &tempfile::TempDir) -> (Arc<RoleService>, aionui_api_types::KeeperDebrief) {
+    use aionui_api_types::{
+        KeeperDebriefDraft, KeeperDebriefDraftWarning, KeeperDebriefStatus, PlaybookDeltaOp, RoleProjectClaim,
+        SetRoleProjectsRequest, UpsertRoleRequest,
+    };
+    let service = Arc::new(RoleService::new(root.path().join("roles")));
+    service
+        .upsert(
+            "seo",
+            UpsertRoleRequest {
+                charter: "Keeps the store findable.".into(),
+                denied_tools: Vec::new(),
+                verifies: false,
+                asks_when_scheduled: false,
+            },
+        )
+        .await
+        .unwrap();
+    service
+        .set_projects(
+            "seo",
+            SetRoleProjectsRequest {
+                projects: vec![RoleProjectClaim {
+                    project_id: "p_store".into(),
+                    name: "store".into(),
+                }],
+                transfer: false,
+            },
+            1_000,
+        )
+        .await
+        .unwrap();
+    service
+        .apply_retrospective(
+            "seo",
+            &[PlaybookDeltaOp::Add {
+                content: "Check robots.txt on staging before shipping".into(),
+            }],
+            &[],
+            "user",
+            "seed",
+            2_000,
+        )
+        .await
+        .unwrap();
+    let draft = KeeperDebriefDraft {
+        notes: vec!["Product pages use JSON-LD".into()],
+        warnings: vec![KeeperDebriefDraftWarning {
+            lesson_id: "p-0001".into(),
+            files: vec!["public/robots.txt".into()],
+            note: "robots.txt changed without a staging check".into(),
+        }],
+        ..KeeperDebriefDraft::default()
+    };
+    let saved = service
+        .record_debrief(crate::DebriefRecord {
+            role_id: "seo",
+            project_id: "p_store",
+            conversation_id: "conv-1",
+            message_id: "msg-1",
+            status: KeeperDebriefStatus::Saved,
+            draft: Some(&draft),
+            day: "2026-11-21",
+            at: 3_000,
+        })
+        .await
+        .unwrap();
+    (service, saved)
+}
+
+#[tokio::test]
+async fn automatic_saves_are_listed_and_only_the_user_takes_them_back() {
+    let root = tempfile::tempdir().unwrap();
+    let (service, saved) = keeper_with_a_save(&root).await;
+    let followed = Arc::new(FollowedCards::default());
+    let app = role_routes(RoleRouterState::with_external(service.clone(), followed.clone()));
+    let note = saved.items[0].key.clone();
+    let forget = format!("/api/roles/seo/debriefs/{}/forget", saved.id);
+    let outdated = format!("/api/roles/seo/debriefs/{}/outdated", saved.id);
+
+    let (status, body) = send(&app, Method::GET, "/api/roles/seo/debriefs", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["debriefs"][0]["id"], saved.id.as_str());
+    assert_eq!(
+        body["data"]["debriefs"][0]["items"][0]["text"],
+        "Product pages use JSON-LD"
+    );
+    assert_eq!(body["data"]["debriefs"][0]["warnings"][0]["lesson_id"], "p-0001");
+    let (status, body) = send(&app, Method::GET, "/api/roles/nobody/debriefs", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["code"], "role_not_found");
+
+    // An agent can take nothing back.
+    let (status, body) = send_as_agent(&app, Method::POST, &forget, "conv-1", Some(json!({ "key": note }))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["code"], "role_user_only");
+    let (status, _) = send_as_agent(
+        &app,
+        Method::POST,
+        &outdated,
+        "conv-1",
+        Some(json!({ "lesson_id": "p-0001" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(service.get("seo").await.unwrap().memory.contains(&note));
+    assert!(followed.0.lock().unwrap().is_empty());
+
+    // The user can, and the card follows.
+    let (status, body) = send(&app, Method::POST, &forget, Some(json!({ "key": note }))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["debrief"]["items"][0]["forgotten"], true);
+    assert!(!service.get("seo").await.unwrap().memory.contains(&note));
+    let (status, body) = send(&app, Method::POST, &outdated, Some(json!({ "lesson_id": " p-0001 " }))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["debrief"]["warnings"][0]["outdated"], true);
+    assert_eq!(*followed.0.lock().unwrap(), vec![saved.id.clone(), saved.id.clone()]);
+
+    let (status, body) = send(&app, Method::POST, &forget, Some(json!({ "key": "nope" }))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "role_bad_request");
+    let (status, _) = send(
+        &app,
+        Method::POST,
+        "/api/roles/seo/debriefs/d-404/outdated",
+        Some(json!({ "lesson_id": "p-0001" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}

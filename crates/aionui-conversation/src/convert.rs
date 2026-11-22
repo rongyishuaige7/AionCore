@@ -483,6 +483,27 @@ mod tests {
     }
 
     #[test]
+    fn a_keeper_save_left_under_a_reply_reads_back_as_a_message() {
+        let row = MessageRow {
+            id: "m3".into(),
+            conversation_id: "c1".into(),
+            msg_id: Some("m3".into()),
+            r#type: "keeper_debrief".into(),
+            content: json!({ "id": "d-1", "role_id": "seo", "status": "saved", "items": [] }).to_string(),
+            position: Some("center".into()),
+            status: Some("finish".into()),
+            hidden: false,
+            created_at: 3,
+            backend_turn_id: None,
+        };
+        let message = row_to_message_response(row.clone()).unwrap();
+        assert_eq!(message.r#type, MessageType::KeeperDebrief);
+        assert_eq!(message.content["status"], json!("saved"));
+        let compact = row_to_message_response_compact(row).unwrap();
+        assert_eq!(compact.r#type, MessageType::KeeperDebrief);
+    }
+
+    #[test]
     fn string_to_enum_invalid() {
         let err = string_to_enum::<AgentType>("not_valid").unwrap_err();
         assert!(matches!(err, ConversationError::Internal { .. }));

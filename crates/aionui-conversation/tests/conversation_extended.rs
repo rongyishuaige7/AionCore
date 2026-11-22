@@ -1264,3 +1264,92 @@ async fn get_projects_fork_capability_for_aionrs_on_detail_path() {
         "detail path projects the aionrs fork capability via the builtin binding ladder"
     );
 }
+
+// ── Keeper save cards ──────────────────────────────────────────────
+
+fn keeper_debrief(conv_id: &str, message_id: &str) -> aionui_api_types::KeeperDebrief {
+    serde_json::from_value(json!({
+        "id": "d-1",
+        "role_id": "seo",
+        "project_id": "p_store",
+        "project_name": "store",
+        "conversation_id": conv_id,
+        "message_id": message_id,
+        "at": 1,
+        "status": "saved",
+        "items": [{ "key": "- 2026-11-21 [store] JSON-LD on product pages", "kind": "note", "text": "JSON-LD on product pages" }],
+        "warnings": []
+    }))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn a_keeper_save_card_reads_back_through_every_message_read_and_follows_a_forget() {
+    let (svc, repo, broadcaster) = setup().await;
+    let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
+    let reply = make_message(&conv.id, "done", 0);
+    repo.insert_message(USER_ID, &reply).await.unwrap();
+    let card_id = generate_prefixed_id("msg");
+    let saved = keeper_debrief(&conv.id, &card_id);
+    repo.insert_message(
+        USER_ID,
+        &MessageRow {
+            id: card_id.clone(),
+            conversation_id: conv.id.clone(),
+            msg_id: Some(card_id.clone()),
+            r#type: "keeper_debrief".into(),
+            content: serde_json::to_string(&saved).unwrap(),
+            position: Some("center".into()),
+            status: Some("finish".into()),
+            hidden: false,
+            created_at: reply.created_at + 1,
+            backend_turn_id: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    for content_mode in [None, Some("compact".to_owned())] {
+        let listed = svc
+            .list_messages(
+                USER_ID,
+                &conv.id,
+                ListMessagesQuery {
+                    content_mode,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("a conversation with a save card still lists");
+        let card = listed.items.last().expect("the card comes last");
+        assert_eq!(card.r#type, aionui_common::MessageType::KeeperDebrief);
+        assert_eq!(card.content["status"], "saved");
+    }
+    let latest = svc
+        .latest_message_of_type(USER_ID, &conv.id, "keeper_debrief")
+        .await
+        .unwrap()
+        .expect("latest save card");
+    assert_eq!(latest.id, card_id);
+    let one = svc.get_message(USER_ID, &conv.id, &card_id).await.unwrap();
+    assert_eq!(one.content["items"][0]["text"], "JSON-LD on product pages");
+
+    let mut forgot = saved.clone();
+    forgot.items[0].forgotten = true;
+    svc.refresh_keeper_debrief_card(USER_ID, &forgot).await;
+
+    let one = svc.get_message(USER_ID, &conv.id, &card_id).await.unwrap();
+    assert_eq!(one.content["items"][0]["forgotten"], true);
+    assert_eq!(one.created_at, reply.created_at + 1, "the card keeps its place");
+    let events = broadcaster.events.lock().unwrap();
+    let changed = events
+        .iter()
+        .find(|event| event.name == "role.keeper_debrief")
+        .expect("changed event");
+    assert_eq!(changed.data["phase"], "changed");
+    assert_eq!(changed.data["msg_id"], card_id.as_str());
+    assert!(
+        changed.data.get("created_at").is_none(),
+        "a changed card does not move: {changed:?}"
+    );
+}
