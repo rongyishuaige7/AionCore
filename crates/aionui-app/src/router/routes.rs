@@ -320,6 +320,12 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         roles: states.role.service.clone(),
         timers: states.cron.cron_service.clone(),
         conversations: services.conversation_service.conversation_repo().clone(),
+        assistant_definitions: Arc::new(aionui_db::SqliteAssistantDefinitionRepository::new(
+            services.database.pool().clone(),
+        )),
+        conversation_service: services.conversation_service.clone(),
+        session_messages: services.session_message_service.clone(),
+        runtime_state: services.conversation_runtime_state.clone(),
         runtime_token_service: services.runtime_token_service.clone(),
         broadcaster: services.event_bus.clone(),
     });

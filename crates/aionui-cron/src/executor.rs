@@ -128,6 +128,19 @@ impl JobExecutor {
         let _ = self.inbox_port.set(inbox_port);
     }
 
+    pub(crate) async fn resolve_aionrs_model_for_assistant(
+        &self,
+        user_id: &str,
+        assistant_id: &str,
+        preferred_model: Option<&str>,
+    ) -> Option<ProviderWithModel> {
+        self.conversation_service
+            .resolve_aionrs_model_for_role(user_id, assistant_id, preferred_model)
+            .await
+            .ok()
+            .flatten()
+    }
+
     /// Delivers a run that came due in an existing conversation through that
     /// conversation's inbox, when it has one — a follow-up and a scheduled
     /// task alike. The note takes its place behind whatever is already
@@ -774,11 +787,22 @@ impl JobExecutor {
         purpose: ConversationPurpose,
     ) -> Result<String, CronError> {
         let agent_type = parse_agent_type(&self.agent_registry, &job.user_id, &job.agent_type).await?;
-        let model = resolve_model(job);
         let user_id = self.resolve_conversation_owner_user_id(job).await?;
 
         let mut extra = build_conversation_extra(&self.agent_registry, job, saved_skill, purpose).await;
         let assistant = build_assistant_request(job);
+        let mut model = resolve_model(job);
+        if model.is_none()
+            && job.agent_type == "aionrs"
+            && let Some(asst) = assistant.as_ref()
+        {
+            model = self
+                .conversation_service
+                .resolve_aionrs_model_for_role(&user_id, &asst.id, None)
+                .await
+                .ok()
+                .flatten();
+        }
         // The conversation of a role that asks first is not started in full auto.
         if self
             .asks_first(assistant.as_ref().map(|assistant| assistant.id.as_str()))

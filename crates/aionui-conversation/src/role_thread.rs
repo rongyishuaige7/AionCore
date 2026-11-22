@@ -470,10 +470,21 @@ pub(crate) struct RoleThreads {
     threads: Arc<Mutex<HashMap<String, String>>>,
     revisions: Arc<Mutex<HashMap<String, u64>>>,
     rotated_pending: Arc<Mutex<HashSet<String>>>,
+    ensure_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     sequence: Arc<AtomicU64>,
 }
 
 impl RoleThreads {
+    /// Per-role async lock serializing lazy thread provisioning (`ensure_role_thread`)
+    /// so concurrent first-time messages to the same role never create orphan threads.
+    pub(crate) fn ensure_lock(&self, role_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.ensure_locks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(role_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
     /// Note a turn in a role's thread. It also pushes back any summary job
     /// that was waiting for the thread to go quiet.
     fn note(&self, conversation_id: &str, assistant_id: &str) {
@@ -593,6 +604,8 @@ impl ConversationService {
     ) -> Option<String> {
         let state = port.thread_state(assistant_id, &row.id).await?;
         self.role_threads.note(&row.id, assistant_id);
+        self.sync_role_thread_row_if_agent_drifted(user_id, row, assistant_id)
+            .await;
         // Only engines that resume from the session anchor can be moved; the
         // others keep (and compact) their own history.
         if !matches!(row.r#type.as_str(), "acp" | "antigravity") {

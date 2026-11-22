@@ -47,8 +47,8 @@ pub use ports::{
     AgentTurnSource, AgentTurnStarted, AgentTurnStartedCallback, AgentTurnStatus, NativeSlashCommandPort,
     NoopNativeSlashCommandPort, NoopTeamRolePort, SlashCatalogSource, SlashCommandRecognition,
     TeamAssistantCatalogEntry, TeamAssistantCatalogPort, TeamConversationBindingLookup, TeamConversationLookupPort,
-    TeamRoleBrief, TeamRoleMemoryNote, TeamRolePort, TeamRoleProgress, TeamRoleProgressUpdate, TeamToolCapabilityPort,
-    UnknownTeamToolCapabilityPort,
+    TeamRoleBrief, TeamRoleMemoryNote, TeamRolePeer, TeamRolePort, TeamRoleProgress, TeamRoleProgressUpdate,
+    TeamToolCapabilityPort, UnknownTeamToolCapabilityPort,
 };
 
 pub use prompt_dump::TeamPromptDumpConfig;

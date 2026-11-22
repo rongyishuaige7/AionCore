@@ -930,12 +930,18 @@ impl SessionAgentTask {
         let current_model = caps
             .current_model
             .or_else(|| self.catalog_preload.current_model.clone());
-        let modes = if caps.available_modes.is_empty() {
-            self.catalog_preload.available_modes.clone()
+        let (modes, current_mode) = if caps.available_modes.is_empty() {
+            (
+                self.catalog_preload.available_modes.clone(),
+                caps.current_mode.or_else(|| self.catalog_preload.current_mode.clone()),
+            )
         } else {
-            caps.available_modes
+            // Once live modes are present, `caps.current_mode` is authoritative for THIS
+            // conversation (`None` means no session mode was set yet). Falling back to
+            // `catalog_preload.current_mode` here leaked a previous conversation's mode
+            // (e.g. `"yolo"` / `"bypassPermissions"`) into unrelated approval-mode sessions.
+            (caps.available_modes, caps.current_mode)
         };
-        let current_mode = caps.current_mode.or_else(|| self.catalog_preload.current_mode.clone());
         (models, current_model, modes, current_mode)
     }
 
@@ -943,10 +949,14 @@ impl SessionAgentTask {
     /// over the capabilities snapshot, which lags an in-band switch.
     pub async fn mode(&self) -> Result<aionui_api_types::AgentModeResponse, AgentError> {
         let caps = self.backend.capabilities();
-        // Preload fallback: on cold-start resume the live catalog is empty until the
-        // initialize round-trip lands, so serve the last-discovered current_mode
-        // until then (override still wins; live current_mode overwrites once present).
-        let current_mode = caps.current_mode.or_else(|| self.catalog_preload.current_mode.clone());
+        // Preload fallback: ONLY when the live mode catalog is still empty (cold-start
+        // before handshake). Once `caps.available_modes` is populated, `caps.current_mode`
+        // reflects this session's actual governing mode.
+        let current_mode = if caps.available_modes.is_empty() {
+            caps.current_mode.or_else(|| self.catalog_preload.current_mode.clone())
+        } else {
+            caps.current_mode
+        };
         Ok(aionui_api_types::AgentModeResponse {
             mode: self.runtime.mode_override().or(current_mode).unwrap_or_default(),
             initialized: true,
@@ -2488,13 +2498,25 @@ pub fn spawn_catalog_writeback(
 /// columns directly (the shape-stable path that keeps the codex model picker from
 /// going empty).
 fn catalog_partial_from_caps(caps: &aionui_session::Capabilities) -> Option<aionui_api_types::AgentHandshake> {
+    // Deliberately NOT `caps.current_mode`: `current_mode` is THIS conversation's
+    // permission tier (e.g. `"yolo"` or `"bypassPermissions"`), whereas `agent_metadata`
+    // is shared across every conversation of the agent. Writing a session's full-auto
+    // mode into the shared catalog made unrelated conversations pre-highlight `"yolo"`.
+    // Note that `SessionModeState.current_mode_id` is non-nullable in the ACP schema, so
+    // record the catalog's neutral default (`"default"` / `"auto"`, else first entry).
+    let catalog_default_mode = caps
+        .available_modes
+        .iter()
+        .find(|m| m.id == "default" || m.id == "auto")
+        .or_else(|| caps.available_modes.first())
+        .map(|m| m.id.as_str());
     let mut config_options = Vec::new();
     if !caps.available_modes.is_empty() {
         config_options.push(serde_json::json!({
             "id": "mode",
             "category": "mode",
             "type": "select",
-            "currentValue": caps.current_mode,
+            "currentValue": catalog_default_mode,
             "options": caps.available_modes.iter().map(|m| serde_json::json!({
                 "value": m.id, "name": m.name, "description": m.description,
             })).collect::<Vec<_>>(),
@@ -2570,7 +2592,7 @@ fn catalog_partial_from_caps(caps: &aionui_session::Capabilities) -> Option<aion
             "available_modes": caps.available_modes.iter().map(|m| serde_json::json!({
                 "id": m.id, "name": m.name, "description": m.description,
             })).collect::<Vec<_>>(),
-            "current_mode_id": caps.current_mode,
+            "current_mode_id": catalog_default_mode,
         })
     });
     let available_models = (!caps.available_models.is_empty()).then(|| {
@@ -10358,6 +10380,88 @@ mod pump_tests {
 
         // mode() serves the preloaded current mode.
         assert_eq!(task.mode().await.unwrap().mode, "plan");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_modes_with_unset_current_mode_do_not_leak_preload_or_writeback_yolo() {
+        struct UnsetModeLiveBackend;
+        #[async_trait::async_trait]
+        impl SessionBackend for UnsetModeLiveBackend {
+            async fn dispatch(
+                &self,
+                _cmd: aionui_session::Command,
+            ) -> Result<aionui_session::CommandReceipt, aionui_session::BackendError> {
+                Ok(aionui_session::CommandReceipt {
+                    accepted: true,
+                    admission: aionui_session::Admission::NoTurn,
+                    turn_gen: 0,
+                })
+            }
+            fn events(&self) -> futures_util::stream::BoxStream<'static, aionui_session::SessionEnvelope> {
+                Box::pin(futures_util::stream::empty())
+            }
+            fn capabilities(&self) -> aionui_session::Capabilities {
+                aionui_session::Capabilities {
+                    available_modes: vec![
+                        aionui_session::ModeInfo {
+                            id: "default".into(),
+                            name: "Default".into(),
+                            description: None,
+                        },
+                        aionui_session::ModeInfo {
+                            id: "yolo".into(),
+                            name: "Full Auto".into(),
+                            description: None,
+                        },
+                    ],
+                    current_mode: None,
+                    ..Default::default()
+                }
+            }
+        }
+
+        // Verify catalog write-back normalizes a full-auto session's `current_mode`
+        // to the neutral catalog default (`"default"`), never `"yolo"`, while keeping
+        // `SessionModeState` valid for `CatalogPreload::from_handshake`.
+        let yolo_caps = aionui_session::Capabilities {
+            available_modes: UnsetModeLiveBackend.capabilities().available_modes,
+            current_mode: Some("yolo".into()),
+            ..Default::default()
+        };
+        let partial = catalog_partial_from_caps(&yolo_caps).expect("partial");
+        assert_eq!(partial.available_modes.as_ref().unwrap()["current_mode_id"], "default");
+        let round_trip = CatalogPreload::from_handshake(&partial);
+        assert_eq!(round_trip.available_modes.len(), 2);
+        assert_eq!(round_trip.current_mode.as_deref(), Some("default"));
+
+        // Even if an existing DB row already had `"current_mode_id": "yolo"` in
+        // `agent_metadata`, a live backend with populated `available_modes` and
+        // `current_mode: None` must NOT report `"yolo"` to the UI.
+        let polluted_handshake = aionui_api_types::AgentHandshake {
+            available_modes: Some(serde_json::json!({
+                "available_modes": [
+                    {"id": "default", "name": "Default"},
+                    {"id": "yolo", "name": "Full Auto"}
+                ],
+                "current_mode_id": "yolo"
+            })),
+            ..Default::default()
+        };
+        let task = SessionAgentTask::new_with_preload(
+            AgentType::Antigravity,
+            "conv-unset".into(),
+            "user-1".into(),
+            "/w".into(),
+            Arc::new(UnsetModeLiveBackend),
+            None,
+            &polluted_handshake,
+            None,
+            None,
+        );
+        let opts = task.get_config_options().await.unwrap().config_options;
+        let mode_opt = opts.iter().find(|o| o.id == "mode").expect("mode select");
+        assert_eq!(mode_opt.current_value, None);
+        assert_eq!(task.mode().await.unwrap().mode, "");
     }
 
     // The live catalog OVERWRITES the preload the instant it is present: even though a

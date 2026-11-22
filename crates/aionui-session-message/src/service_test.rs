@@ -167,3 +167,21 @@ fn a_real_rejection_is_still_dropped() {
         );
     }
 }
+
+#[test]
+fn role_meta_and_hop_round_trip_cleanly_inside_session_message_block() {
+    let block = build_session_message_block_with_meta(
+        "安全官",
+        "conv_role_sec",
+        "same",
+        "conv_role_sec",
+        Some(("sec-officer", "安全官")),
+        Some((2, 4)),
+    );
+    assert!(block.contains("from_role: sec-officer\t安全官\n"), "{block}");
+    assert!(block.contains("hop: 2/4\n"), "{block}");
+
+    let composed = compose_delivery_content(&block, "请协助排查线上报错");
+    assert_eq!(parse_inbound_hop_from_text(&composed), 2);
+    assert_eq!(parse_inbound_hop_from_text("普通用户直接发送的消息"), 0);
+}

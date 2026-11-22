@@ -6,9 +6,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use aionui_api_types::{
-    KeeperBrief, PlaybookDeltaOp, RoleCommit, RoleExpandRequest, RoleExpandResponse, RoleKeeper, RoleKeptProject,
-    RoleProgress, RoleProjectClaim, RoleProposal, RoleProposalChange, RoleRecallRequest, RoleRecallResponse,
-    RoleReport, RoleReportOutcome, RoleResponse, SetRoleProjectsRequest, TeamToolName, UpsertRoleRequest,
+    KeeperBrief, PlaybookDeltaOp, ROLE_SEND_TOOL_NAME, RoleCommit, RoleExpandRequest, RoleExpandResponse, RoleKeeper,
+    RoleKeptProject, RoleProgress, RoleProjectClaim, RoleProposal, RoleProposalChange, RoleRecallRequest,
+    RoleRecallResponse, RoleReport, RoleReportOutcome, RoleResponse, SetRoleProjectsRequest, TeamToolName,
+    UpsertRoleRequest,
 };
 use aionui_common::now_ms;
 use tokio::sync::Mutex;
@@ -1514,13 +1515,13 @@ fn is_day(text: &str) -> bool {
         })
 }
 
-/// Trim, reject anything that is not a real team tool, then sort and dedupe so
-/// the stored table is canonical.
+/// Trim, reject anything that is not a real team tool or `role_send`, then sort
+/// and dedupe so the stored table is canonical.
 fn normalize_denied_tools(tools: &[String]) -> Result<Vec<String>, RoleError> {
     let mut normalized = Vec::with_capacity(tools.len());
     for tool in tools {
         let tool = tool.trim();
-        if TeamToolName::parse(tool).is_none() {
+        if TeamToolName::parse(tool).is_none() && tool != ROLE_SEND_TOOL_NAME {
             return Err(RoleError::InvalidRequest(format!("unknown team tool: {tool}")));
         }
         normalized.push(tool.to_owned());

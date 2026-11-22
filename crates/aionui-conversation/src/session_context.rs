@@ -263,6 +263,10 @@ impl<'a> SessionContextBuilder<'a> {
         self.resolve_acp_identity(row, &mut config, &extra, session_row.as_ref())
             .await?;
         let session_id = session_row.as_ref().and_then(|row| row.session_id.clone());
+        if session_id.is_none() {
+            self.promote_unanchored_runtime_seeds(&row.user_id, &row.id, &mut config)
+                .await?;
+        }
         let session_snapshot = self
             .load_acp_session_snapshot(&row.user_id, &row.id, &config, session_id.as_deref())
             .await?;
@@ -345,6 +349,74 @@ impl<'a> SessionContextBuilder<'a> {
         Ok(())
     }
 
+    /// When `acp_session.session_id` is `None` (brand-new session before its first
+    /// turn binds an anchor, or after `rotate_thread_if_due` / `clear_acp_context_anchor`
+    /// drops the resume anchor), `session_snapshot` is intentionally `None` so the
+    /// backend opens `SessionSpec::Fresh` instead of resuming a dead/cleared anchor.
+    ///
+    /// However, interactive runtime switches (`PUT /config-options/{mode,model,reasoning_effort}`)
+    /// persist into `acp_session.session_config.runtime`. Promoting those selections
+    /// into the startup seed (`config.session_mode` / `current_model_id` / `thought_level`)
+    /// ensures role thread rotations, `/clear`, and pre-first-turn switches never
+    /// revert back to the stale create-time `conversations.extra` values.
+    async fn promote_unanchored_runtime_seeds(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        config: &mut AcpBuildExtra,
+    ) -> Result<(), ConversationError> {
+        let Some(db_state) = self
+            .acp_session_repo
+            .load_runtime_state_for_user(user_id, conversation_id)
+            .await
+            .map_err(|e| ConversationError::internal(format!("Failed to load acp_session runtime state: {e}")))?
+        else {
+            return Ok(());
+        };
+        let selections = db_state
+            .config_selections_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<HashMap<String, String>>(raw).ok())
+            .unwrap_or_default();
+
+        if let Some(mode) = db_state
+            .current_mode_id
+            .as_deref()
+            .or_else(|| selections.get("mode").map(String::as_str))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            config.session_mode = Some(mode.to_owned());
+        }
+
+        if let Some(model) = db_state
+            .current_model_id
+            .as_deref()
+            .or_else(|| selections.get("model").map(String::as_str))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            config.current_model_id = Some(model.to_owned());
+        }
+
+        let selected_thought = [
+            "effort",
+            "reasoning_effort",
+            "thought_level",
+            "thinking_budget",
+            "thinking",
+        ]
+        .into_iter()
+        .find_map(|key| selections.get(key).map(String::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+        if let Some(thought) = selected_thought {
+            config.thought_level = Some(thought.to_owned());
+        }
+
+        Ok(())
+    }
+
     async fn load_acp_session_snapshot(
         &self,
         user_id: &str,
@@ -399,8 +471,10 @@ impl<'a> SessionContextBuilder<'a> {
         options: &mut BuildTaskOptions,
     ) -> Result<(), ConversationError> {
         let user_id = options.context.conversation.user_id.clone();
-        let AgentSessionKind::Acp(ctx) = &mut options.context.kind else {
-            return Ok(());
+        let (config, ctx_session_id, ctx_session_snapshot) = match &mut options.context.kind {
+            AgentSessionKind::Acp(ctx) => (&mut ctx.config, &mut ctx.session_id, &mut ctx.session_snapshot),
+            AgentSessionKind::Antigravity(ctx) => (&mut ctx.config, &mut ctx.session_id, &mut ctx.session_snapshot),
+            _ => return Ok(()),
         };
         let session_row = self
             .acp_session_repo
@@ -408,20 +482,24 @@ impl<'a> SessionContextBuilder<'a> {
             .await
             .map_err(|e| ConversationError::internal(format!("Failed to load acp_session row: {e}")))?;
         let session_id = session_row.as_ref().and_then(|row| row.session_id.clone());
-        if session_id == ctx.session_id {
+        if session_id == *ctx_session_id {
             return Ok(());
         }
+        if session_id.is_none() {
+            self.promote_unanchored_runtime_seeds(&user_id, conversation_id, config)
+                .await?;
+        }
         let session_snapshot = self
-            .load_acp_session_snapshot(&user_id, conversation_id, &ctx.config, session_id.as_deref())
+            .load_acp_session_snapshot(&user_id, conversation_id, config, session_id.as_deref())
             .await?;
         info!(
             conversation_id,
-            had_anchor = ctx.session_id.is_some(),
+            had_anchor = ctx_session_id.is_some(),
             has_anchor = session_id.is_some(),
             "session_context: refreshed resume anchor for replay (turn-start snapshot was stale)"
         );
-        ctx.session_id = session_id;
-        ctx.session_snapshot = session_snapshot;
+        *ctx_session_id = session_id;
+        *ctx_session_snapshot = session_snapshot;
         Ok(())
     }
 }
@@ -1061,6 +1139,55 @@ mod tests {
         assert_eq!(acp.config.session_mode.as_deref(), Some("full-access"));
         assert_eq!(acp.config.current_model_id.as_deref(), Some("gpt-5.5"));
         assert!(acp.session_snapshot.is_none());
+    }
+
+    #[tokio::test]
+    async fn acp_unassigned_session_promotes_runtime_mode_and_effort_over_stale_extra() {
+        let repos = setup().await;
+        upsert_builtin(&repos, "agy-ultra", "antigravity").await;
+        let row = row(
+            "antigravity",
+            serde_json::json!({
+                "agent_id": "agy-ultra",
+                "backend": "antigravity",
+                "session_mode": "default"
+            }),
+            None,
+        );
+        repos.insert_conversation(&row).await;
+        repos
+            .acp_session_repo
+            .create(&CreateAcpSessionParams {
+                user_id: "user-1",
+                conversation_id: "conv-1",
+                agent_source: "builtin",
+                agent_id: "agy-ultra",
+            })
+            .await
+            .unwrap();
+        repos
+            .acp_session_repo
+            .save_runtime_state_for_user(
+                "user-1",
+                "conv-1",
+                &SaveRuntimeStateParams {
+                    current_mode_id: Some(Some("yolo")),
+                    current_model_id: Some(Some("gemini-4-neon-xhigh")),
+                    config_selections_json: Some(Some(r#"{"mode":"yolo","effort":"high"}"#)),
+                    context_usage_json: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let context = repos.builder().build(&row).await.unwrap();
+        let AgentSessionKind::Antigravity(agy) = context.kind else {
+            panic!("expected antigravity session build context");
+        };
+        assert_eq!(agy.config.session_mode.as_deref(), Some("yolo"));
+        assert_eq!(agy.config.current_model_id.as_deref(), Some("gemini-4-neon-xhigh"));
+        assert_eq!(agy.config.thought_level.as_deref(), Some("high"));
+        assert!(agy.session_snapshot.is_none());
     }
 
     #[tokio::test]

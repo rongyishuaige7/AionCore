@@ -158,6 +158,16 @@ pub struct TeamRoleBrief {
     pub playbook: Vec<String>,
     /// Shared boss profile (`roles/_boss/USER.md`) across all resident roles.
     pub boss_profile: String,
+    /// Compact directory of other active resident roles (`Colleagues`).
+    pub colleagues: Vec<TeamRolePeer>,
+}
+
+/// Compact summary of a peer resident role injected into a role's prompt outside teams.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TeamRolePeer {
+    pub role_id: String,
+    pub name: String,
+    pub charter_summary: String,
 }
 
 /// One task a role has under way.

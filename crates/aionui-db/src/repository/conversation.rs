@@ -30,6 +30,32 @@ pub trait IConversationRepository: Send + Sync {
     /// Partially updates a conversation. Returns `DbError::NotFound` if ID is missing for the user.
     async fn update(&self, user_id: &str, id: &str, updates: &ConversationRowUpdate) -> Result<(), DbError>;
 
+    /// Atomically updates a conversation's runtime engine `type`, top-level
+    /// `model` JSON, and `extra` JSON (used when syncing a resident role's
+    /// thread conversation after its assistant runtime binding changes).
+    async fn update_runtime_binding(
+        &self,
+        user_id: &str,
+        id: &str,
+        agent_type: &str,
+        model: Option<&str>,
+        extra: &str,
+        updated_at: TimestampMs,
+    ) -> Result<(), DbError> {
+        let _ = agent_type;
+        self.update(
+            user_id,
+            id,
+            &ConversationRowUpdate {
+                model: Some(model.map(ToOwned::to_owned)),
+                extra: Some(extra.to_owned()),
+                updated_at: Some(updated_at),
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
     /// Atomically rename only an unchanged, automatically named conversation.
     /// A manual rename or newly persisted activity invalidates the snapshot.
     async fn update_agent_title(
@@ -138,6 +164,24 @@ pub trait IConversationRepository: Send + Sync {
         _conversation_id: &str,
     ) -> Result<Option<ConversationAssistantSnapshotRow>, DbError> {
         Ok(None)
+    }
+
+    /// Returns persisted assistant snapshots for the given conversations of `user_id`, keyed by `conversation_id`.
+    ///
+    /// Default implementation delegates to [`Self::get_assistant_snapshot`] so test stubs keep working
+    /// without boilerplate; concrete SQL implementations override with a batch query.
+    async fn list_assistant_snapshots_for_conversations(
+        &self,
+        user_id: &str,
+        conversation_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, ConversationAssistantSnapshotRow>, DbError> {
+        let mut out = std::collections::HashMap::with_capacity(conversation_ids.len());
+        for conversation_id in conversation_ids {
+            if let Some(snapshot) = self.get_assistant_snapshot(user_id, conversation_id).await? {
+                out.insert(conversation_id.clone(), snapshot);
+            }
+        }
+        Ok(out)
     }
 
     /// Inserts or updates a persisted assistant snapshot for a conversation.

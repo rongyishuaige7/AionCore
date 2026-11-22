@@ -102,7 +102,7 @@ pub use conversation::{
     CreateConversationRequest, EnsureConversationRuntimeResponse, ForkCapabilityView, ForkConversationRequest,
     ListConversationsQuery, ListMessagesQuery, McpRuntimeSnapshot, MessageListResponse, MessageResponse,
     MessageSearchItem, MessageSearchResponse, MessageStatusChangedPayload, MoveConversationToProjectRequest,
-    PromptCapabilityView, SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionRef,
+    PromptCapabilityView, RoleRef, SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionRef,
     UpdateConversationArtifactRequest, UpdateConversationRequest,
 };
 pub use conversation_tools::{
@@ -165,15 +165,16 @@ pub use role::{
     ForgetKeeperDebriefItemRequest, KeeperBrief, KeeperBriefLesson, KeeperBriefResponse, KeeperBriefTask,
     KeeperDebrief, KeeperDebriefContext, KeeperDebriefDraft, KeeperDebriefDraftWarning, KeeperDebriefItem,
     KeeperDebriefItemKind, KeeperDebriefResponse, KeeperDebriefStatus, KeeperDebriefWarning, KeeperDebriefsResponse,
-    KeeperLastStop, OutdatedKeeperLessonRequest, PlaybookDeltaOp, ROLE_CLI_SCHEMA_VERSION, RoleCliEnvelope,
-    RoleCliError, RoleCliErrorCode, RoleCliMeta, RoleCommit, RoleCurateRequest, RoleCurateResponse, RoleDreamResponse,
-    RoleExpandMessage, RoleExpandRequest, RoleExpandResponse, RoleFollowUpRequest, RoleFollowUpResponse, RoleKeeper,
-    RoleKeepersResponse, RoleKeptProject, RoleListResponse, RolePlaybookEntry, RoleProgress, RoleProgressRequest,
-    RoleProgressResponse, RoleProjectClaim, RoleProposal, RoleProposalChange, RoleRecallBound, RoleRecallHit,
-    RoleRecallKind, RoleRecallRequest, RoleRecallResponse, RoleRecallScope, RoleRecallSource, RoleRememberRequest,
+    KeeperLastStop, MAX_ROLE_AUTO_HOPS, OutdatedKeeperLessonRequest, PlaybookDeltaOp, ROLE_CLI_SCHEMA_VERSION,
+    ROLE_SEND_TOOL_NAME, RoleCliEnvelope, RoleCliError, RoleCliErrorCode, RoleCliMeta, RoleCommit, RoleCurateRequest,
+    RoleCurateResponse, RoleDreamResponse, RoleExpandMessage, RoleExpandRequest, RoleExpandResponse,
+    RoleFollowUpRequest, RoleFollowUpResponse, RoleKeeper, RoleKeepersResponse, RoleKeptProject, RoleListResponse,
+    RolePeerSummary, RolePeersResponse, RolePlaybookEntry, RoleProgress, RoleProgressRequest, RoleProgressResponse,
+    RoleProjectClaim, RoleProposal, RoleProposalChange, RoleRecallBound, RoleRecallHit, RoleRecallKind,
+    RoleRecallRequest, RoleRecallResponse, RoleRecallScope, RoleRecallSource, RoleRememberRequest,
     RoleRememberResponse, RoleReport, RoleReportOutcome, RoleReportRequest, RoleReportResponse, RoleReportedEvent,
-    RoleResponse, RoleRevertRequest, RoleTimelineResponse, SetRoleProjectsRequest, UpdateRoleMemoryRequest,
-    UpsertRoleRequest,
+    RoleResponse, RoleRevertRequest, RoleSendRequest, RoleSendResponse, RoleTimelineResponse, SetRoleProjectsRequest,
+    UpdateRoleMemoryRequest, UpsertRoleRequest,
 };
 pub use runtime::{
     EnsureNodeRuntimeRequest, EnsureNodeRuntimeResponse, RuntimeFailureKind, RuntimeResourceKind, RuntimeStatusPayload,

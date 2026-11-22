@@ -39,6 +39,8 @@ pub(crate) fn data() -> Value {
             "target_is_team",
             "sender_is_team",
             "target_is_self",
+            "permission_denied",
+            "hop_limit_reached",
             "queue_full",
             "rate_limited",
             "feature_disabled",

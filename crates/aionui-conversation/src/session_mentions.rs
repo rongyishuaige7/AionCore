@@ -5,7 +5,9 @@
 //! broadcast, and agent input all see the same bytes.
 
 use aionui_api_types::TeamSessionBinding;
-use aionui_common::constants::{AIONUI_SESSIONS_END_MARKER, AIONUI_SESSIONS_MARKER};
+use aionui_common::constants::{
+    AIONUI_ROLES_END_MARKER, AIONUI_ROLES_MARKER, AIONUI_SESSIONS_END_MARKER, AIONUI_SESSIONS_MARKER,
+};
 
 use crate::error::ConversationError;
 
@@ -15,6 +17,17 @@ pub struct SessionMentionTargetInfo {
     pub id: String,
     pub name: String,
     /// Absolute workspace path, when the conversation row records one.
+    pub workspace: Option<String>,
+}
+
+/// One `@@@` resident-role target, resolved from its role id (`assistant_id`) by
+/// the backend into its unique thread conversation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleMentionTargetInfo {
+    pub role_id: String,
+    pub role_name: String,
+    pub thread_conversation_id: String,
+    /// Absolute workspace path of the role's thread conversation, when recorded.
     pub workspace: Option<String>,
 }
 
@@ -87,6 +100,32 @@ pub fn build_sessions_block(sender_workspace: Option<&str>, targets: &[SessionMe
     }
     block.push('\n');
     block.push_str(AIONUI_SESSIONS_END_MARKER);
+    block
+}
+
+const ROLES_BLOCK_HINT: &str = "To deliver to the resident roles below, use `role send` (`to_role` = role_id) when you run as a resident role, or use the session-message skill / `session_send_message` (`to` = thread_conversation_id); if unavailable, run `\"$AIONUI_HELPER_BIN\" session capabilities` for the delivery contract.";
+
+/// Build the sender-side `[[AION_ROLES]]` block for `@@@` resident-role mentions.
+///
+/// Each target line encodes `role_name \t role_id \t thread_conversation_id \t workspace: <value>`.
+/// The first line inside the markers has no tab so the frontend chip parser
+/// skips it while every agent backend receives the routing guidance.
+pub fn build_roles_block(sender_workspace: Option<&str>, targets: &[RoleMentionTargetInfo]) -> String {
+    let mut block = String::from(AIONUI_ROLES_MARKER);
+    block.push('\n');
+    block.push_str(ROLES_BLOCK_HINT);
+    for target in targets {
+        block.push('\n');
+        block.push_str(&target.role_name);
+        block.push('\t');
+        block.push_str(&target.role_id);
+        block.push('\t');
+        block.push_str(&target.thread_conversation_id);
+        block.push_str("\tworkspace: ");
+        block.push_str(&workspace_field_value(sender_workspace, target.workspace.as_deref()));
+    }
+    block.push('\n');
+    block.push_str(AIONUI_ROLES_END_MARKER);
     block
 }
 

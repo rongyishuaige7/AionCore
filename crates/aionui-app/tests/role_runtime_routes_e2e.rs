@@ -902,3 +902,648 @@ async fn proposals_gate_agent_role_and_cron_mutations_and_dismiss_cleans_up_sche
 
     fixture.services.database.close().await;
 }
+
+#[tokio::test]
+async fn role_peers_and_role_send_collaborate_lazily_provision_threads_and_preserve_boss_news() {
+    let fixture = fixture().await;
+    let assistants: Vec<(String, String)> = sqlx::query_as(
+        "SELECT assistant_id, name FROM assistant_definitions WHERE source = 'builtin' ORDER BY assistant_id LIMIT 2",
+    )
+    .fetch_all(fixture.services.database.pool())
+    .await
+    .expect("two builtin assistants");
+    assert_eq!(assistants.len(), 2);
+    let (role_a_id, role_a_name) = &assistants[0];
+    let (role_b_id, role_b_name) = &assistants[1];
+
+    // Point Role B at the seeded builtin `claude` ACP agent so `ensure_role_thread`
+    // can materialize Role B's direct conversation in the in-memory DB without
+    // needing external model provider credentials.
+    sqlx::query("UPDATE assistant_definitions SET agent_id = 'claude' WHERE assistant_id = ?")
+        .bind(role_b_id)
+        .execute(fixture.services.database.pool())
+        .await
+        .unwrap();
+
+    define_role_as(&fixture, role_a_id, &[]).await;
+    define_role_as(&fixture, role_b_id, &[]).await;
+
+    let token_a = conversation_as(&fixture, "conv-role-a", Some(role_a_id)).await;
+
+    // 1. `GET /api/runtime/role/peers` lists Role B (excluding self Role A), initially without a thread.
+    let (status, peers_before) = call(
+        &fixture,
+        "GET",
+        "/api/runtime/role/peers",
+        "conv-role-a",
+        &token_a,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{peers_before}");
+    let peer_arr = peers_before["data"]["peers"].as_array().unwrap();
+    assert_eq!(peer_arr.len(), 1, "{peer_arr:?}");
+    assert_eq!(peer_arr[0]["role_id"], json!(role_b_id));
+    assert_eq!(peer_arr[0]["name"], json!(role_b_name));
+    assert!(peer_arr[0].get("thread_conversation_id").is_none());
+
+    // 2. Validation bad paths: self-send, missing peer, ambiguous target.
+    let (status, self_err) = call(
+        &fixture,
+        "POST",
+        "/api/runtime/role/send",
+        "conv-role-a",
+        &token_a,
+        Some(json!({ "to_role": role_a_id, "message": "talk to myself" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{self_err}");
+    assert_eq!(self_err["error"]["code"], json!("target_is_self"));
+
+    let (status, missing_err) = call(
+        &fixture,
+        "POST",
+        "/api/runtime/role/send",
+        "conv-role-a",
+        &token_a,
+        Some(json!({ "to_role": "ghost-role", "message": "hello?" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{missing_err}");
+    assert_eq!(missing_err["error"]["code"], json!("target_not_found"));
+
+    let (status, schema_err) = call(
+        &fixture,
+        "POST",
+        "/api/runtime/role/send",
+        "conv-role-a",
+        &token_a,
+        Some(json!({ "to_role": role_b_id, "to_conversation": "conv-x", "message": "both?" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{schema_err}");
+    assert_eq!(schema_err["error"]["code"], json!("schema_validation_failed"));
+
+    // 3. `POST /api/runtime/role/send` lazily provisions Role B's thread and delivers `from_role` + `hop: 1/4`.
+    let (status, sent) = call(
+        &fixture,
+        "POST",
+        "/api/runtime/role/send",
+        "conv-role-a",
+        &token_a,
+        Some(json!({ "to_role": role_b_id, "message": "请协助审查鉴权改动" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{sent}");
+    let b_thread_id = sent["data"]["to_conversation_id"].as_str().unwrap().to_owned();
+    assert_eq!(sent["data"]["to_role_id"], json!(role_b_id));
+    assert_eq!(sent["data"]["hop"], json!(1));
+    assert_eq!(sent["data"]["max_hops"], json!(4));
+    assert_eq!(
+        fixture.services.role_service.thread(role_b_id).await.unwrap(),
+        Some(b_thread_id.clone()),
+        "Role B must claim the auto-provisioned conversation as its unique thread"
+    );
+
+    // Verify delivered message carries `from_role:` and `hop: 1/4`.
+    let page = fixture
+        .services
+        .conversation_repo
+        .list_messages_page(
+            USER,
+            &b_thread_id,
+            &aionui_db::MessagePageParams {
+                limit: 10,
+                direction: aionui_db::MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap();
+    let user_msg = page
+        .items
+        .iter()
+        .rfind(|m| m.position.as_deref() == Some("right"))
+        .expect("delivered message persisted in Role B thread");
+    let text = serde_json::from_str::<Value>(&user_msg.content).unwrap()["content"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        text.contains(&format!("from_role: {role_a_id}\t{role_a_name}\n")),
+        "{text}"
+    );
+    assert!(text.contains("hop: 1/4\n"), "{text}");
+
+    // 4. Record an unread scheduled-run report on Role B, send a second colleague message,
+    //    and confirm Role B's unread `<role-news>` was NOT consumed by the colleague turn!
+    let now_after = aionui_common::now_ms() + 5_000;
+    fixture
+        .services
+        .role_service
+        .record_report(
+            role_b_id,
+            aionui_api_types::RoleReportOutcome::Say,
+            "巡检发现证书将在 7 天后到期",
+            "conv-cron-run-b",
+            now_after,
+        )
+        .await
+        .unwrap();
+
+    // `resolve_role_mentions` (`@@@`) reuses the exact same `b_thread_id`!
+    let mentioned = fixture
+        .services
+        .conversation_service
+        .resolve_role_mentions(
+            USER,
+            "conv-role-a",
+            "请跟进证书续期",
+            &[aionui_api_types::RoleRef { id: role_b_id.clone() }],
+            Some("/w/caller"),
+        )
+        .await
+        .unwrap();
+    assert!(mentioned.contains("[[AION_ROLES]]"), "{mentioned}");
+    assert!(
+        mentioned.contains(&format!("{role_b_name}\t{role_b_id}\t{b_thread_id}\tworkspace: ")),
+        "{mentioned}"
+    );
+
+    // Unread report is STILL waiting for the human user (`open_thread_turn` returns 1 report)!
+    let turn = fixture
+        .services
+        .role_service
+        .open_thread_turn(role_b_id, &b_thread_id, false, now_after + 1_000)
+        .await
+        .unwrap();
+    match turn {
+        aionui_role::ThreadTurn::Thread { reports, .. } => {
+            assert_eq!(reports.len(), 1, "colleague turn must not consume boss <role-news>");
+            assert_eq!(reports[0].summary, "巡检发现证书将在 7 天后到期");
+        }
+        other => panic!("expected Thread, got {other:?}"),
+    }
+
+    // 5. Denying `role_send` on Role A immediately blocks outbound `role send` with 403 `permission_denied`.
+    define_role_as(&fixture, role_a_id, &["role_send"]).await;
+    let (status, denied_err) = call(
+        &fixture,
+        "POST",
+        "/api/runtime/role/send",
+        "conv-role-a",
+        &token_a,
+        Some(json!({ "to_role": role_b_id, "message": "blocked outreach" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{denied_err}");
+    assert_eq!(denied_err["error"]["code"], json!("permission_denied"));
+
+    fixture.services.database.close().await;
+}
+
+#[tokio::test]
+async fn role_runtime_switch_syncs_existing_thread_session_and_cron_jobs_and_heals_startup_drift() {
+    let mut fixture = fixture().await;
+    let (token, csrf) = common::setup_and_login(&mut fixture.app, &fixture.services, "admin", "Passw0rd!234").await;
+
+    // 1. Create a user assistant bound to Antigravity (`a9f3c21e`) with a fixed model.
+    let create_resp = fixture
+        .app
+        .clone()
+        .oneshot(common::json_with_token(
+            "POST",
+            "/api/assistants",
+            json!({
+                "id": "custom-growth-lead",
+                "name": "出海情报与增长巡检员",
+                "agent_id": "a9f3c21e",
+                "defaults": {
+                    "model": { "mode": "fixed", "value": "gemini-4-hydrogen-high" }
+                }
+            }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(create_resp.status(), StatusCode::CREATED);
+
+    // Promote it to a resident role.
+    let role_resp = fixture
+        .app
+        .clone()
+        .oneshot(common::json_with_token(
+            "PUT",
+            "/api/roles/custom-growth-lead",
+            json!({
+                "charter": "负责独立站 SEO 与增长巡检。",
+                "denied_tools": [],
+                "verifies": false,
+                "asks_when_scheduled": false
+            }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(role_resp.status(), StatusCode::OK);
+
+    // Provision its unique thread conversation (`ensure_role_thread`) and record a backend resume anchor
+    // so we can verify switching agents drops the incompatible anchor while same-agent model switch keeps it.
+    let (_, thread_row) = fixture
+        .services
+        .conversation_service
+        .ensure_role_thread(USER, "custom-growth-lead")
+        .await
+        .unwrap();
+    let thread_id = thread_row.id.clone();
+    assert_eq!(thread_row.r#type, "antigravity");
+    let initial_thread_extra: Value = serde_json::from_str(&thread_row.extra).unwrap();
+    assert_eq!(
+        initial_thread_extra["session_mode"],
+        json!("yolo"),
+        "autonomous resident role (`asks_when_scheduled == false`) must seed full-auto on thread creation"
+    );
+
+    let acp_repo = aionui_db::SqliteAcpSessionRepository::new(fixture.services.database.pool().clone());
+    use aionui_db::IAcpSessionRepository;
+    assert!(
+        acp_repo
+            .update_session_id_for_user(USER, &thread_id, "old-agy-session-anchor")
+            .await
+            .unwrap()
+    );
+
+    // Create a scheduled task bound to this resident role (`new_conversation` mode).
+    let cron_resp = fixture
+        .app
+        .clone()
+        .oneshot(common::json_with_token(
+            "POST",
+            "/api/cron/jobs",
+            json!({
+                "name": "每日 SEO 巡检",
+                "schedule": { "kind": "cron", "expr": "0 9 * * *", "tz": "UTC" },
+                "prompt": "执行每日 SEO 巡检",
+                "conversation_id": "",
+                "created_by": "user",
+                "execution_mode": "new_conversation",
+                "agent_config": {
+                    "name": "出海情报与增长巡检员",
+                    "assistant_id": "custom-growth-lead"
+                }
+            }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    let cron_status = cron_resp.status();
+    let cron_created = body_json(cron_resp).await;
+    assert_eq!(cron_status, StatusCode::CREATED, "{cron_created}");
+    let job_id = cron_created["data"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(cron_created["data"]["metadata"]["agent_config"]["mode"], json!("yolo"));
+
+    // Also create a non-role assistant and conversation to ensure ordinary assistant snapshots stay immutable.
+    let ordinary_asst_resp = fixture
+        .app
+        .clone()
+        .oneshot(common::json_with_token(
+            "POST",
+            "/api/assistants",
+            json!({
+                "id": "custom-ordinary-helper",
+                "name": "普通写作助手",
+                "agent_id": "a9f3c21e",
+                "defaults": {
+                    "model": { "mode": "fixed", "value": "gemini-4-hydrogen-high" }
+                }
+            }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(ordinary_asst_resp.status(), StatusCode::CREATED);
+    let ordinary_conv = fixture
+        .services
+        .conversation_service
+        .create(
+            USER,
+            serde_json::from_value(json!({
+                "name": "普通对话",
+                "assistant": { "id": "custom-ordinary-helper" },
+                "extra": {}
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Security & bad-path checks on assistant runtime switch:
+    // - State-changing PUT without CSRF token is rejected with 403 Forbidden.
+    let missing_csrf_resp = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/assistants/custom-growth-lead")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(r#"{"agent_id":"2d23ff1c"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing_csrf_resp.status(), StatusCode::FORBIDDEN);
+
+    // - Invalid `agent_id` returns 400 and leaves the role thread on Antigravity.
+    let bad_agent_resp = fixture
+        .app
+        .clone()
+        .oneshot(common::json_with_token(
+            "PUT",
+            "/api/assistants/custom-growth-lead",
+            json!({ "agent_id": "missing-agent-id" }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(bad_agent_resp.status(), StatusCode::BAD_REQUEST);
+
+    // 2. Subscribe to WebSocket event bus and switch the resident role from Antigravity (`a9f3c21e`)
+    //    to Claude Code (`2d23ff1c`, `acp`) with a new fixed model (`claude-sonnet-4-6`).
+    let mut ws_rx = fixture.services.event_bus.subscribe();
+    let switch_resp = fixture
+        .app
+        .clone()
+        .oneshot(common::json_with_token(
+            "PUT",
+            "/api/assistants/custom-growth-lead",
+            json!({
+                "agent_id": "2d23ff1c",
+                "defaults": {
+                    "model": { "mode": "fixed", "value": "claude-sonnet-4-6" }
+                }
+            }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(switch_resp.status(), StatusCode::OK);
+
+    // Verify `conversation.listChanged` WebSocket event was broadcast for `thread_id` scoped to `USER`.
+    let mut saw_thread_updated_event = false;
+    while let Ok(msg) = ws_rx.try_recv() {
+        if msg.name == "conversation.listChanged"
+            && msg.data["conversation_id"] == json!(thread_id)
+            && msg.data["action"] == json!("updated")
+        {
+            assert_eq!(msg.data["user_id"], json!(USER));
+            saw_thread_updated_event = true;
+        }
+    }
+    assert!(
+        saw_thread_updated_event,
+        "switching a resident role's agent must emit conversation.listChanged(updated) for its thread"
+    );
+
+    // Clicking 「找它聊」 fetches `GET /api/conversations/{thread_id}` — verify it immediately reflects Claude!
+    let get_conv_resp = fixture
+        .app
+        .clone()
+        .oneshot(common::get_with_token(
+            &format!("/api/conversations/{thread_id}"),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(get_conv_resp.status(), StatusCode::OK);
+    let conv_json = body_json(get_conv_resp).await;
+    assert_eq!(conv_json["data"]["type"], json!("acp"));
+    assert_eq!(conv_json["data"]["extra"]["agent_id"], json!("2d23ff1c"));
+    assert_eq!(conv_json["data"]["extra"]["backend"], json!("claude"));
+    assert_eq!(
+        conv_json["data"]["extra"]["current_model_id"],
+        json!("claude-sonnet-4-6")
+    );
+    assert_eq!(
+        conv_json["data"]["extra"]["session_mode"],
+        json!("bypassPermissions"),
+        "switching an autonomous role from Antigravity to Claude must map full-auto `yolo` -> `bypassPermissions`"
+    );
+    assert_eq!(
+        conv_json["data"]["extra"]["current_mode_id"],
+        json!("bypassPermissions")
+    );
+    assert_eq!(conv_json["data"]["assistant"]["backend"], json!("claude"));
+    assert!(
+        conv_json["data"]["extra"].get("preset_context").is_none(),
+        "HTTP response must keep preset_context scrubbed"
+    );
+    let stored_thread_row = fixture
+        .services
+        .conversation_repo
+        .get(USER, &thread_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let stored_extra: Value = serde_json::from_str(&stored_thread_row.extra).unwrap();
+    let preset_ctx = stored_extra["preset_context"].as_str().unwrap_or_default();
+    assert!(
+        preset_ctx.contains("## Your Standing Role"),
+        "standing role instructions must stay intact in stored extra after runtime sync: {preset_ctx}"
+    );
+    let stored_snapshot = fixture
+        .services
+        .conversation_repo
+        .get_assistant_snapshot(USER, &thread_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        stored_snapshot.rules_content.contains("## Your Standing Role"),
+        "standing role instructions must stay intact in conversation_assistant_snapshots"
+    );
+
+    // Verify `acp_session` updated `agent_id`, cleared the incompatible Antigravity `session_id`,
+    // and seeded `current_model_id = "claude-sonnet-4-6"`.
+    let acp_after_switch = acp_repo.get_for_user(USER, &thread_id).await.unwrap().unwrap();
+    assert_eq!(acp_after_switch.agent_id, "2d23ff1c");
+    assert_eq!(acp_after_switch.session_id, None);
+    let runtime_state = acp_repo
+        .load_runtime_state_for_user(USER, &thread_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(runtime_state.current_model_id.as_deref(), Some("claude-sonnet-4-6"));
+    assert_eq!(runtime_state.current_mode_id.as_deref(), Some("bypassPermissions"));
+    assert_eq!(
+        stored_snapshot.resolved_permission_value.as_deref(),
+        Some("bypassPermissions")
+    );
+
+    // Verify the scheduled Cron Job bound to this role also updated its full-auto `mode` (`bypassPermissions`)
+    // and `model_id` (`claude-sonnet-4-6`).
+    let cron_get_resp = fixture
+        .app
+        .clone()
+        .oneshot(common::get_with_token(&format!("/api/cron/jobs/{job_id}"), &token))
+        .await
+        .unwrap();
+    assert_eq!(cron_get_resp.status(), StatusCode::OK);
+    let cron_after = body_json(cron_get_resp).await;
+    assert_eq!(
+        cron_after["data"]["metadata"]["agent_config"]["mode"],
+        json!("bypassPermissions")
+    );
+    assert_eq!(
+        cron_after["data"]["metadata"]["agent_config"]["model_id"],
+        json!("claude-sonnet-4-6")
+    );
+
+    // Meanwhile, switching the ordinary non-role assistant does NOT mutate its historical conversation snapshot!
+    let ord_switch = fixture
+        .app
+        .clone()
+        .oneshot(common::json_with_token(
+            "PUT",
+            "/api/assistants/custom-ordinary-helper",
+            json!({ "agent_id": "2d23ff1c" }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(ord_switch.status(), StatusCode::OK);
+    let ord_row = fixture
+        .services
+        .conversation_repo
+        .get(USER, &ordinary_conv.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ord_row.r#type, "antigravity");
+
+    // 3. Same-agent default-model switch preserves the live `acp_session.session_id` while updating the model.
+    acp_repo
+        .update_session_id_for_user(USER, &thread_id, "live-claude-session-1")
+        .await
+        .unwrap();
+    let model_only_resp = fixture
+        .app
+        .clone()
+        .oneshot(common::json_with_token(
+            "PUT",
+            "/api/assistants/custom-growth-lead",
+            json!({
+                "defaults": {
+                    "model": { "mode": "fixed", "value": "claude-opus-4-7" }
+                }
+            }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(model_only_resp.status(), StatusCode::OK);
+    let acp_after_model = acp_repo.get_for_user(USER, &thread_id).await.unwrap().unwrap();
+    assert_eq!(
+        acp_after_model.session_id.as_deref(),
+        Some("live-claude-session-1"),
+        "switching default model on the same agent must keep the live session anchor"
+    );
+    let runtime_after_model = acp_repo
+        .load_runtime_state_for_user(USER, &thread_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(runtime_after_model.current_model_id.as_deref(), Some("claude-opus-4-7"));
+    assert_eq!(
+        runtime_after_model.current_mode_id.as_deref(),
+        Some("bypassPermissions"),
+        "switching default model on the same agent must preserve the thread's full-auto permission"
+    );
+
+    // 4. Simulate pre-existing DB drift (e.g. an offline or pre-fix edit setting `agent_id = '8e1acf31'` Codex)
+    //    and rebuild the app router: startup drift reconciliation heals `thread_id` automatically!
+    sqlx::query(
+        "UPDATE assistant_definitions SET agent_id = '8e1acf31', default_model_mode = 'auto', default_model_value = NULL \
+         WHERE assistant_id = 'custom-growth-lead'",
+    )
+    .execute(fixture.services.database.pool())
+    .await
+    .unwrap();
+    let _restarted_router = create_router(&fixture.services).await.expect("rebuild router");
+    let healed_row = fixture
+        .services
+        .conversation_repo
+        .get(USER, &thread_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let healed_extra: Value = serde_json::from_str(&healed_row.extra).unwrap();
+    assert_eq!(healed_extra["agent_id"], json!("8e1acf31"));
+    assert_eq!(healed_extra["backend"], json!("codex"));
+    assert!(healed_extra.get("current_model_id").is_none());
+    assert_eq!(
+        healed_extra["session_mode"],
+        json!("agent-full-access"),
+        "startup drift heal onto Codex must map full-auto `bypassPermissions` -> `agent-full-access`"
+    );
+
+    // 5. Simulate wiped thread permission (matching live `8e34e0ba`) while `assistant_preferences`
+    //    carries a stale `"plan"` from an unrelated conversation: startup reconciliation restores
+    //    `agent-full-access` without letting `assistant_preferences` downgrade the role thread!
+    sqlx::query(
+        "UPDATE conversations SET extra = json_remove(extra, '$.session_mode', '$.current_mode_id') WHERE id = ?",
+    )
+    .bind(&thread_id)
+    .execute(fixture.services.database.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE conversation_assistant_snapshots SET resolved_permission_value = NULL WHERE conversation_id = ?",
+    )
+    .bind(&thread_id)
+    .execute(fixture.services.database.pool())
+    .await
+    .unwrap();
+    acp_repo
+        .save_runtime_state_for_user(
+            USER,
+            &thread_id,
+            &aionui_db::SaveRuntimeStateParams {
+                current_mode_id: Some(None),
+                config_selections_json: Some(Some("{}")),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    sqlx::query("UPDATE assistant_preferences SET last_permission_value = 'plan'")
+        .execute(fixture.services.database.pool())
+        .await
+        .unwrap();
+    let _restarted_again = create_router(&fixture.services).await.expect("rebuild router 2");
+    let restored_row = fixture
+        .services
+        .conversation_repo
+        .get(USER, &thread_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let restored_extra: Value = serde_json::from_str(&restored_row.extra).unwrap();
+    assert_eq!(restored_extra["session_mode"], json!("agent-full-access"));
+    let restored_acp = acp_repo
+        .load_runtime_state_for_user(USER, &thread_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(restored_acp.current_mode_id.as_deref(), Some("agent-full-access"));
+
+    fixture.services.database.close().await;
+}

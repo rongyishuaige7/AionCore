@@ -24,19 +24,25 @@ use std::sync::Arc;
 
 use aionui_ai_agent::{RuntimeTokenScope, RuntimeTokenService, TEAM_RUNTIME_TOKEN_SESSION_GENERATION};
 use aionui_api_types::{
-    RoleCliEnvelope, RoleCliErrorCode, RoleCurateRequest, RoleCurateResponse, RoleExpandRequest, RoleFollowUpRequest,
-    RoleFollowUpResponse, RoleProgressRequest, RoleProgressResponse, RoleRecallRequest, RoleRecallSource,
-    RoleRememberRequest, RoleRememberResponse, RoleReport, RoleReportRequest, RoleReportResponse, RoleReportedEvent,
-    RoleResponse, TeamToolName, WebSocketMessage,
+    ROLE_SEND_TOOL_NAME, RoleCliEnvelope, RoleCliErrorCode, RoleCurateRequest, RoleCurateResponse, RoleExpandRequest,
+    RoleFollowUpRequest, RoleFollowUpResponse, RolePeerSummary, RolePeersResponse, RoleProgressRequest,
+    RoleProgressResponse, RoleRecallRequest, RoleRecallSource, RoleRememberRequest, RoleRememberResponse, RoleReport,
+    RoleReportRequest, RoleReportResponse, RoleReportedEvent, RoleResponse, RoleSendRequest, RoleSendResponse,
+    SessionSendMessageRequest, TeamToolName, WebSocketMessage,
 };
 use aionui_common::now_ms;
-use aionui_conversation::ConversationService;
+use aionui_conversation::runtime_state::ConversationRuntimeStateService;
+use aionui_conversation::{ConversationError, ConversationService};
 use aionui_cron::error::CronError;
 use aionui_cron::service::CronService;
 use aionui_db::models::MessageRow;
-use aionui_db::{IConversationRepository, MessagePageCursor, MessagePageDirection, MessagePageParams};
+use aionui_db::{
+    IAssistantDefinitionRepository, IConversationRepository, MessagePageCursor, MessagePageDirection, MessagePageParams,
+};
 use aionui_realtime::EventBroadcaster;
 use aionui_role::{RecallConversationSync, RecallMessage, RecallSync, RecallWatermark, RoleError, RoleService};
+use aionui_session_message::error::SessionMessageError;
+use aionui_session_message::service::SessionMessageService;
 use axum::extract::State;
 use axum::extract::rejection::JsonRejection;
 use axum::http::{HeaderMap, StatusCode};
@@ -60,6 +66,10 @@ pub struct RuntimeRoleState {
     /// Where a role's follow-ups wait until they are due.
     pub timers: Arc<CronService>,
     pub conversations: Arc<dyn IConversationRepository>,
+    pub assistant_definitions: Arc<dyn IAssistantDefinitionRepository>,
+    pub conversation_service: ConversationService,
+    pub session_messages: Arc<SessionMessageService>,
+    pub runtime_state: Arc<ConversationRuntimeStateService>,
     pub runtime_token_service: Arc<RuntimeTokenService>,
     /// Where a run's declaration of how it ended is announced.
     pub broadcaster: Arc<dyn EventBroadcaster>,
@@ -68,6 +78,8 @@ pub struct RuntimeRoleState {
 pub fn runtime_role_routes(state: RuntimeRoleState) -> Router {
     Router::new()
         .route("/api/runtime/role", get(show))
+        .route("/api/runtime/role/peers", get(peers))
+        .route("/api/runtime/role/send", post(send))
         .route("/api/runtime/role/remember", post(remember))
         .route("/api/runtime/role/curate", post(curate))
         .route("/api/runtime/role/progress", post(progress))
@@ -347,6 +359,180 @@ async fn expand(
         Ok(expanded) => success(COMMAND, &expanded),
         Err(error) => role_failure(error, COMMAND),
     }
+}
+
+/// Live roster of other resident roles (`role peers` / `role_peers`), with
+/// each peer's display name, charter gist, thread id, and busy flag.
+async fn peers(State(state): State<RuntimeRoleState>, headers: HeaderMap) -> Reply {
+    const COMMAND: &str = "role peers";
+    let (caller, role) = match caller_and_role(&state, &headers, COMMAND).await {
+        Ok(found) => found,
+        Err(reply) => return reply,
+    };
+    let all_roles = match state.roles.list().await {
+        Ok(roles) => roles,
+        Err(error) => return role_failure(error, COMMAND),
+    };
+    let definitions = state
+        .assistant_definitions
+        .list_for_user(&caller.user_id)
+        .await
+        .unwrap_or_default();
+
+    let mut peer_list = Vec::new();
+    for item in all_roles {
+        if item.id == role.id {
+            continue;
+        }
+        let name = definitions
+            .iter()
+            .find(|def| def.assistant_id == item.id)
+            .map(|def| def.name.trim())
+            .filter(|name| !name.is_empty())
+            .unwrap_or(&item.id)
+            .to_owned();
+        let busy = item
+            .thread_conversation_id
+            .as_deref()
+            .is_some_and(|tid| state.runtime_state.active_turn_id_for(tid).is_some());
+        peer_list.push(RolePeerSummary {
+            role_id: item.id,
+            name,
+            charter_summary: super::state::summarize_role_charter(&item.charter),
+            thread_conversation_id: item.thread_conversation_id,
+            busy,
+        });
+    }
+    success(COMMAND, &RolePeersResponse { peers: peer_list })
+}
+
+/// Deliver a message either to a peer resident role (`to_role`, lazily
+/// creating its thread when needed) or to an explicit conversation id
+/// (`to_conversation`, e.g. `reply_to` from an incoming `[[AION_SESSION_MESSAGE]]`).
+async fn send(
+    State(state): State<RuntimeRoleState>,
+    headers: HeaderMap,
+    body: Result<Json<RoleSendRequest>, JsonRejection>,
+) -> Reply {
+    const COMMAND: &str = "role send";
+    let (caller, role) = match caller_and_role(&state, &headers, COMMAND).await {
+        Ok(found) => found,
+        Err(reply) => return reply,
+    };
+    let request = match parsed(body, COMMAND) {
+        Ok(request) => request,
+        Err(reply) => return *reply,
+    };
+    if role.denied_tools.iter().any(|tool| tool == ROLE_SEND_TOOL_NAME) {
+        return failure(
+            StatusCode::FORBIDDEN,
+            RoleCliErrorCode::PermissionDenied,
+            "this role is not permitted to message colleagues on its own; tell the user who should be contacted",
+            COMMAND,
+        );
+    }
+
+    let to_role = request.to_role.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let to_conv = request
+        .to_conversation
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let (target_conversation_id, resolved_role_id) = match (to_role, to_conv) {
+        (Some(_), Some(_)) | (None, None) => {
+            return failure(
+                StatusCode::BAD_REQUEST,
+                RoleCliErrorCode::SchemaValidationFailed,
+                "provide exactly one of `to_role` (peer role id) or `to_conversation` (conversation id)",
+                COMMAND,
+            );
+        }
+        (Some(peer_role_id), None) => {
+            if peer_role_id == role.id {
+                return failure(
+                    StatusCode::BAD_REQUEST,
+                    RoleCliErrorCode::TargetIsSelf,
+                    "cannot message your own role",
+                    COMMAND,
+                );
+            }
+            match state
+                .conversation_service
+                .ensure_role_thread(&caller.user_id, peer_role_id)
+                .await
+            {
+                Ok((_, row)) => (row.id, Some(peer_role_id.to_owned())),
+                Err(ConversationError::NotFound { id }) => {
+                    return failure(
+                        StatusCode::NOT_FOUND,
+                        RoleCliErrorCode::TargetNotFound,
+                        format!("peer resident role not found: {id}"),
+                        COMMAND,
+                    );
+                }
+                Err(ConversationError::BadRequest { reason }) => {
+                    return failure(
+                        StatusCode::BAD_REQUEST,
+                        RoleCliErrorCode::SchemaValidationFailed,
+                        reason,
+                        COMMAND,
+                    );
+                }
+                Err(error) => {
+                    return failure(
+                        StatusCode::CONFLICT,
+                        RoleCliErrorCode::TransportUnavailable,
+                        error.to_string(),
+                        COMMAND,
+                    );
+                }
+            }
+        }
+        (None, Some(conv_id)) => (conv_id.to_owned(), None),
+    };
+
+    let send_req = SessionSendMessageRequest {
+        to: target_conversation_id,
+        message: request.message,
+    };
+    match state
+        .session_messages
+        .send_detailed(&caller.user_id, &caller.conversation_id, &send_req)
+        .await
+    {
+        Ok(outcome) => success(
+            COMMAND,
+            &RoleSendResponse {
+                status: outcome.response.status,
+                to_conversation_id: outcome.response.to,
+                to_role_id: resolved_role_id,
+                hop: outcome.hop,
+                max_hops: outcome.max_hops,
+            },
+        ),
+        Err(error) => session_send_failure(error, COMMAND),
+    }
+}
+
+fn session_send_failure(error: SessionMessageError, command: &str) -> Reply {
+    let status = StatusCode::from_u16(error.http_status()).unwrap_or(StatusCode::CONFLICT);
+    let message = error.to_string();
+    let code = match error {
+        SessionMessageError::TargetNotFound { .. } => RoleCliErrorCode::TargetNotFound,
+        SessionMessageError::TargetIsSelf { .. } => RoleCliErrorCode::TargetIsSelf,
+        SessionMessageError::TargetIsTeam { .. } | SessionMessageError::SenderIsTeam { .. } => {
+            RoleCliErrorCode::PermissionDenied
+        }
+        SessionMessageError::PermissionDenied => RoleCliErrorCode::PermissionDenied,
+        SessionMessageError::HopLimitReached { .. } => RoleCliErrorCode::HopLimitReached,
+        SessionMessageError::QueueFull => RoleCliErrorCode::QueueFull,
+        SessionMessageError::RateLimited => RoleCliErrorCode::RateLimited,
+        SessionMessageError::FeatureDisabled => RoleCliErrorCode::FeatureDisabled,
+        SessionMessageError::SchemaValidation { .. } => RoleCliErrorCode::SchemaValidationFailed,
+        SessionMessageError::TransportUnavailable { .. } => RoleCliErrorCode::TransportUnavailable,
+    };
+    failure(status, code, message, command)
 }
 
 const RECALL_PAGE_ROWS: u32 = 500;

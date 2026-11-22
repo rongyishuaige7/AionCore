@@ -7,6 +7,7 @@
 mod common;
 
 use aionui_api_types::{SessionDeliveryStatus, SessionSendMessageRequest, SessionToolErrorCode};
+use aionui_db::IConversationRepository;
 use common::{OTHER_USER, USER, setup};
 
 fn request(to: &str, message: &str) -> SessionSendMessageRequest {
@@ -636,4 +637,68 @@ async fn a_restarting_target_keeps_its_queue_and_is_drained_once_the_restart_fin
     assert_eq!(ctx.user_message_count("conv_target").await, 1);
     let content = ctx.last_user_message_content("conv_target").await;
     assert!(content.contains("survive the restart"), "{content}");
+}
+
+#[tokio::test]
+async fn autonomous_chain_stops_at_four_hops_and_resets_when_human_writes() {
+    let ctx = setup().await;
+    ctx.create_conversation("conv_0", "Origin", "/w/a").await;
+    ctx.create_conversation("conv_1", "Peer1", "/w/a").await;
+    ctx.create_conversation("conv_2", "Peer2", "/w/a").await;
+    ctx.create_conversation("conv_3", "Peer3", "/w/a").await;
+    ctx.create_conversation("conv_4", "Peer4", "/w/a").await;
+    ctx.create_conversation("conv_5", "Peer5", "/w/a").await;
+
+    for (hop, (from, to)) in [
+        (1, ("conv_0", "conv_1")),
+        (2, ("conv_1", "conv_2")),
+        (3, ("conv_2", "conv_3")),
+        (4, ("conv_3", "conv_4")),
+    ] {
+        let outcome = ctx
+            .service
+            .send_detailed(USER, from, &request(to, &format!("step {hop}")))
+            .await
+            .expect("within 4-hop budget");
+        assert_eq!(outcome.hop, hop);
+        assert_eq!(outcome.max_hops, 4);
+        let body = ctx.last_user_message_content(to).await;
+        assert!(body.contains(&format!("hop: {hop}/4\n")), "{body}");
+    }
+
+    // 5th autonomous hop without human intervention is refused as `hop_limit_reached`.
+    let refused = ctx
+        .service
+        .send(USER, "conv_4", &request("conv_5", "step 5"))
+        .await
+        .expect_err("5th autonomous hop must be blocked");
+    assert_eq!(refused.code(), SessionToolErrorCode::HopLimitReached, "{refused}");
+    assert_eq!(refused.http_status(), 429);
+
+    // Once the human user writes in `conv_4`, its causal chain resets to 0.
+    ctx.conversation_repo
+        .insert_message(
+            USER,
+            &aionui_db::models::MessageRow {
+                id: "human_reset_msg".to_owned(),
+                conversation_id: "conv_4".to_owned(),
+                msg_id: Some("human_reset_msg".to_owned()),
+                r#type: "text".to_owned(),
+                content: serde_json::json!({ "content": "继续通知 Peer5" }).to_string(),
+                position: Some("right".to_owned()),
+                status: Some("finish".to_owned()),
+                hidden: false,
+                created_at: aionui_common::now_ms() + 10_000,
+                backend_turn_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let reset_outcome = ctx
+        .service
+        .send_detailed(USER, "conv_4", &request("conv_5", "fresh chain"))
+        .await
+        .expect("human message resets hop budget");
+    assert_eq!(reset_outcome.hop, 1);
 }

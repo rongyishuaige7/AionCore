@@ -64,6 +64,14 @@ pub(crate) const EXPAND_FIELDS: Fields = Fields {
     timestamps: &[],
 };
 
+/// Stdin fields of `role send` (exactly one of `to_role` or `to_conversation` is required at runtime).
+pub(crate) const SEND_FIELDS: Fields = Fields {
+    required: &["message"],
+    optional: &["to_role", "to_conversation"],
+    whole_numbers: &[],
+    timestamps: &[],
+};
+
 /// The fields a command reads from its stdin JSON object: strings, except the
 /// ones named in `whole_numbers` or `timestamps`.
 pub(crate) struct Fields {
@@ -145,6 +153,21 @@ pub(crate) fn data() -> Value {
                     "after": "following messages to include around a message hit, from 0 to 20 (default 3)"
                 },
                 "data": "{ ref_id, kind, source, conversation_id, span?, leaf?, messages?: [{ ref_id, speaker, at, text, hit? }], truncated? }"
+            },
+            "peers": {
+                "runtime_env_required": RUNTIME_ENV,
+                "stdin": "none",
+                "data": "{ peers: [{ role_id, name, charter_summary, thread_conversation_id?, busy }] } — live roster of other resident roles"
+            },
+            "send": {
+                "runtime_env_required": RUNTIME_ENV,
+                "stdin_json": { "required": SEND_FIELDS.required, "optional": SEND_FIELDS.optional },
+                "fields": {
+                    "to_role": "peer resident role id (lazily creates its thread when needed); mutually exclusive with `to_conversation`",
+                    "to_conversation": "conversation id (e.g. `reply_to` from an incoming `[[AION_SESSION_MESSAGE]]`); mutually exclusive with `to_role`",
+                    "message": "concise, self-contained message body"
+                },
+                "data": "{ status, to_conversation_id, to_role_id?, hop, max_hops }"
             }
         },
         "output_envelope": {
@@ -166,6 +189,12 @@ pub(crate) fn data() -> Value {
             "permission_denied",
             "runtime_auth_failed",
             "schema_validation_failed",
+            "target_not_found",
+            "target_is_self",
+            "feature_disabled",
+            "rate_limited",
+            "hop_limit_reached",
+            "queue_full",
             "transport_unavailable",
             "internal"
         ]

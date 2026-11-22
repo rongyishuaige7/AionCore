@@ -15,7 +15,7 @@ use serde_json::{Map, Value};
 use crate::cli::{RoleArgs, RoleCommand};
 use crate::commands::role_capabilities::{
     self, CURATE_FIELDS, EXPAND_FIELDS, FOLLOW_UP_FIELDS, Fields, PROGRESS_FIELDS, RECALL_FIELDS, REMEMBER_FIELDS,
-    REPORT_FIELDS,
+    REPORT_FIELDS, SEND_FIELDS,
 };
 
 const ENV_BASE_URL: &str = "AIONUI_BASE_URL";
@@ -37,7 +37,9 @@ async fn run_role_inner(args: RoleArgs) -> Result<(), ExitCode> {
             role_capabilities::data(),
             "role capabilities",
         )),
-        RoleCommand::Show => show().await,
+        RoleCommand::Show => get_route("role show", "/api/runtime/role").await,
+        RoleCommand::Peers => get_route("role peers", "/api/runtime/role/peers").await,
+        RoleCommand::Send => write("role send", "/api/runtime/role/send", &SEND_FIELDS).await,
         RoleCommand::Remember => write("role remember", "/api/runtime/role/remember", &REMEMBER_FIELDS).await,
         RoleCommand::Curate => write("role curate", "/api/runtime/role/curate", &CURATE_FIELDS).await,
         RoleCommand::Progress => write("role progress", "/api/runtime/role/progress", &PROGRESS_FIELDS).await,
@@ -49,11 +51,10 @@ async fn run_role_inner(args: RoleArgs) -> Result<(), ExitCode> {
     }
 }
 
-async fn show() -> Result<(), ExitCode> {
-    let command = "role show";
+async fn get_route(command: &str, path: &str) -> Result<(), ExitCode> {
     let env = runtime_env(command)?;
     let response = reqwest::Client::new()
-        .get(env.url("/api/runtime/role"))
+        .get(env.url(path))
         .headers(env.headers(command)?)
         .send()
         .await

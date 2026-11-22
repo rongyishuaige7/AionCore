@@ -620,6 +620,104 @@ impl CronService {
         Ok(jobs)
     }
 
+    /// Synchronize stored `agent_config` (`mode`, `model`, `model_id`, `name`)
+    /// across scheduled jobs bound to `assistant_id` after the assistant's
+    /// runtime (`agent_id` or `defaults.model`) changes.
+    pub async fn sync_jobs_for_assistant_runtime(&self, user_id: &str, assistant_id: &str) -> Result<usize, CronError> {
+        let assistant_id = assistant_id.trim();
+        if assistant_id.is_empty() {
+            return Ok(0);
+        }
+        let Some(definition) = self
+            .assistant_definition_repo
+            .get_by_assistant_id_for_user(user_id, assistant_id)
+            .await?
+        else {
+            return Ok(0);
+        };
+        let runtime_agent_type = self.resolve_agent_type_for_assistant_id(user_id, assistant_id).await?;
+        let assistant_backend = self.resolve_assistant_backend(user_id, Some(assistant_id)).await?;
+        let full_auto_mode = self
+            .resolve_cron_full_auto_mode(
+                user_id,
+                &runtime_agent_type,
+                Some(assistant_id),
+                None,
+                assistant_backend.as_deref(),
+            )
+            .await?;
+        let fixed_model = (definition.default_model_mode == "fixed")
+            .then(|| definition.default_model_value.clone())
+            .flatten()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        let aionrs_model = if runtime_agent_type == "aionrs" {
+            self.executor
+                .resolve_aionrs_model_for_assistant(user_id, assistant_id, fixed_model.as_deref())
+                .await
+        } else {
+            None
+        };
+
+        let rows = self.repo.list_all_for_user(user_id).await?;
+        let mut updated_count = 0usize;
+        for row in rows {
+            let mut job = cron_job_from_row(row)?;
+            if crate::follow_up::is_follow_up(&job) {
+                continue;
+            }
+            let bound_assistant = job
+                .agent_config
+                .as_ref()
+                .and_then(|cfg| cfg.assistant_id.as_deref().or(cfg.custom_agent_id.as_deref()))
+                .map(str::trim);
+            if bound_assistant != Some(assistant_id) {
+                continue;
+            }
+            let Some(mut cfg) = job.agent_config.clone() else {
+                continue;
+            };
+
+            let prev_cfg = cfg.clone();
+            if !definition.name.trim().is_empty() {
+                cfg.name = definition.name.trim().to_owned();
+            }
+            cfg.mode = Some(full_auto_mode.clone());
+            if runtime_agent_type == "aionrs" {
+                cfg.model = aionrs_model.clone();
+                cfg.model_id = cfg.model.as_ref().map(|m| m.model.clone());
+            } else {
+                cfg.model = None;
+                cfg.model_id = fixed_model.clone();
+            }
+
+            if cfg == prev_cfg {
+                continue;
+            }
+
+            let serialized = serde_json::to_string(&cfg)?;
+            job.agent_type = runtime_agent_type.clone();
+            job.agent_config = Some(cfg);
+            job.updated_at = now_ms();
+            let params = UpdateCronJobParams {
+                agent_config: Some(Some(serialized)),
+                ..Default::default()
+            };
+            self.repo.update_for_user(user_id, &job.id, &params).await?;
+            self.scheduler.reschedule_job(&job);
+            self.emitter.emit_job_updated(user_id, &cron_job_to_response(&job));
+            updated_count += 1;
+        }
+
+        if updated_count > 0 {
+            info!(
+                assistant_id,
+                runtime_agent_type, updated_count, "synchronized scheduled jobs for assistant runtime change"
+            );
+        }
+        Ok(updated_count)
+    }
+
     // -----------------------------------------------------------------------
     // Init / Tick / Resume / RunNow
     // -----------------------------------------------------------------------
