@@ -58,6 +58,7 @@ mod tests {
         assert!(!names.contains(&"team_rename_agent".to_owned()));
         assert!(!names.contains(&"team_shutdown_agent".to_owned()));
         assert!(names.contains(&"team_read_messages".to_owned()));
+        assert!(names.contains(&"team_read_board".to_owned()));
         assert!(names.contains(&"team_send_message".to_owned()));
     }
 
@@ -78,6 +79,7 @@ mod tests {
             vec![
                 ("team_members".to_owned(), TeamToolPermission::AnyTeamAgent),
                 ("team_read_messages".to_owned(), TeamToolPermission::AnyTeamAgent),
+                ("team_read_board".to_owned(), TeamToolPermission::AnyTeamAgent),
                 ("team_send_message".to_owned(), TeamToolPermission::AnyTeamAgent),
                 ("team_interrupt_agent".to_owned(), TeamToolPermission::LeadOnly),
                 ("team_task_create".to_owned(), TeamToolPermission::AnyTeamAgent),

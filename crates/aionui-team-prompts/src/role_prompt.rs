@@ -415,7 +415,8 @@ mod tests {
         assert!(prompt.contains("Role: teammate"));
         assert!(!prompt.contains("Role: general-purpose AI assistant"));
         assert!(prompt.contains("You MUST use the `team_*` MCP tools for ALL team coordination."));
-        assert!(prompt.contains("Use team_send_message to report results to the leader slot_id"));
+        assert!(prompt.contains("Use team_send_message to report to the next person responsible for the task"));
+        assert!(prompt.contains("Report the result to the reviewer when one is assigned, or to the leader otherwise"));
         assert!(prompt.contains("Leader: Lead (slot_id: lead-1)"));
         assert!(prompt.contains("Display names are only for user-facing text"));
         assert!(prompt.contains("Never pass display names as agent targets"));
