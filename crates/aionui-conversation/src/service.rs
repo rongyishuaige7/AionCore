@@ -901,7 +901,7 @@ impl ConversationService {
         };
 
         let created = self
-            .create(
+            .create_inner(
                 user_id,
                 CreateConversationRequest {
                     name: Some(display_name.clone()),
@@ -921,6 +921,7 @@ impl ConversationService {
                     channel_chat_id: None,
                     extra: serde_json::Value::Object(serde_json::Map::new()),
                 },
+                false,
             )
             .await?;
 
@@ -1752,6 +1753,15 @@ impl ConversationService {
         user_id: &str,
         req: CreateConversationRequest,
     ) -> Result<ConversationResponse, ConversationError> {
+        self.create_inner(user_id, req, true).await
+    }
+
+    async fn create_inner(
+        &self,
+        user_id: &str,
+        req: CreateConversationRequest,
+        converge_resident_thread: bool,
+    ) -> Result<ConversationResponse, ConversationError> {
         let id = generate_short_id();
         let now = now_ms();
         let source = req.source.unwrap_or(ConversationSource::Aionui);
@@ -1787,6 +1797,74 @@ impl ConversationService {
             }
             None => None,
         };
+
+        let is_direct_human_chat = converge_resident_thread
+            && source == ConversationSource::Aionui
+            && req.channel_chat_id.is_none()
+            && !put_to_work(&extra)
+            && !THREAD_ASIDE_KEYS
+                .iter()
+                .any(|key| extra.get(*key).is_some_and(|v| !v.is_null()))
+            && extra.get("jot_explore").is_none_or(serde_json::Value::is_null)
+            && extra.get("is_health_check").and_then(serde_json::Value::as_bool) != Some(true);
+
+        let mut resident_claim: Option<(
+            Arc<dyn ConversationRolePort>,
+            String,
+            String,
+            bool,
+            tokio::sync::OwnedMutexGuard<()>,
+        )> = None;
+        if is_direct_human_chat
+            && let Some(port) = self.role_port()
+            && let Some(snapshot) = assistant_snapshot.as_mut()
+            && port.is_resident_role(&snapshot.assistant_id).await
+        {
+            let role_id = snapshot.assistant_id.clone();
+            let display_name = {
+                let trimmed = snapshot.name.trim();
+                if trimmed.is_empty() {
+                    role_id.clone()
+                } else {
+                    trimmed.to_owned()
+                }
+            };
+            let lock = self.role_threads.ensure_lock(&role_id);
+            let guard = lock.lock_owned().await;
+            let recorded = port
+                .role_thread(&role_id)
+                .await
+                .map_err(|reason| ConversationError::internal(format!("role thread lookup failed: {reason}")))?;
+            let mut thread_gone = false;
+            if let Some(thread_id) = recorded.as_deref() {
+                if let Some(mut existing) = self.conversation_repo.get(user_id, thread_id).await?
+                    && session_mentions::team_id_from_extra_str(&existing.extra).is_none()
+                {
+                    let _ = self
+                        .sync_role_thread_name_only(user_id, &mut existing, &display_name)
+                        .await?;
+                    drop(guard);
+                    return self.get(user_id, thread_id).await;
+                }
+                thread_gone = true;
+            }
+            if assistant_overrides.permission.is_none()
+                && snapshot
+                    .resolved_defaults
+                    .permission
+                    .as_deref()
+                    .map(str::trim)
+                    .is_none_or(str::is_empty)
+                && !port.asks_when_scheduled(&role_id).await
+                && let Some(full_auto) = self
+                    .resolve_role_target_full_auto_mode(user_id, &snapshot.agent_type, &snapshot.agent_id)
+                    .await
+            {
+                snapshot.resolved_defaults.permission = Some(full_auto);
+            }
+            resident_claim = Some((port, role_id, display_name, thread_gone, guard));
+        }
+
         if let Some(snapshot) = assistant_snapshot.as_mut() {
             self.add_standing_role(snapshot, &extra).await;
         }
@@ -2136,10 +2214,15 @@ impl ConversationService {
             }
         }
 
+        let (initial_name, initial_name_source) = match resident_claim.as_ref() {
+            Some((_, _, display_name, _, _)) => (display_name.clone(), Some(ROLE_THREAD_NAME_SOURCE.to_owned())),
+            None => (req.name.unwrap_or_default(), None),
+        };
+
         let row = aionui_db::models::ConversationRow {
             id: id.clone(),
             user_id: user_id.to_owned(),
-            name: req.name.unwrap_or_default(),
+            name: initial_name,
             r#type: enum_to_db(&effective_type)?,
             extra: serde_json::to_string(&extra)
                 .map_err(|e| ConversationError::internal(format!("Failed to serialize extra: {e}")))?,
@@ -2158,10 +2241,10 @@ impl ConversationService {
             updated_at: now,
             project_id: None,
             folder_id: None,
-            // Create never claims name ownership: even a request-supplied name
-            // is the frontend's first-message placeholder, so agents may
-            // replace it later (spec 2026-08-04).
-            name_source: None,
+            // Ordinary creates never claim name ownership so agents may replace
+            // first-message placeholders later; resident role threads lock their
+            // display name immediately at creation.
+            name_source: initial_name_source,
         };
 
         self.conversation_repo.create(&row).await?;
@@ -2233,6 +2316,35 @@ impl ConversationService {
         if let Some(snapshot) = assistant_snapshot.as_ref() {
             self.persist_assistant_preferences_from_snapshot(user_id, snapshot)
                 .await?;
+        }
+
+        if let Some((port, role_id, display_name, thread_gone, _guard)) = resident_claim {
+            self.conversation_repo
+                .update(
+                    user_id,
+                    &row.id,
+                    &ConversationRowUpdate {
+                        name: Some(display_name),
+                        status: None,
+                        extra: None,
+                        model: None,
+                        pinned: None,
+                        pinned_at: None,
+                        updated_at: None,
+                        project_id: None,
+                        folder_id: None,
+                        name_source: Some(ROLE_THREAD_NAME_SOURCE.to_owned()),
+                    },
+                )
+                .await?;
+            port.claim_role_thread(&role_id, &row.id, thread_gone, now)
+                .await
+                .map_err(|reason| ConversationError::internal(format!("role thread claim failed: {reason}")))?;
+            info!(
+                role_id = %role_id,
+                conversation_id = %row.id,
+                "claimed direct conversation as resident role thread at creation"
+            );
         }
 
         let mut response = row_to_response(row, &self.workspace_root)?;
