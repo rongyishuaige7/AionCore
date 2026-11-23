@@ -1,4 +1,4 @@
-use sqlx::{Row, SqlitePool};
+use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 
 use aionui_common::{PaginatedResult, TimestampMs};
 
@@ -743,6 +743,52 @@ impl IConversationRepository for SqliteConversationRepository {
         .await?;
 
         Ok(row)
+    }
+
+    async fn list_assistant_snapshots_for_conversations(
+        &self,
+        user_id: &str,
+        conversation_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, ConversationAssistantSnapshotRow>, DbError> {
+        if conversation_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        // Deduplicate while staying well below SQLite's bind-parameter limit per chunk.
+        let mut unique_ids = Vec::with_capacity(conversation_ids.len());
+        let mut seen = std::collections::HashSet::with_capacity(conversation_ids.len());
+        for id in conversation_ids {
+            if seen.insert(id.as_str()) {
+                unique_ids.push(id.as_str());
+            }
+        }
+
+        const CHUNK_SIZE: usize = 400;
+        let mut out = std::collections::HashMap::with_capacity(unique_ids.len());
+        for chunk in unique_ids.chunks(CHUNK_SIZE) {
+            let mut qb: QueryBuilder<'_, Sqlite> = QueryBuilder::new(
+                "SELECT s.* FROM conversation_assistant_snapshots s \
+                 INNER JOIN conversations c ON c.id = s.conversation_id \
+                 WHERE c.user_id = ",
+            );
+            qb.push_bind(user_id);
+            qb.push(" AND s.conversation_id IN (");
+            let mut separated = qb.separated(", ");
+            for id in chunk {
+                separated.push_bind(*id);
+            }
+            separated.push_unseparated(")");
+
+            let rows = qb
+                .build_query_as::<ConversationAssistantSnapshotRow>()
+                .fetch_all(&self.pool)
+                .await?;
+            for row in rows {
+                out.insert(row.conversation_id.clone(), row);
+            }
+        }
+
+        Ok(out)
     }
 
     async fn upsert_assistant_snapshot(
@@ -2888,5 +2934,213 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(f.effective_limit(), 50);
+    }
+
+    // ── Batch assistant snapshot tests ──────────────────────────────
+
+    #[tokio::test]
+    async fn list_assistant_snapshots_for_conversations_batches_dedupes_and_isolates_users() {
+        use crate::models::UpsertAssistantDefinitionParams;
+        use crate::repository::assistant::IAssistantDefinitionRepository;
+        use crate::repository::sqlite_assistant::SqliteAssistantDefinitionRepository;
+
+        let (repo, db) = setup().await;
+        sqlx::query(
+            "INSERT INTO users (id, user_type, username, password_hash, status, session_generation, created_at, updated_at) \
+             VALUES ('user_other', 'local', 'user_other', 'hash', 'active', 0, 1, 1)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        SqliteAssistantDefinitionRepository::new(db.pool().clone())
+            .upsert_for_user(
+                SYSTEM_USER_ID,
+                &UpsertAssistantDefinitionParams {
+                    id: "def_snap_test",
+                    assistant_id: "role-alpha",
+                    source: "user",
+                    owner_type: "user",
+                    source_ref: Some("role-alpha"),
+                    name: "Alpha",
+                    name_i18n: "{}",
+                    description: None,
+                    description_i18n: "{}",
+                    avatar_type: "emoji",
+                    avatar_value: None,
+                    agent_id: "codex",
+                    rule_resource_type: "user_file",
+                    rule_resource_ref: None,
+                    recommended_prompts: "[]",
+                    recommended_prompts_i18n: "{}",
+                    default_model_mode: "auto",
+                    default_model_value: None,
+                    default_permission_mode: "auto",
+                    default_permission_value: None,
+                    default_thought_level_mode: "auto",
+                    default_thought_level_value: None,
+                    default_skills_mode: "auto",
+                    default_skill_ids: "[]",
+                    custom_skill_names: "[]",
+                    default_disabled_builtin_skill_ids: "[]",
+                    default_mcps_mode: "auto",
+                    default_mcp_ids: "[]",
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            repo.list_assistant_snapshots_for_conversations(SYSTEM_USER_ID, &[])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let mut c1 = sample_conversation(SYSTEM_USER_ID);
+        c1.id = "conv_snap_1".into();
+        let mut c2 = sample_conversation(SYSTEM_USER_ID);
+        c2.id = "conv_snap_2".into();
+        let mut c3_no_snap = sample_conversation(SYSTEM_USER_ID);
+        c3_no_snap.id = "conv_no_snap".into();
+        let mut c_other = sample_conversation("user_other");
+        c_other.id = "conv_other_user".into();
+
+        for conv in [&c1, &c2, &c3_no_snap, &c_other] {
+            repo.create(conv).await.unwrap();
+        }
+
+        let insert_snap = |conv_id: &str, assistant_id: &str| {
+            let pool = db.pool().clone();
+            let conv_id = conv_id.to_owned();
+            let assistant_id = assistant_id.to_owned();
+            async move {
+                sqlx::query(
+                    "INSERT INTO conversation_assistant_snapshots (
+                        conversation_id, assistant_definition_id, assistant_id, assistant_source,
+                        agent_id, rules_content, default_model_mode, default_permission_mode,
+                        default_thought_level_mode, default_skills_mode, resolved_skill_ids,
+                        resolved_disabled_builtin_skill_ids, default_mcps_mode, resolved_mcp_ids,
+                        created_at, updated_at
+                     ) VALUES (?, 'def_snap_test', ?, 'user', 'codex', '', 'auto', 'auto',
+                        'auto', 'auto', '[]', '[]', 'auto', '[]', 1, 1)",
+                )
+                .bind(conv_id)
+                .bind(assistant_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+        };
+
+        insert_snap(&c1.id, "role-alpha").await;
+        insert_snap(&c2.id, "role-beta").await;
+        insert_snap(&c_other.id, "role-secret").await;
+
+        let requested = vec![
+            c1.id.clone(),
+            c1.id.clone(),
+            c2.id.clone(),
+            c3_no_snap.id.clone(),
+            c_other.id.clone(),
+            "conv_missing".to_string(),
+        ];
+        let snapshots = repo
+            .list_assistant_snapshots_for_conversations(SYSTEM_USER_ID, &requested)
+            .await
+            .unwrap();
+
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[&c1.id].assistant_id, "role-alpha");
+        assert_eq!(snapshots[&c2.id].assistant_id, "role-beta");
+        assert!(!snapshots.contains_key(&c3_no_snap.id));
+        assert!(!snapshots.contains_key(&c_other.id));
+    }
+
+    #[tokio::test]
+    async fn list_assistant_snapshots_for_conversations_handles_multiple_chunks() {
+        use crate::models::UpsertAssistantDefinitionParams;
+        use crate::repository::assistant::IAssistantDefinitionRepository;
+        use crate::repository::sqlite_assistant::SqliteAssistantDefinitionRepository;
+
+        let (repo, db) = setup().await;
+        SqliteAssistantDefinitionRepository::new(db.pool().clone())
+            .upsert_for_user(
+                SYSTEM_USER_ID,
+                &UpsertAssistantDefinitionParams {
+                    id: "def_chunk_test",
+                    assistant_id: "role-first",
+                    source: "user",
+                    owner_type: "user",
+                    source_ref: Some("role-first"),
+                    name: "First",
+                    name_i18n: "{}",
+                    description: None,
+                    description_i18n: "{}",
+                    avatar_type: "emoji",
+                    avatar_value: None,
+                    agent_id: "codex",
+                    rule_resource_type: "user_file",
+                    rule_resource_ref: None,
+                    recommended_prompts: "[]",
+                    recommended_prompts_i18n: "{}",
+                    default_model_mode: "auto",
+                    default_model_value: None,
+                    default_permission_mode: "auto",
+                    default_permission_value: None,
+                    default_thought_level_mode: "auto",
+                    default_thought_level_value: None,
+                    default_skills_mode: "auto",
+                    default_skill_ids: "[]",
+                    custom_skill_names: "[]",
+                    default_disabled_builtin_skill_ids: "[]",
+                    default_mcps_mode: "auto",
+                    default_mcp_ids: "[]",
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut first = sample_conversation(SYSTEM_USER_ID);
+        first.id = "conv_chunk_first".into();
+        let mut last = sample_conversation(SYSTEM_USER_ID);
+        last.id = "conv_chunk_last".into();
+        repo.create(&first).await.unwrap();
+        repo.create(&last).await.unwrap();
+
+        for (conv_id, assistant_id) in [(&first.id, "role-first"), (&last.id, "role-last")] {
+            sqlx::query(
+                "INSERT INTO conversation_assistant_snapshots (
+                    conversation_id, assistant_definition_id, assistant_id, assistant_source,
+                    agent_id, rules_content, default_model_mode, default_permission_mode,
+                    default_thought_level_mode, default_skills_mode, resolved_skill_ids,
+                    resolved_disabled_builtin_skill_ids, default_mcps_mode, resolved_mcp_ids,
+                    created_at, updated_at
+                 ) VALUES (?, 'def_chunk_test', ?, 'user', 'codex', '', 'auto', 'auto',
+                    'auto', 'auto', '[]', '[]', 'auto', '[]', 1, 1)",
+            )
+            .bind(conv_id)
+            .bind(assistant_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+
+        // Exceed CHUNK_SIZE (400) so first and last sit in different SQL IN chunks.
+        let mut ids = Vec::with_capacity(405);
+        ids.push(first.id.clone());
+        for i in 0..403 {
+            ids.push(format!("conv_filler_{i}"));
+        }
+        ids.push(last.id.clone());
+
+        let snapshots = repo
+            .list_assistant_snapshots_for_conversations(SYSTEM_USER_ID, &ids)
+            .await
+            .unwrap();
+
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[&first.id].assistant_id, "role-first");
+        assert_eq!(snapshots[&last.id].assistant_id, "role-last");
     }
 }
