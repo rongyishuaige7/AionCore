@@ -16,7 +16,7 @@
 //! - `Cancel` kills the process; the turn's own `result` frame may never
 //!   arrive, so the reader synthesizes the terminal event on exit.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -27,13 +27,14 @@ use tokio::sync::{Mutex, broadcast, oneshot};
 
 use super::argv::{ArgvInput, build_argv};
 use super::models::probe_models;
+use super::permission_policy::{auto_approve_reason, input_touches_sensitive_path};
 use super::skills::skill_commands_from_dirs;
 use super::translate::Translator;
 use super::wire::parse_line;
 use crate::backend::cli_version::session_drift_notice;
 use crate::backend::types::{
-    Admission, BackendError, CancelTarget, Command, CommandReceipt, ContentBlock, PendingPermissionView,
-    PermissionDecision, SessionEnvelope, SessionSpec,
+    Admission, BackendError, CancelTarget, Command, CommandReceipt, ContentBlock, ExternalPermissionOutcome,
+    PendingPermissionView, PermissionDecision, SessionEnvelope, SessionSpec,
 };
 use crate::backend::{BackendConnection, SessionBackend, SessionConfig};
 use crate::capability::{
@@ -286,6 +287,7 @@ impl BackendConnection for AntigravityConnection {
             anchor: Arc::new(Mutex::new(anchor)),
             current: Arc::new(Mutex::new(None)),
             pending: Arc::new(Mutex::new(HashMap::new())),
+            always_allowed_tools: Arc::new(std::sync::RwLock::new(HashSet::new())),
             permission_seq: AtomicU64::new(0),
             weak_self: std::sync::OnceLock::new(),
             in_flight: Arc::new(AtomicBool::new(false)),
@@ -376,11 +378,15 @@ pub struct AntigravitySessionBackend {
     /// silently collapse two things the user said into one, and they would
     /// never see the second one echoed.
     queued: Arc<Mutex<VecDeque<Vec<ContentBlock>>>>,
+    /// Tools the user explicitly granted with `AllowAlways` during this session.
+    /// Cleared whenever the session mode changes so approvals made under a
+    /// looser mode never leak into a stricter one.
+    always_allowed_tools: Arc<std::sync::RwLock<HashSet<String>>>,
 }
 
 struct PendingPermission {
     tool_name: String,
-    answer: oneshot::Sender<PermissionDecision>,
+    answer: oneshot::Sender<ExternalPermissionOutcome>,
 }
 
 impl AntigravitySessionBackend {
@@ -516,7 +522,7 @@ impl AntigravitySessionBackend {
     async fn deny_all_pending(&self) {
         let drained: Vec<_> = self.pending.lock().await.drain().collect();
         for (request_id, entry) in drained {
-            let _ = entry.answer.send(PermissionDecision::Denied);
+            let _ = entry.answer.send(ExternalPermissionOutcome::SessionClosed);
             self.emit(
                 self.turn_gen.load(Ordering::SeqCst),
                 SessionEvent::PermissionResolved {
@@ -932,7 +938,17 @@ impl SessionBackend for AntigravitySessionBackend {
                 let entry = self.pending.lock().await.remove(&request_id);
                 match entry {
                     Some(p) => {
-                        let _ = p.answer.send(decision);
+                        let outcome = match decision {
+                            PermissionDecision::AllowAlways => {
+                                if let Ok(mut allowed) = self.always_allowed_tools.write() {
+                                    allowed.insert(p.tool_name.clone());
+                                }
+                                ExternalPermissionOutcome::Approved
+                            }
+                            PermissionDecision::Approved => ExternalPermissionOutcome::Approved,
+                            PermissionDecision::Denied => ExternalPermissionOutcome::Denied,
+                        };
+                        let _ = p.answer.send(outcome);
                         self.emit(
                             self.turn_gen.load(Ordering::SeqCst),
                             SessionEvent::PermissionResolved {
@@ -981,6 +997,12 @@ impl SessionBackend for AntigravitySessionBackend {
                 // success and changed nothing.
                 if let Ok(mut guard) = self.mode_override.write() {
                     *guard = Some(mode.clone());
+                }
+                // Clear session-scoped `AllowAlways` grants on any mode change so
+                // approvals made under a looser mode never carry over into a
+                // stricter one (e.g. `default` -> `plan`).
+                if let Ok(mut allowed) = self.always_allowed_tools.write() {
+                    allowed.clear();
                 }
                 // The hook FILE has to be there for the switch to mean anything.
                 // Turning full auto off is the dangerous direction: with no hook
@@ -1137,20 +1159,43 @@ impl SessionBackend for AntigravitySessionBackend {
         self.deny_all_pending().await;
     }
 
-    async fn request_external_permission(&self, tool_name: String, input: serde_json::Value) -> PermissionDecision {
-        // Full auto answers itself. The hook stays installed in every mode — it
-        // belongs to the workspace, which other conversations share — so a
-        // full-auto session's agy calls back like any other, and this is where
-        // it gets its yes. Without it the session would raise cards the user
-        // explicitly asked not to see.
-        if self.is_full_auto() {
+    async fn request_external_permission(
+        &self,
+        tool_name: String,
+        input: serde_json::Value,
+    ) -> ExternalPermissionOutcome {
+        // Apply the host-side permission policy first (full-auto, read-only tools,
+        // verified read-only shell commands, and `accept-edits` file edits).
+        // The hook stays installed in every mode — it belongs to the workspace,
+        // which other conversations share — so every session's agy calls back
+        // here, and safe/mode-permitted calls are approved on the spot without
+        // blocking behind agy's ~30s hook deadline.
+        let mode = self.effective_mode();
+        if let Some(reason) = auto_approve_reason(mode.as_deref(), &tool_name, &input) {
             tracing::debug!(
                 session_id = %self.session_id,
                 tool = %tool_name,
-                "antigravity: full-auto mode — approving without a prompt"
+                mode = ?mode,
+                reason,
+                "antigravity: auto-approving tool call by policy"
             );
-            return PermissionDecision::Approved;
+            return ExternalPermissionOutcome::Approved;
         }
+
+        if !input_touches_sensitive_path(&input)
+            && self
+                .always_allowed_tools
+                .read()
+                .is_ok_and(|allowed| allowed.contains(&tool_name))
+        {
+            tracing::debug!(
+                session_id = %self.session_id,
+                tool = %tool_name,
+                "antigravity: auto-approving tool call from session AllowAlways grant"
+            );
+            return ExternalPermissionOutcome::Approved;
+        }
+
         let request_id = format!("agy-perm-{}", self.permission_seq.fetch_add(1, Ordering::SeqCst) + 1);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(
@@ -1183,10 +1228,10 @@ impl SessionBackend for AntigravitySessionBackend {
         // fail-closed: a user who is too slow gets a refused tool they can
         // retry, never one that silently executed behind a pending prompt.
         match tokio::time::timeout(PERMISSION_ANSWER_DEADLINE, rx).await {
-            Ok(Ok(decision)) => decision,
-            // Sender dropped without answering — treat as denial, never as
-            // silent approval.
-            Ok(Err(_)) => PermissionDecision::Denied,
+            Ok(Ok(outcome)) => outcome,
+            // Sender dropped without answering — treat as session closed, never
+            // as silent approval.
+            Ok(Err(_)) => ExternalPermissionOutcome::SessionClosed,
             Err(_) => {
                 // Retract the card too. Leaving it up would invite an answer
                 // that no longer reaches agy, which reads as "my click did
@@ -1205,7 +1250,7 @@ impl SessionBackend for AntigravitySessionBackend {
                     tool = %tool_name,
                     "antigravity: denied a tool because agy was about to stop waiting for approval"
                 );
-                PermissionDecision::Denied
+                ExternalPermissionOutcome::TimedOut
             }
         }
     }
@@ -1346,6 +1391,7 @@ mod tests {
             anchor: Arc::new(Mutex::new(None)),
             current: Arc::new(Mutex::new(None)),
             pending: Arc::new(Mutex::new(HashMap::new())),
+            always_allowed_tools: Arc::new(std::sync::RwLock::new(HashSet::new())),
             permission_seq: AtomicU64::new(0),
             weak_self: std::sync::OnceLock::new(),
             in_flight: Arc::new(AtomicBool::new(false)),
@@ -1378,7 +1424,7 @@ mod tests {
         .await
         .expect("answer accepted");
 
-        assert_eq!(waiting.await.unwrap(), PermissionDecision::Approved);
+        assert_eq!(waiting.await.unwrap(), ExternalPermissionOutcome::Approved);
         assert!(
             b.pending_permission_requests().is_empty(),
             "answered request must clear"
@@ -1400,7 +1446,7 @@ mod tests {
         }
         b.terminate().await;
 
-        assert_eq!(waiting.await.unwrap(), PermissionDecision::Denied);
+        assert_eq!(waiting.await.unwrap(), ExternalPermissionOutcome::SessionClosed);
         assert!(b.pending_permission_requests().is_empty());
     }
 
@@ -1413,7 +1459,7 @@ mod tests {
         // `deny` first and the refusal stays ours.
         let b = backend_for_permissions().await;
         let decision = b.request_external_permission("run_command".into(), json!({})).await;
-        assert_eq!(decision, PermissionDecision::Denied);
+        assert_eq!(decision, ExternalPermissionOutcome::TimedOut);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1456,7 +1502,172 @@ mod tests {
         });
         let decision = b.request_external_permission("run_command".into(), json!({})).await;
         let _ = answer.await;
-        assert_eq!(decision, PermissionDecision::Approved);
+        assert_eq!(decision, ExternalPermissionOutcome::Approved);
+    }
+
+    #[tokio::test]
+    async fn user_rejection_reports_denied_not_timed_out() {
+        let b = backend_for_permissions().await;
+        let asker = Arc::clone(&b);
+        let waiting =
+            tokio::spawn(async move { asker.request_external_permission("run_command".into(), json!({})).await });
+
+        let request_id = loop {
+            if let Some(p) = b.pending_permission_requests().into_iter().next() {
+                break p.request_id;
+            }
+            tokio::task::yield_now().await;
+        };
+
+        b.dispatch(Command::AnswerPermission {
+            request_id,
+            decision: PermissionDecision::Denied,
+            selected: None,
+            answers: Vec::new(),
+        })
+        .await
+        .expect("rejection accepted");
+
+        assert_eq!(waiting.await.unwrap(), ExternalPermissionOutcome::Denied);
+    }
+
+    #[tokio::test]
+    async fn read_only_tools_and_safe_shell_auto_approve_without_cards() {
+        let b = backend_for_permissions().await;
+        assert_eq!(
+            b.request_external_permission("read_file".into(), json!({"Path": "/Users/x/Desktop/notes.md"}))
+                .await,
+            ExternalPermissionOutcome::Approved
+        );
+        assert_eq!(
+            b.request_external_permission("search_web".into(), json!({"query": "rust"}))
+                .await,
+            ExternalPermissionOutcome::Approved
+        );
+        assert_eq!(
+            b.request_external_permission("run_command".into(), json!({"CommandLine": "git status"}))
+                .await,
+            ExternalPermissionOutcome::Approved
+        );
+        assert!(b.pending_permission_requests().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sensitive_read_still_requires_interactive_approval() {
+        let b = backend_for_permissions().await;
+        let outcome = b
+            .request_external_permission("read_file".into(), json!({"Path": "/Users/x/.ssh/id_rsa"}))
+            .await;
+        assert_eq!(outcome, ExternalPermissionOutcome::TimedOut);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn accept_edits_mode_auto_approves_edits_but_still_asks_for_mutating_shell() {
+        let b = backend_for_permissions().await;
+        b.dispatch(Command::SetMode {
+            mode: "accept-edits".to_owned(),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            b.request_external_permission("edit_file".into(), json!({"Path": "/Users/x/project/src/lib.rs"}))
+                .await,
+            ExternalPermissionOutcome::Approved
+        );
+        assert_eq!(
+            b.request_external_permission("run_command".into(), json!({"CommandLine": "cargo build"}))
+                .await,
+            ExternalPermissionOutcome::TimedOut
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn allow_always_remembers_tool_until_mode_changes() {
+        let b = backend_for_permissions().await;
+        let asker = Arc::clone(&b);
+        let first = tokio::spawn(async move {
+            asker
+                .request_external_permission("write_file".into(), json!({"Path": "/Users/x/project/a.txt"}))
+                .await
+        });
+
+        let request_id = loop {
+            if let Some(p) = b.pending_permission_requests().into_iter().next() {
+                break p.request_id;
+            }
+            tokio::task::yield_now().await;
+        };
+
+        b.dispatch(Command::AnswerPermission {
+            request_id,
+            decision: PermissionDecision::AllowAlways,
+            selected: None,
+            answers: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(first.await.unwrap(), ExternalPermissionOutcome::Approved);
+
+        // Subsequent calls to the same tool auto-approve without raising a card.
+        assert_eq!(
+            b.request_external_permission("write_file".into(), json!({"Path": "/Users/x/project/b.txt"}))
+                .await,
+            ExternalPermissionOutcome::Approved
+        );
+        assert!(b.pending_permission_requests().is_empty());
+
+        // Switching mode clears session-level AllowAlways grants so they never
+        // leak into a stricter mode like `plan`.
+        b.dispatch(Command::SetMode {
+            mode: "plan".to_owned(),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            b.request_external_permission("write_file".into(), json!({"Path": "/Users/x/project/c.txt"}))
+                .await,
+            ExternalPermissionOutcome::TimedOut
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn allow_always_does_not_bypass_sensitive_path_guard() {
+        let b = backend_for_permissions().await;
+        let asker = Arc::clone(&b);
+        let first = tokio::spawn(async move {
+            asker
+                .request_external_permission("write_file".into(), json!({"Path": "/Users/x/project/a.txt"}))
+                .await
+        });
+
+        let request_id = loop {
+            if let Some(p) = b.pending_permission_requests().into_iter().next() {
+                break p.request_id;
+            }
+            tokio::task::yield_now().await;
+        };
+
+        b.dispatch(Command::AnswerPermission {
+            request_id,
+            decision: PermissionDecision::AllowAlways,
+            selected: None,
+            answers: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(first.await.unwrap(), ExternalPermissionOutcome::Approved);
+
+        // Even with AllowAlways granted on write_file, writing to a sensitive
+        // credential path must still ask the user.
+        assert_eq!(
+            b.request_external_permission("write_file".into(), json!({"Path": "/Users/x/.ssh/authorized_keys"}))
+                .await,
+            ExternalPermissionOutcome::TimedOut
+        );
     }
 
     /// A backend rooted at `cwd`, in `mode`, carrying a prepared hook body.
@@ -1482,6 +1693,7 @@ mod tests {
             anchor: Arc::new(Mutex::new(None)),
             current: Arc::new(Mutex::new(None)),
             pending: Arc::new(Mutex::new(HashMap::new())),
+            always_allowed_tools: Arc::new(std::sync::RwLock::new(HashSet::new())),
             permission_seq: AtomicU64::new(0),
             weak_self: std::sync::OnceLock::new(),
             in_flight: Arc::new(AtomicBool::new(false)),
@@ -1503,7 +1715,7 @@ mod tests {
         .expect("mode switch accepted");
 
         let decision = b.request_external_permission("run_command".into(), json!({})).await;
-        assert_eq!(decision, PermissionDecision::Approved);
+        assert_eq!(decision, ExternalPermissionOutcome::Approved);
         assert!(
             b.pending_permission_requests().is_empty(),
             "full auto must not raise a card at all"
@@ -1552,7 +1764,7 @@ mod tests {
         let decision = b.request_external_permission("run_command".into(), json!({})).await;
         assert_eq!(
             decision,
-            PermissionDecision::Approved,
+            ExternalPermissionOutcome::Approved,
             "full auto is answered by the host"
         );
     }
@@ -1812,6 +2024,7 @@ mod tests {
             anchor: Arc::new(Mutex::new(None)),
             current: Arc::new(Mutex::new(None)),
             pending: Arc::new(Mutex::new(HashMap::new())),
+            always_allowed_tools: Arc::new(std::sync::RwLock::new(HashSet::new())),
             permission_seq: AtomicU64::new(0),
             weak_self: std::sync::OnceLock::new(),
             in_flight: Arc::new(AtomicBool::new(false)),
@@ -1856,7 +2069,7 @@ mod tests {
             }
         }
         let decision = Bare.request_external_permission("x".into(), json!({})).await;
-        assert_eq!(decision, PermissionDecision::Denied);
+        assert_eq!(decision, ExternalPermissionOutcome::Denied);
     }
 
     #[tokio::test]
@@ -1888,6 +2101,7 @@ mod tests {
             anchor: Arc::new(Mutex::new(None)),
             current: Arc::new(Mutex::new(None)),
             pending: Arc::new(Mutex::new(HashMap::new())),
+            always_allowed_tools: Arc::new(std::sync::RwLock::new(HashSet::new())),
             permission_seq: AtomicU64::new(0),
             weak_self: std::sync::OnceLock::new(),
             in_flight: Arc::new(AtomicBool::new(false)),
@@ -1929,6 +2143,7 @@ mod tests {
             anchor: Arc::new(Mutex::new(None)),
             current: Arc::new(Mutex::new(None)),
             pending: Arc::new(Mutex::new(HashMap::new())),
+            always_allowed_tools: Arc::new(std::sync::RwLock::new(HashSet::new())),
             permission_seq: AtomicU64::new(0),
             weak_self: std::sync::OnceLock::new(),
             in_flight: Arc::new(AtomicBool::new(false)),
@@ -2078,6 +2293,7 @@ mod tests {
             anchor: Arc::new(Mutex::new(None)),
             current: Arc::new(Mutex::new(None)),
             pending: Arc::new(Mutex::new(HashMap::new())),
+            always_allowed_tools: Arc::new(std::sync::RwLock::new(HashSet::new())),
             permission_seq: AtomicU64::new(0),
             weak_self: std::sync::OnceLock::new(),
             in_flight: Arc::new(AtomicBool::new(false)),

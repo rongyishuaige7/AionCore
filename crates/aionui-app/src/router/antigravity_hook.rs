@@ -74,26 +74,32 @@ async fn handle_hook(
     // Blocks until the user answers, the turn ends, or the session is torn
     // down; every one of those paths resolves the request rather than leaving
     // the hook (and agy's tool call) hanging.
-    let decision = task
+    let outcome = task
         .request_external_permission(tool_name.clone(), input.tool_call.args.clone())
         .await;
 
     tracing::info!(
         conversation_id = %conversation_id,
         tool = %tool_name,
-        approved = matches!(
-            decision,
-            aionui_session::PermissionDecision::Approved | aionui_session::PermissionDecision::AllowAlways
-        ),
+        approved = outcome.is_approved(),
+        outcome = outcome.as_str(),
         "antigravity hook: permission answered"
     );
 
-    Json(match decision {
-        aionui_session::PermissionDecision::Approved | aionui_session::PermissionDecision::AllowAlways => {
-            AntigravityHookOutput::allow("approved in AionUi")
+    Json(hook_output_for_outcome(outcome))
+}
+
+fn hook_output_for_outcome(outcome: aionui_session::ExternalPermissionOutcome) -> AntigravityHookOutput {
+    match outcome {
+        aionui_session::ExternalPermissionOutcome::Approved => AntigravityHookOutput::allow("approved in AionUi"),
+        aionui_session::ExternalPermissionOutcome::Denied => AntigravityHookOutput::deny("rejected by user in AionUi"),
+        aionui_session::ExternalPermissionOutcome::TimedOut => {
+            AntigravityHookOutput::deny("approval timed out after 20s in AionUi (no user response)")
         }
-        aionui_session::PermissionDecision::Denied => AntigravityHookOutput::deny("rejected in AionUi"),
-    })
+        aionui_session::ExternalPermissionOutcome::SessionClosed => {
+            AntigravityHookOutput::deny("approval cancelled in AionUi (turn ended or session closed)")
+        }
+    }
 }
 
 #[cfg(test)]
@@ -194,5 +200,32 @@ mod tests {
         )
         .await;
         assert_eq!(out.decision, AntigravityHookDecision::Deny);
+    }
+
+    #[test]
+    fn hook_output_distinguishes_rejection_timeout_and_session_close() {
+        use aionui_session::ExternalPermissionOutcome;
+
+        let approved = hook_output_for_outcome(ExternalPermissionOutcome::Approved);
+        assert_eq!(approved.decision, AntigravityHookDecision::Allow);
+        assert_eq!(approved.reason.as_deref(), Some("approved in AionUi"));
+
+        let denied = hook_output_for_outcome(ExternalPermissionOutcome::Denied);
+        assert_eq!(denied.decision, AntigravityHookDecision::Deny);
+        assert!(
+            denied
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("rejected by user")
+        );
+
+        let timed_out = hook_output_for_outcome(ExternalPermissionOutcome::TimedOut);
+        assert_eq!(timed_out.decision, AntigravityHookDecision::Deny);
+        assert!(timed_out.reason.as_deref().unwrap_or_default().contains("timed out"));
+
+        let closed = hook_output_for_outcome(ExternalPermissionOutcome::SessionClosed);
+        assert_eq!(closed.decision, AntigravityHookDecision::Deny);
+        assert!(closed.reason.as_deref().unwrap_or_default().contains("cancelled"));
     }
 }

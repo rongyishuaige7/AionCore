@@ -46,9 +46,9 @@ pub use rehydrate::rehydrate;
 // core; it is consumed intra-crate by the claude/codex/acp backend impls (each
 // embeds a `SuspendController`), so it is not re-exported from the crate root.
 pub use types::{
-    Admission, BackendError, CancelTarget, Command, CommandMeta, CommandReceipt, ContentBlock, PendingPermissionView,
-    PermissionDecision, QuestionAnswer, SessionEnvelope, SessionInfoKind, SessionSpec, StateSnapshot, Tier2Checkpoint,
-    TransitionReason, command_name,
+    Admission, BackendError, CancelTarget, Command, CommandMeta, CommandReceipt, ContentBlock,
+    ExternalPermissionOutcome, PendingPermissionView, PermissionDecision, QuestionAnswer, SessionEnvelope,
+    SessionInfoKind, SessionSpec, StateSnapshot, Tier2Checkpoint, TransitionReason, command_name,
 };
 
 use crate::capability::Capabilities;
@@ -141,8 +141,12 @@ pub trait SessionBackend: Send + Sync {
     ///
     /// Default is `Denied`, deliberately: a backend that does not implement
     /// externally-raised permissions must not silently let the tool run.
-    async fn request_external_permission(&self, _tool_name: String, _input: serde_json::Value) -> PermissionDecision {
-        PermissionDecision::Denied
+    async fn request_external_permission(
+        &self,
+        _tool_name: String,
+        _input: serde_json::Value,
+    ) -> ExternalPermissionOutcome {
+        ExternalPermissionOutcome::Denied
     }
 }
 

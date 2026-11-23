@@ -732,7 +732,7 @@ impl SessionAgentTask {
         &self,
         tool_name: String,
         input: serde_json::Value,
-    ) -> aionui_session::PermissionDecision {
+    ) -> aionui_session::ExternalPermissionOutcome {
         self.backend.request_external_permission(tool_name, input).await
     }
 

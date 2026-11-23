@@ -20,6 +20,7 @@ pub(crate) const CODE_DISCONNECTED_AFTER_REPLY: &str = "ANTIGRAVITY_DISCONNECTED
 
 mod conn;
 mod models;
+mod permission_policy;
 mod skills;
 mod title;
 mod translate;

@@ -155,6 +155,37 @@ pub enum PermissionDecision {
     AllowAlways,
 }
 
+/// Outcome of an externally-raised permission check (e.g. Antigravity's
+/// `PreToolUse` hook). Distinguishes user refusal from deadline expiry and
+/// session teardown so callers report an accurate reason instead of mislabeling
+/// timeouts as user rejections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalPermissionOutcome {
+    /// Approved by the user, session policy, mode, or a session-level `AllowAlways`.
+    Approved,
+    /// Explicitly rejected by the user on the permission card.
+    Denied,
+    /// No answer arrived before the hook answer deadline elapsed.
+    TimedOut,
+    /// The turn ended, was cancelled, or the session was closed while waiting.
+    SessionClosed,
+}
+
+impl ExternalPermissionOutcome {
+    pub fn is_approved(self) -> bool {
+        matches!(self, Self::Approved)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Approved => "approved",
+            Self::Denied => "denied",
+            Self::TimedOut => "timed_out",
+            Self::SessionClosed => "session_closed",
+        }
+    }
+}
+
 /// One answered claude `AskUserQuestion` question (§C1 / task #83). `question` is
 /// the exact question TEXT (claude's `answers` map is keyed by it — the input
 /// schema guarantees question texts are unique). `labels` are the chosen option
