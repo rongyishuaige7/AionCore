@@ -302,6 +302,10 @@ const THREAD_ASIDE_KEYS: [&str; 2] = ["companion_of", "jot_trial"];
 
 /// `extra` keys of a conversation a schedule or a team creates. Those put the
 /// role to work with their own wording of its section, so such a conversation
+/// `conversations.name_source` value marking a resident role's unique thread,
+/// whose title is derived solely from the role's display name.
+pub(crate) const ROLE_THREAD_NAME_SOURCE: &str = "role";
+
 /// is not given the direct one as well.
 const PUT_TO_WORK_EXTRA_KEYS: [&str; 4] = ["cron_job_id", "cronJobId", "teamId", "team_id"];
 
@@ -864,6 +868,9 @@ impl ConversationService {
                 } else {
                     existing.name.clone()
                 };
+                let _ = self
+                    .sync_role_thread_name_only(user_id, &mut existing, &resolved_name)
+                    .await?;
                 return Ok((resolved_name, existing));
             }
             thread_gone = true;
@@ -927,10 +934,13 @@ impl ConversationService {
             "auto-provisioned resident role thread"
         );
 
-        let row =
+        let mut row =
             self.conversation_repo.get(user_id, &created.id).await?.ok_or_else(|| {
                 ConversationError::internal("created role thread row missing immediately after insert")
             })?;
+        let _ = self
+            .sync_role_thread_name_only(user_id, &mut row, &display_name)
+            .await?;
         Ok((display_name, row))
     }
 
@@ -1319,6 +1329,23 @@ impl ConversationService {
         };
         if news.is_some() {
             info!(conversation_id = %row.id, assistant_id = %assistant_id, "turn brings the role's news to its thread");
+        }
+        if row.name_source.as_deref() != Some(ROLE_THREAD_NAME_SOURCE)
+            && port.role_thread(&assistant_id).await.ok().flatten().as_deref() == Some(row.id.as_str())
+            && let Ok(Some(snapshot)) = self
+                .resolve_assistant_snapshot(
+                    user_id,
+                    &assistant_id,
+                    None,
+                    &AssistantConversationOverrides::default(),
+                    &extra,
+                )
+                .await
+            && !snapshot.name.trim().is_empty()
+        {
+            let _ = self
+                .sync_role_thread_name_only(user_id, row, snapshot.name.trim())
+                .await;
         }
         let handoff = self
             .rotate_thread_if_due(&port, user_id, row, &assistant_id, user_msg_id)
@@ -3008,7 +3035,7 @@ impl ConversationService {
         &self,
         user_id: &str,
         id: &str,
-        req: UpdateConversationRequest,
+        mut req: UpdateConversationRequest,
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<ConversationResponse, ConversationError> {
         if self.runtime_state.is_restarting(id) {
@@ -3023,6 +3050,20 @@ impl ConversationService {
             .ok_or_else(|| ConversationError::NotFound { id: id.to_owned() })?;
 
         let existing_type: AgentType = string_to_enum(&existing.r#type)?;
+
+        if req.name.is_some() && self.is_active_role_thread_row(user_id, &existing).await {
+            if req.name_source.as_deref() == Some("auto") {
+                req.name = None;
+                req.name_source = None;
+                if req.pinned.is_none() && req.model.is_none() && req.extra.is_none() {
+                    return row_to_response(existing, &self.workspace_root);
+                }
+            } else {
+                return Err(ConversationError::BadRequest {
+                    reason: "resident role conversation name cannot be modified".into(),
+                });
+            }
+        }
 
         // Snapshot invariant: once written at create time, `extra.skills`
         // must not be re-shaped by PATCH. The frontend must clone the
@@ -3594,6 +3635,8 @@ impl ConversationService {
         // an inherited parent name keeps the parent's provenance marker.
         let name_source = if explicit_name.is_some() {
             Some("user".to_owned())
+        } else if parent.name_source.as_deref() == Some(ROLE_THREAD_NAME_SOURCE) {
+            None
         } else {
             parent.name_source.clone()
         };
@@ -6835,8 +6878,11 @@ pub(crate) async fn persist_agent_title(
     consumer: &str,
 ) -> Result<bool, ConversationError> {
     let conversation_id = existing.id.as_str();
-    if existing.name_source.as_deref() == Some("user") {
-        debug!(conversation_id, consumer, "agent title dropped: name is user-owned");
+    if matches!(existing.name_source.as_deref(), Some("user" | ROLE_THREAD_NAME_SOURCE)) {
+        debug!(
+            conversation_id,
+            consumer, "agent title dropped: name is user- or role-owned"
+        );
         return Ok(false);
     }
     if existing.name == title {

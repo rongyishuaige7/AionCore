@@ -1544,6 +1544,107 @@ async fn role_runtime_switch_syncs_existing_thread_session_and_cron_jobs_and_hea
         .unwrap()
         .unwrap();
     assert_eq!(restored_acp.current_mode_id.as_deref(), Some("agent-full-access"));
+    assert_eq!(restored_row.name_source.as_deref(), Some("role"));
+
+    // 6. Resident role conversation name lock & single-source-of-truth sync:
+    //    - Manual rename on `thread_id` via PATCH /api/conversations/{thread_id} is rejected (400),
+    //      whereas renaming `ordinary_conv` succeeds (200).
+    let reject_rename = fixture
+        .app
+        .clone()
+        .oneshot(common::json_with_token(
+            "PATCH",
+            &format!("/api/conversations/{thread_id}"),
+            json!({ "name": "随便改的名字" }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(reject_rename.status(), StatusCode::BAD_REQUEST);
+
+    let ok_ord_rename = fixture
+        .app
+        .clone()
+        .oneshot(common::json_with_token(
+            "PATCH",
+            &format!("/api/conversations/{}", ordinary_conv.id),
+            json!({ "name": "可自由改名的普通对话" }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(ok_ord_rename.status(), StatusCode::OK);
+
+    //    - Legacy frontend `name_source: "auto"` on `thread_id` is silently ignored without mutating `name`.
+    let ignore_auto_rename = fixture
+        .app
+        .clone()
+        .oneshot(common::json_with_token(
+            "PATCH",
+            &format!("/api/conversations/{thread_id}"),
+            json!({ "name": "Derived auto title", "name_source": "auto" }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(ignore_auto_rename.status(), StatusCode::OK);
+    let after_auto = fixture
+        .services
+        .conversation_repo
+        .get(USER, &thread_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(after_auto.name, "Derived auto title");
+
+    //    - Renaming the role via PUT /api/assistants/{id} immediately updates `thread_id`'s name.
+    let role_rename_resp = fixture
+        .app
+        .clone()
+        .oneshot(common::json_with_token(
+            "PUT",
+            "/api/assistants/custom-growth-lead",
+            json!({ "name": "出海情报总负责人" }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(role_rename_resp.status(), StatusCode::OK);
+    let after_role_rename = fixture
+        .services
+        .conversation_repo
+        .get(USER, &thread_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after_role_rename.name, "出海情报总负责人");
+    assert_eq!(after_role_rename.name_source.as_deref(), Some("role"));
+
+    //    - Polluted legacy DB title (`name_source = 'agent'`) is healed back to the role name on startup
+    //      without bumping `updated_at`!
+    let prev_updated_at = after_role_rename.updated_at;
+    sqlx::query(
+        "UPDATE conversations SET name = 'yipan.store SEO数据巡检：曝光升至50次', name_source = 'agent' WHERE id = ?",
+    )
+    .bind(&thread_id)
+    .execute(fixture.services.database.pool())
+    .await
+    .unwrap();
+    let _restarted_name_heal = create_router(&fixture.services).await.expect("rebuild router 3");
+    let healed_name_row = fixture
+        .services
+        .conversation_repo
+        .get(USER, &thread_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(healed_name_row.name, "出海情报总负责人");
+    assert_eq!(healed_name_row.name_source.as_deref(), Some("role"));
+    assert_eq!(healed_name_row.updated_at, prev_updated_at);
 
     fixture.services.database.close().await;
 }
