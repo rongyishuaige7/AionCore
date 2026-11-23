@@ -1544,6 +1544,198 @@ async fn role_runtime_switch_syncs_existing_thread_session_and_cron_jobs_and_hea
         .unwrap()
         .unwrap();
     assert_eq!(restored_acp.current_mode_id.as_deref(), Some("agent-full-access"));
+    assert_eq!(restored_row.name_source.as_deref(), Some("role"));
+
+    // 6. Resident role conversation name lock & single-source-of-truth sync:
+    //    - Manual rename on `thread_id` via PATCH /api/conversations/{thread_id} is rejected (400),
+    //      whereas renaming `ordinary_conv` succeeds (200).
+    let reject_rename = fixture
+        .app
+        .clone()
+        .oneshot(common::json_with_token(
+            "PATCH",
+            &format!("/api/conversations/{thread_id}"),
+            json!({ "name": "随便改的名字" }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(reject_rename.status(), StatusCode::BAD_REQUEST);
+
+    let ok_ord_rename = fixture
+        .app
+        .clone()
+        .oneshot(common::json_with_token(
+            "PATCH",
+            &format!("/api/conversations/{}", ordinary_conv.id),
+            json!({ "name": "可自由改名的普通对话" }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(ok_ord_rename.status(), StatusCode::OK);
+
+    //    - Legacy frontend `name_source: "auto"` on `thread_id` is silently ignored without mutating `name`.
+    let ignore_auto_rename = fixture
+        .app
+        .clone()
+        .oneshot(common::json_with_token(
+            "PATCH",
+            &format!("/api/conversations/{thread_id}"),
+            json!({ "name": "Derived auto title", "name_source": "auto" }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(ignore_auto_rename.status(), StatusCode::OK);
+    let after_auto = fixture
+        .services
+        .conversation_repo
+        .get(USER, &thread_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(after_auto.name, "Derived auto title");
+
+    //    - Renaming the role via PUT /api/assistants/{id} immediately updates `thread_id`'s name.
+    let role_rename_resp = fixture
+        .app
+        .clone()
+        .oneshot(common::json_with_token(
+            "PUT",
+            "/api/assistants/custom-growth-lead",
+            json!({ "name": "出海情报总负责人" }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(role_rename_resp.status(), StatusCode::OK);
+    let after_role_rename = fixture
+        .services
+        .conversation_repo
+        .get(USER, &thread_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after_role_rename.name, "出海情报总负责人");
+    assert_eq!(after_role_rename.name_source.as_deref(), Some("role"));
+
+    //    - Polluted legacy DB title (`name_source = 'agent'`) is healed back to the role name on startup
+    //      without bumping `updated_at`!
+    let prev_updated_at = after_role_rename.updated_at;
+    sqlx::query(
+        "UPDATE conversations SET name = 'yipan.store SEO数据巡检：曝光升至50次', name_source = 'agent' WHERE id = ?",
+    )
+    .bind(&thread_id)
+    .execute(fixture.services.database.pool())
+    .await
+    .unwrap();
+    let _restarted_name_heal = create_router(&fixture.services).await.expect("rebuild router 3");
+    let healed_name_row = fixture
+        .services
+        .conversation_repo
+        .get(USER, &thread_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(healed_name_row.name, "出海情报总负责人");
+    assert_eq!(healed_name_row.name_source.as_deref(), Some("role"));
+    assert_eq!(healed_name_row.updated_at, prev_updated_at);
+
+    // 7. Direct `POST /api/conversations` for a resident role converges onto its unique thread:
+    //    - Repeating `POST /api/conversations` for `custom-growth-lead` (which already owns `thread_id`)
+    //      idempotently returns `thread_id` instead of spawning an Aside chat in Scratchpad!
+    let repeat_create_resp = fixture
+        .app
+        .clone()
+        .oneshot(common::json_with_token(
+            "POST",
+            "/api/conversations",
+            json!({
+                "name": "https://github.com/Panniantong/Agent-Reach 这个 skill 你安装了么",
+                "assistant": { "id": "custom-growth-lead" },
+                "extra": {}
+            }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(repeat_create_resp.status(), StatusCode::CREATED);
+    let repeat_created = body_json(repeat_create_resp).await;
+    assert_eq!(repeat_created["data"]["id"], json!(thread_id));
+    assert_eq!(repeat_created["data"]["name"], json!("出海情报总负责人"));
+
+    //    - Creating the very first direct conversation of a brand-new resident role via `/guid` (`POST /api/conversations`)
+    //      claims it immediately as `thread_conversation_id` and locks `name = role_name`, `name_source = "role"`.
+    let create_fresh_asst = fixture
+        .app
+        .clone()
+        .oneshot(common::json_with_token(
+            "POST",
+            "/api/assistants",
+            json!({
+                "id": "custom-ecom-director",
+                "name": "跨境电商总负责人",
+                "agent_id": "a9f3c21e",
+                "rules": { "content": "统筹跨境电商业务。" }
+            }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(create_fresh_asst.status(), StatusCode::CREATED);
+    define_role_as(&fixture, "custom-ecom-director", &[]).await;
+
+    let first_guid_resp = fixture
+        .app
+        .clone()
+        .oneshot(common::json_with_token(
+            "POST",
+            "/api/conversations",
+            json!({
+                "name": "Agent-Reach 这个 skill 你安装了么",
+                "assistant": { "id": "custom-ecom-director" },
+                "extra": {}
+            }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first_guid_resp.status(), StatusCode::CREATED);
+    let first_guid_json = body_json(first_guid_resp).await;
+    let ecom_thread_id = first_guid_json["data"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(first_guid_json["data"]["name"], json!("跨境电商总负责人"));
+    let ecom_row = fixture
+        .services
+        .conversation_repo
+        .get(USER, &ecom_thread_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ecom_row.name, "跨境电商总负责人");
+    assert_eq!(ecom_row.name_source.as_deref(), Some("role"));
+    let roles_resp = fixture
+        .app
+        .clone()
+        .oneshot(common::get_with_token("/api/roles", &token))
+        .await
+        .unwrap();
+    assert_eq!(roles_resp.status(), StatusCode::OK);
+    let roles_json = body_json(roles_resp).await;
+    let ecom_role = roles_json["data"]["roles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == json!("custom-ecom-director"))
+        .expect("custom-ecom-director in /api/roles");
+    assert_eq!(ecom_role["thread_conversation_id"], json!(ecom_thread_id));
 
     fixture.services.database.close().await;
 }

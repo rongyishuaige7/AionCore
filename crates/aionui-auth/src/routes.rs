@@ -833,10 +833,16 @@ async fn refresh_handler(
     // legacy clients that posted the token explicitly.
     let (raw_token, from_cookie) = match extract_cookie_value(&headers, REFRESH_COOKIE_NAME) {
         Some(cookie_token) => (cookie_token, true),
-        None => {
-            let Json(req) = body.map_err(ApiError::from)?;
-            (req.token, false)
-        }
+        None => match body {
+            Ok(Json(req)) => (req.token, false),
+            Err(JsonRejection::MissingJsonContentType(_)) => {
+                // Cookie-borne browser callers POST without a JSON body; when no
+                // refresh cookie is present that is an unauthenticated request,
+                // not an unsupported media type.
+                return Err(ApiError::Unauthorized("No refresh token provided".into()));
+            }
+            Err(err) => return Err(ApiError::from(err)),
+        },
     };
 
     // Coalesce concurrent refreshes carrying the same token: one expired access

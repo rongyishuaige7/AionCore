@@ -1434,6 +1434,14 @@ impl aionui_assistant::AssistantRuntimeSyncPort for RoleGovernanceAdapter {
             Err(errors.join("; "))
         }
     }
+
+    async fn on_assistant_identity_updated(&self, user_id: &str, assistant_id: &str) -> Result<(), String> {
+        self.conversation
+            .sync_role_thread_identity(user_id, assistant_id)
+            .await
+            .map(|_| ())
+            .map_err(|error| format!("role thread identity sync failed: {error}"))
+    }
 }
 
 async fn reconcile_drifted_role_threads(adapter: &RoleGovernanceAdapter) {

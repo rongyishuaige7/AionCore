@@ -112,6 +112,10 @@ where
 #[async_trait::async_trait]
 pub trait AssistantRuntimeSyncPort: Send + Sync {
     async fn on_assistant_runtime_updated(&self, user_id: &str, assistant_id: &str) -> Result<(), String>;
+
+    async fn on_assistant_identity_updated(&self, _user_id: &str, _assistant_id: &str) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// Aggregated business logic for `/api/assistants/*` and rule/skill dispatch.
@@ -1461,8 +1465,28 @@ impl AssistantService {
             )
             .await?;
         }
-        self.finish_assistant_mutation(user_id, id, mcp_binding_changed, runtime_binding_changed)
-            .await
+        let identity_changed = req.name.is_some() || req.name_i18n.is_some();
+        let response = self
+            .finish_assistant_mutation(user_id, id, mcp_binding_changed, runtime_binding_changed)
+            .await?;
+        if identity_changed && !runtime_binding_changed {
+            let sync_port = self
+                .runtime_sync_port
+                .read()
+                .ok()
+                .and_then(|guard| guard.as_ref().cloned());
+            if let Some(port) = sync_port
+                && let Err(error) = port.on_assistant_identity_updated(user_id, id).await
+            {
+                warn!(
+                    user_id,
+                    assistant_id = id,
+                    error = %error,
+                    "failed to synchronize assistant identity update to downstream consumers"
+                );
+            }
+        }
+        Ok(response)
     }
 
     async fn sync_preferences_from_defaults_request_for_user(

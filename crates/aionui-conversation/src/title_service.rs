@@ -142,7 +142,10 @@ impl ConversationTitles {
         let Some(existing) = self.repo.get(user_id, conversation_id).await? else {
             return Ok(None);
         };
-        if existing.name_source.as_deref() == Some("user") {
+        if matches!(
+            existing.name_source.as_deref(),
+            Some("user" | crate::service::ROLE_THREAD_NAME_SOURCE)
+        ) {
             return Ok(None);
         }
         let page = self
@@ -507,5 +510,32 @@ mod tests {
         ] {
             assert!(!context.contains(excluded));
         }
+    }
+
+    #[tokio::test]
+    async fn role_locked_conversation_name_is_never_overwritten_by_title_summary() {
+        let rig = rig().await;
+        rig.repo
+            .update(
+                USER,
+                "conv",
+                &ConversationRowUpdate {
+                    name: Some("出海情报与增长巡检员".into()),
+                    name_source: Some(crate::service::ROLE_THREAD_NAME_SOURCE.into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let generator = Generator::new(Some("yipan.store SEO数据巡检：曝光升至50次"), false);
+        assert!(
+            rig.titles
+                .schedule(USER, "conv", "turn1", generator.clone())
+                .await
+                .is_none(),
+            "role-locked conversation must skip scheduling title summary"
+        );
+        assert!(generator.prompts.lock().unwrap().is_empty());
+        assert_eq!(rig.name().await, "出海情报与增长巡检员");
     }
 }

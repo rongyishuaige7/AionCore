@@ -15,16 +15,17 @@ use std::path::Path;
 use std::sync::Arc;
 
 use aionui_ai_agent::IWorkerTaskManager;
+use aionui_api_types::{ConversationNameUpdatedPayload, WebSocketMessage};
 use aionui_common::{AgentKillReason, AgentType, ConversationSource, ErrorChain, TurnCancelCause, now_ms};
-use aionui_db::SaveRuntimeStateParams;
 use aionui_db::models::{ConversationRow, UpsertConversationAssistantSnapshotParams};
+use aionui_db::{ConversationRowUpdate, SaveRuntimeStateParams};
 use tracing::{info, warn};
 
 use crate::convert::string_to_enum;
 use crate::error::ConversationError;
 use crate::service::{
-    AssistantConversationOverrides, AssistantSnapshot, ConversationService, is_temp_session_workspace,
-    team_id_from_extra,
+    AssistantConversationOverrides, AssistantSnapshot, ConversationService, ROLE_THREAD_NAME_SOURCE,
+    is_temp_session_workspace, team_id_from_extra,
 };
 
 impl ConversationService {
@@ -397,7 +398,15 @@ impl ConversationService {
             None => false,
         };
 
+        let expected_name = snapshot.name.trim();
+        let name_drifted = !expected_name.is_empty()
+            && (existing.name != expected_name || existing.name_source.as_deref() != Some(ROLE_THREAD_NAME_SOURCE));
+
         if only_when_agent_changed && !agent_changed && !permission_drifted {
+            if name_drifted {
+                let mut row = existing.clone();
+                return self.sync_role_thread_name_only(user_id, &mut row, expected_name).await;
+            }
             return Ok(false);
         }
 
@@ -701,11 +710,18 @@ impl ConversationService {
             | AgentType::Nanobot => {}
         }
 
-        let source = existing
-            .source
-            .as_deref()
-            .and_then(|raw| string_to_enum::<ConversationSource>(raw).ok());
-        self.broadcast_list_changed(user_id, &existing.id, "updated", source.as_ref());
+        if name_drifted {
+            let mut row = existing.clone();
+            let _ = self
+                .sync_role_thread_name_only(user_id, &mut row, expected_name)
+                .await?;
+        } else {
+            let source = existing
+                .source
+                .as_deref()
+                .and_then(|raw| string_to_enum::<ConversationSource>(raw).ok());
+            self.broadcast_list_changed(user_id, &existing.id, "updated", source.as_ref());
+        }
 
         info!(
             conversation_id = %existing.id,
@@ -751,6 +767,138 @@ impl ConversationService {
             | AgentType::Remote
             | AgentType::Nanobot => None,
         }
+    }
+
+    /// Synchronize only the display name (`conversations.name` + `name_source = "role"`)
+    /// of a resident role's thread when the role's assistant name is updated, without
+    /// cancelling or restarting any in-flight turn.
+    pub async fn sync_role_thread_identity(&self, user_id: &str, role_id: &str) -> Result<bool, ConversationError> {
+        let role_id = role_id.trim();
+        if role_id.is_empty() {
+            return Ok(false);
+        }
+        let Some(port) = self.role_port() else {
+            return Ok(false);
+        };
+        let lock = self.role_threads.ensure_lock(role_id);
+        let _guard = lock.lock().await;
+
+        if !port.is_resident_role(role_id).await {
+            return Ok(false);
+        }
+        let Some(thread_id) = port
+            .role_thread(role_id)
+            .await
+            .map_err(|reason| ConversationError::internal(format!("role thread lookup failed: {reason}")))?
+        else {
+            return Ok(false);
+        };
+        let Some(mut existing) = self.conversation_repo().get(user_id, &thread_id).await? else {
+            return Ok(false);
+        };
+        if team_id_from_extra(&existing.extra).is_some() {
+            return Ok(false);
+        }
+        let existing_extra: serde_json::Value =
+            serde_json::from_str(&existing.extra).unwrap_or_else(|_| serde_json::json!({}));
+        let Some(snapshot) = self
+            .resolve_assistant_snapshot(
+                user_id,
+                role_id,
+                None,
+                &AssistantConversationOverrides::default(),
+                &existing_extra,
+            )
+            .await?
+        else {
+            return Ok(false);
+        };
+        let expected_name = snapshot.name.trim();
+        if expected_name.is_empty() {
+            return Ok(false);
+        }
+        self.sync_role_thread_name_only(user_id, &mut existing, expected_name)
+            .await
+    }
+
+    pub(crate) async fn sync_role_thread_name_only(
+        &self,
+        user_id: &str,
+        row: &mut ConversationRow,
+        expected_name: &str,
+    ) -> Result<bool, ConversationError> {
+        let expected_name = expected_name.trim();
+        if expected_name.is_empty() {
+            return Ok(false);
+        }
+        if row.name == expected_name && row.name_source.as_deref() == Some(ROLE_THREAD_NAME_SOURCE) {
+            return Ok(false);
+        }
+
+        let updates = ConversationRowUpdate {
+            name: Some(expected_name.to_owned()),
+            pinned: None,
+            pinned_at: None,
+            model: None,
+            extra: None,
+            status: None,
+            updated_at: None,
+            project_id: None,
+            folder_id: None,
+            name_source: Some(ROLE_THREAD_NAME_SOURCE.to_owned()),
+        };
+        self.conversation_repo().update(user_id, &row.id, &updates).await?;
+
+        row.name = expected_name.to_owned();
+        row.name_source = Some(ROLE_THREAD_NAME_SOURCE.to_owned());
+
+        let payload = ConversationNameUpdatedPayload {
+            conversation_id: row.id.clone(),
+            name: expected_name.to_owned(),
+        };
+        let mut value = serde_json::to_value(&payload)
+            .map_err(|e| ConversationError::internal(format!("Failed to serialize nameUpdated event: {e}")))?;
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert("user_id".to_owned(), serde_json::Value::String(user_id.to_owned()));
+        }
+        self.broadcaster()
+            .broadcast(WebSocketMessage::new("conversation.nameUpdated", value));
+
+        let source = row
+            .source
+            .as_deref()
+            .and_then(|raw| string_to_enum::<ConversationSource>(raw).ok());
+        self.broadcast_list_changed(user_id, &row.id, "updated", source.as_ref());
+
+        info!(
+            conversation_id = %row.id,
+            name = expected_name,
+            "synchronized resident role thread conversation name"
+        );
+        Ok(true)
+    }
+
+    pub(crate) async fn is_active_role_thread_row(&self, user_id: &str, row: &ConversationRow) -> bool {
+        let Some(port) = self.role_port() else {
+            return row.name_source.as_deref() == Some(ROLE_THREAD_NAME_SOURCE);
+        };
+        let assistant_id = match self.conversation_repo().get_assistant_snapshot(user_id, &row.id).await {
+            Ok(Some(snapshot)) if !snapshot.assistant_id.trim().is_empty() => Some(snapshot.assistant_id),
+            _ => serde_json::from_str::<serde_json::Value>(&row.extra)
+                .ok()
+                .and_then(|extra| {
+                    extra
+                        .get("assistant_id")
+                        .or_else(|| extra.get("presetAssistantId"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(|raw| raw.trim_start_matches("builtin-").trim_start_matches("ext-").to_owned())
+                        .filter(|value| !value.is_empty())
+                }),
+        };
+        let Some(role_id) = assistant_id else {
+            return false;
+        };
+        port.role_thread(&role_id).await.ok().flatten().as_deref() == Some(row.id.as_str())
     }
 }
 

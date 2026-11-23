@@ -348,6 +348,10 @@ pub(crate) const THREAD_ASIDE_KEYS: [&str; 2] = ["companion_of", "jot_trial"];
 
 /// `extra` keys of a conversation a schedule or a team creates. Those put the
 /// role to work with their own wording of its section, so such a conversation
+/// `conversations.name_source` value marking a resident role's unique thread,
+/// whose title is derived solely from the role's display name.
+pub(crate) const ROLE_THREAD_NAME_SOURCE: &str = "role";
+
 /// is not given the direct one as well.
 const PUT_TO_WORK_EXTRA_KEYS: [&str; 4] = ["cron_job_id", "cronJobId", "teamId", "team_id"];
 
@@ -914,6 +918,9 @@ impl ConversationService {
                 } else {
                     existing.name.clone()
                 };
+                let _ = self
+                    .sync_role_thread_name_only(user_id, &mut existing, &resolved_name)
+                    .await?;
                 return Ok((resolved_name, existing));
             }
             thread_gone = true;
@@ -944,7 +951,7 @@ impl ConversationService {
         };
 
         let created = self
-            .create(
+            .create_inner(
                 user_id,
                 CreateConversationRequest {
                     name: Some(display_name.clone()),
@@ -964,6 +971,7 @@ impl ConversationService {
                     channel_chat_id: None,
                     extra: serde_json::Value::Object(serde_json::Map::new()),
                 },
+                false,
             )
             .await?;
 
@@ -977,10 +985,13 @@ impl ConversationService {
             "auto-provisioned resident role thread"
         );
 
-        let row =
+        let mut row =
             self.conversation_repo.get(user_id, &created.id).await?.ok_or_else(|| {
                 ConversationError::internal("created role thread row missing immediately after insert")
             })?;
+        let _ = self
+            .sync_role_thread_name_only(user_id, &mut row, &display_name)
+            .await?;
         Ok((display_name, row))
     }
 
@@ -1454,6 +1465,23 @@ impl ConversationService {
         if news.is_some() {
             info!(conversation_id = %row.id, assistant_id = %assistant_id, "turn brings the role's news to its thread");
         }
+        if row.name_source.as_deref() != Some(ROLE_THREAD_NAME_SOURCE)
+            && port.role_thread(&assistant_id).await.ok().flatten().as_deref() == Some(row.id.as_str())
+            && let Ok(Some(snapshot)) = self
+                .resolve_assistant_snapshot(
+                    user_id,
+                    &assistant_id,
+                    None,
+                    &AssistantConversationOverrides::default(),
+                    &extra,
+                )
+                .await
+            && !snapshot.name.trim().is_empty()
+        {
+            let _ = self
+                .sync_role_thread_name_only(user_id, row, snapshot.name.trim())
+                .await;
+        }
         let handoff = self
             .rotate_thread_if_due(&port, user_id, row, &assistant_id, user_msg_id)
             .await;
@@ -1859,6 +1887,15 @@ impl ConversationService {
         user_id: &str,
         req: CreateConversationRequest,
     ) -> Result<ConversationResponse, ConversationError> {
+        self.create_inner(user_id, req, true).await
+    }
+
+    async fn create_inner(
+        &self,
+        user_id: &str,
+        req: CreateConversationRequest,
+        converge_resident_thread: bool,
+    ) -> Result<ConversationResponse, ConversationError> {
         let id = generate_short_id();
         let now = now_ms();
         let source = req.source.unwrap_or(ConversationSource::Aionui);
@@ -1894,6 +1931,74 @@ impl ConversationService {
             }
             None => None,
         };
+
+        let is_direct_human_chat = converge_resident_thread
+            && source == ConversationSource::Aionui
+            && req.channel_chat_id.is_none()
+            && !put_to_work(&extra)
+            && !THREAD_ASIDE_KEYS
+                .iter()
+                .any(|key| extra.get(*key).is_some_and(|v| !v.is_null()))
+            && extra.get("jot_explore").is_none_or(serde_json::Value::is_null)
+            && extra.get("is_health_check").and_then(serde_json::Value::as_bool) != Some(true);
+
+        let mut resident_claim: Option<(
+            Arc<dyn ConversationRolePort>,
+            String,
+            String,
+            bool,
+            tokio::sync::OwnedMutexGuard<()>,
+        )> = None;
+        if is_direct_human_chat
+            && let Some(port) = self.role_port()
+            && let Some(snapshot) = assistant_snapshot.as_mut()
+            && port.is_resident_role(&snapshot.assistant_id).await
+        {
+            let role_id = snapshot.assistant_id.clone();
+            let display_name = {
+                let trimmed = snapshot.name.trim();
+                if trimmed.is_empty() {
+                    role_id.clone()
+                } else {
+                    trimmed.to_owned()
+                }
+            };
+            let lock = self.role_threads.ensure_lock(&role_id);
+            let guard = lock.lock_owned().await;
+            let recorded = port
+                .role_thread(&role_id)
+                .await
+                .map_err(|reason| ConversationError::internal(format!("role thread lookup failed: {reason}")))?;
+            let mut thread_gone = false;
+            if let Some(thread_id) = recorded.as_deref() {
+                if let Some(mut existing) = self.conversation_repo.get(user_id, thread_id).await?
+                    && session_mentions::team_id_from_extra_str(&existing.extra).is_none()
+                {
+                    let _ = self
+                        .sync_role_thread_name_only(user_id, &mut existing, &display_name)
+                        .await?;
+                    drop(guard);
+                    return self.get(user_id, thread_id).await;
+                }
+                thread_gone = true;
+            }
+            if assistant_overrides.permission.is_none()
+                && snapshot
+                    .resolved_defaults
+                    .permission
+                    .as_deref()
+                    .map(str::trim)
+                    .is_none_or(str::is_empty)
+                && !port.asks_when_scheduled(&role_id).await
+                && let Some(full_auto) = self
+                    .resolve_role_target_full_auto_mode(user_id, &snapshot.agent_type, &snapshot.agent_id)
+                    .await
+            {
+                snapshot.resolved_defaults.permission = Some(full_auto);
+            }
+            resident_claim = Some((port, role_id, display_name, thread_gone, guard));
+        }
+
         if let Some(snapshot) = assistant_snapshot.as_mut() {
             self.add_standing_role(snapshot, &extra).await;
         }
@@ -2243,10 +2348,15 @@ impl ConversationService {
             }
         }
 
+        let (initial_name, initial_name_source) = match resident_claim.as_ref() {
+            Some((_, _, display_name, _, _)) => (display_name.clone(), Some(ROLE_THREAD_NAME_SOURCE.to_owned())),
+            None => (req.name.unwrap_or_default(), None),
+        };
+
         let row = aionui_db::models::ConversationRow {
             id: id.clone(),
             user_id: user_id.to_owned(),
-            name: req.name.unwrap_or_default(),
+            name: initial_name,
             r#type: enum_to_db(&effective_type)?,
             extra: serde_json::to_string(&extra)
                 .map_err(|e| ConversationError::internal(format!("Failed to serialize extra: {e}")))?,
@@ -2265,10 +2375,10 @@ impl ConversationService {
             updated_at: now,
             project_id: None,
             folder_id: None,
-            // Create never claims name ownership: even a request-supplied name
-            // is the frontend's first-message placeholder, so agents may
-            // replace it later (spec 2026-08-04).
-            name_source: None,
+            // Ordinary creates never claim name ownership so agents may replace
+            // first-message placeholders later; resident role threads lock their
+            // display name immediately at creation.
+            name_source: initial_name_source,
         };
 
         self.conversation_repo.create(&row).await?;
@@ -2340,6 +2450,35 @@ impl ConversationService {
         if let Some(snapshot) = assistant_snapshot.as_ref() {
             self.persist_assistant_preferences_from_snapshot(user_id, snapshot)
                 .await?;
+        }
+
+        if let Some((port, role_id, display_name, thread_gone, _guard)) = resident_claim {
+            self.conversation_repo
+                .update(
+                    user_id,
+                    &row.id,
+                    &ConversationRowUpdate {
+                        name: Some(display_name),
+                        status: None,
+                        extra: None,
+                        model: None,
+                        pinned: None,
+                        pinned_at: None,
+                        updated_at: None,
+                        project_id: None,
+                        folder_id: None,
+                        name_source: Some(ROLE_THREAD_NAME_SOURCE.to_owned()),
+                    },
+                )
+                .await?;
+            port.claim_role_thread(&role_id, &row.id, thread_gone, now)
+                .await
+                .map_err(|reason| ConversationError::internal(format!("role thread claim failed: {reason}")))?;
+            info!(
+                role_id = %role_id,
+                conversation_id = %row.id,
+                "claimed direct conversation as resident role thread at creation"
+            );
         }
 
         let mut response = row_to_response(row, &self.workspace_root)?;
@@ -3142,7 +3281,7 @@ impl ConversationService {
         &self,
         user_id: &str,
         id: &str,
-        req: UpdateConversationRequest,
+        mut req: UpdateConversationRequest,
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<ConversationResponse, ConversationError> {
         if self.runtime_state.is_restarting(id) {
@@ -3157,6 +3296,20 @@ impl ConversationService {
             .ok_or_else(|| ConversationError::NotFound { id: id.to_owned() })?;
 
         let existing_type: AgentType = string_to_enum(&existing.r#type)?;
+
+        if req.name.is_some() && self.is_active_role_thread_row(user_id, &existing).await {
+            if req.name_source.as_deref() == Some("auto") {
+                req.name = None;
+                req.name_source = None;
+                if req.pinned.is_none() && req.model.is_none() && req.extra.is_none() {
+                    return row_to_response(existing, &self.workspace_root);
+                }
+            } else {
+                return Err(ConversationError::BadRequest {
+                    reason: "resident role conversation name cannot be modified".into(),
+                });
+            }
+        }
 
         // Snapshot invariant: once written at create time, `extra.skills`
         // must not be re-shaped by PATCH. The frontend must clone the
@@ -3728,6 +3881,8 @@ impl ConversationService {
         // an inherited parent name keeps the parent's provenance marker.
         let name_source = if explicit_name.is_some() {
             Some("user".to_owned())
+        } else if parent.name_source.as_deref() == Some(ROLE_THREAD_NAME_SOURCE) {
+            None
         } else {
             parent.name_source.clone()
         };
@@ -6969,8 +7124,11 @@ pub(crate) async fn persist_agent_title(
     consumer: &str,
 ) -> Result<bool, ConversationError> {
     let conversation_id = existing.id.as_str();
-    if existing.name_source.as_deref() == Some("user") {
-        debug!(conversation_id, consumer, "agent title dropped: name is user-owned");
+    if matches!(existing.name_source.as_deref(), Some("user" | ROLE_THREAD_NAME_SOURCE)) {
+        debug!(
+            conversation_id,
+            consumer, "agent title dropped: name is user- or role-owned"
+        );
         return Ok(false);
     }
     if existing.name == title {
