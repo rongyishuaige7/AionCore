@@ -418,6 +418,7 @@ fn wp1_wake_payload_includes_unread_messages() {
     let agent = make_agent("lead-1", "Lead", TeammateRole::Lead);
     let messages = vec![
         MailboxMessage {
+            seq: 0,
             id: "msg-1".into(),
             team_id: "t1".into(),
             to_agent_id: "lead-1".into(),
@@ -430,6 +431,7 @@ fn wp1_wake_payload_includes_unread_messages() {
             created_at: 0,
         },
         MailboxMessage {
+            seq: 0,
             id: "msg-2".into(),
             team_id: "t1".into(),
             to_agent_id: "lead-1".into(),

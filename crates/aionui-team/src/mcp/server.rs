@@ -23,9 +23,9 @@ use super::protocol::{
     read_request, write_response,
 };
 use super::tools::{
-    ClearAgentContextInput, InterruptAgentInput, MAX_REMEMBER_NOTE_CHARS, ProgressInput, ReadMessagesInput,
-    RememberInput, RenameAgentInput, SendMessageInput, ShutdownAgentInput, SpawnAgentInput, TaskCreateInput,
-    TaskListInput, TaskListStatusInput, TaskUpdateInput,
+    ClearAgentContextInput, InterruptAgentInput, MAX_REMEMBER_NOTE_CHARS, ProgressInput, ReadBoardInput,
+    ReadMessagesInput, RememberInput, RenameAgentInput, SendMessageInput, ShutdownAgentInput, SpawnAgentInput,
+    TaskCreateInput, TaskListInput, TaskListStatusInput, TaskUpdateInput,
 };
 
 // ---------------------------------------------------------------------------
@@ -527,6 +527,7 @@ pub(crate) async fn dispatch_tool(
 
     match tool_name {
         "team_read_messages" => exec_read_messages(arguments, service, team_id, caller_slot_id).await,
+        "team_read_board" => exec_read_board(arguments, scheduler, service, team_id, caller_slot_id).await,
         "team_send_message" => exec_send_message(arguments, scheduler, service, team_id, caller_slot_id).await,
         "team_interrupt_agent" => {
             exec_interrupt_agent(arguments, scheduler, service, team_id, caller_slot_id, caller_role).await
@@ -732,6 +733,109 @@ async fn exec_describe_assistant(
 // Individual tool handlers
 // ---------------------------------------------------------------------------
 
+const MAX_BOARD_PAGE_BYTES: usize = 32 * 1024;
+
+async fn exec_read_board(
+    args: &Value,
+    scheduler: &TeammateManager,
+    service: &Weak<TeamSessionService>,
+    team_id: &str,
+    caller_slot_id: &str,
+) -> Result<String, ToolCallError> {
+    scheduler
+        .get_agent(caller_slot_id)
+        .await
+        .map_err(|_| ToolCallError::from_message("Invalid agent target: caller is not on this team"))?;
+    let input: ReadBoardInput = serde_json::from_value(args.clone())
+        .map_err(|e| ToolCallError::from_message(format!("Invalid params: {e}")))?;
+    let since_seq = input.since_seq.unwrap_or_default().max(0);
+    let limit = input.limit.unwrap_or(30).clamp(1, 100);
+    let service = service
+        .upgrade()
+        .ok_or_else(|| ToolCallError::from_message("Team service not available"))?;
+    let (rows, latest_seq) = service
+        .read_shared_board(
+            team_id,
+            since_seq,
+            input.from_slot_id.as_deref(),
+            input.include_system.unwrap_or(false),
+            limit + 1,
+        )
+        .await
+        .map_err(|error| ToolCallError::from_message(error.to_string()))?;
+    let names = scheduler
+        .list_agents()
+        .await
+        .into_iter()
+        .map(|agent| (agent.slot_id, bounded_text(&agent.name, 120).0.to_owned()))
+        .collect();
+    render_board_page(rows, &names, since_seq, latest_seq, limit as usize)
+}
+
+fn bounded_text(text: &str, max_chars: usize) -> (&str, bool) {
+    match text.char_indices().nth(max_chars) {
+        Some((end, _)) => (&text[..end], true),
+        None => (text, false),
+    }
+}
+
+fn render_board_page(
+    rows: Vec<aionui_api_types::TeamMailboxMessageResponse>,
+    names: &std::collections::HashMap<String, String>,
+    since_seq: i64,
+    latest_seq: i64,
+    limit: usize,
+) -> Result<String, ToolCallError> {
+    let total = rows.len();
+    let mut messages = Vec::new();
+    let mut next_since_seq = since_seq;
+    // Reserve space for the envelope, including three signed 64-bit fields.
+    let mut bytes = 256;
+    for row in rows.into_iter().take(limit) {
+        let Some(seq) = row.seq else { continue };
+        let (content, content_truncated) = bounded_text(&row.content, 2400);
+        let mut item = json!({
+            "seq": seq,
+            "message_id": row.id,
+            "from_slot_id": row.from_agent_id,
+            "from_name": names.get(&row.from_agent_id).map(String::as_str).unwrap_or(&row.from_agent_id),
+            "to_slot_id": row.to_agent_id,
+            "to_name": names.get(&row.to_agent_id).map(String::as_str).unwrap_or(&row.to_agent_id),
+            "msg_type": row.msg_type,
+            "content": content,
+            "summary": row.summary,
+            "files": row.files,
+            "created_at": row.created_at,
+            "content_truncated": content_truncated,
+        });
+        let mut encoded = item.to_string();
+        if bytes + encoded.len() + 1 > MAX_BOARD_PAGE_BYTES {
+            if !messages.is_empty() {
+                break;
+            }
+            // Even a row with a very large attachment list must advance the cursor.
+            item["summary"] = Value::Null;
+            item["files"] = json!([]);
+            item["metadata_truncated"] = json!(true);
+            encoded = item.to_string();
+            if bytes + encoded.len() + 1 > MAX_BOARD_PAGE_BYTES {
+                return Err(ToolCallError::from_message(
+                    "Shared board row exceeds the response budget",
+                ));
+            }
+        }
+        bytes += encoded.len() + 1;
+        messages.push(item);
+        next_since_seq = seq;
+    }
+    json_text(&json!({
+        "has_more": messages.len() < total,
+        "messages": messages,
+        "next_since_seq": next_since_seq,
+        "latest_seq": if messages.is_empty() { latest_seq } else { latest_seq.max(next_since_seq) },
+    }))
+}
+
 const MAX_INBOX_MESSAGES: usize = 50;
 const MAX_INBOX_CONTENT_CHARS: usize = 4_000;
 const INBOX_TRUNCATION_MARKER: &str = "\n[truncated]";
@@ -843,6 +947,7 @@ fn render_inbox_page(page: InboxPage) -> RenderedInbox {
             last_message_id = Some(message.id.clone());
             let mut item = json!({
                 "message_id": message.id,
+                "seq": message.seq,
                 "from_slot": message.from_agent_id,
                 "type": message.msg_type,
                 "content": content,
@@ -1054,6 +1159,12 @@ fn build_send_message_queued_response(
         .first()
         .ok_or_else(|| "No message targets resolved".to_string())?;
     Ok(TeamSendMessageQueuedResponse {
+        seq: Some(first.seq),
+        seqs: if target_results.len() > 1 {
+            target_results.iter().map(|result| result.seq).collect()
+        } else {
+            Vec::new()
+        },
         team_run_id: first.team_run_id.clone(),
         target: first.target.clone(),
     })
@@ -1873,6 +1984,7 @@ mod tests {
 
     fn inbox_message(index: usize, content: impl Into<String>) -> MailboxMessage {
         MailboxMessage {
+            seq: index as i64,
             id: format!("message-{index:02}"),
             team_id: "team-1".into(),
             to_agent_id: "lead-1".into(),
@@ -1902,6 +2014,59 @@ mod tests {
         }
     }
 
+    fn board_message(seq: i64, content: String) -> aionui_api_types::TeamMailboxMessageResponse {
+        aionui_api_types::TeamMailboxMessageResponse {
+            seq: Some(seq),
+            id: format!("m{seq}"),
+            team_id: "t1".into(),
+            from_agent_id: "author".into(),
+            to_agent_id: "reviewer".into(),
+            msg_type: "message".into(),
+            content,
+            summary: None,
+            files: vec![],
+            read: false,
+            created_at: seq,
+        }
+    }
+
+    #[test]
+    fn shared_board_reports_page_cursor_and_latest_sequence() {
+        let rows = (11..=13).map(|seq| board_message(seq, "report".into())).collect();
+        let names = [("author".into(), "Writer".into())].into();
+        let page = render_board_page(rows, &names, 10, 20, 2).unwrap();
+        let value: Value = serde_json::from_str(&page).unwrap();
+        assert_eq!(value["messages"][0]["from_name"], "Writer");
+        assert_eq!(value["messages"][1]["seq"], 12);
+        assert_eq!(value["next_since_seq"], 12);
+        assert_eq!(value["latest_seq"], 20);
+        assert_eq!(value["has_more"], true);
+    }
+
+    #[test]
+    fn shared_board_budget_keeps_unicode_intact_and_resumes_after_last_returned_message() {
+        let rows = (1..=8).map(|seq| board_message(seq, "界".repeat(3000))).collect();
+        let page = render_board_page(rows, &Default::default(), 0, 8, 8).unwrap();
+        assert!(page.len() <= MAX_BOARD_PAGE_BYTES);
+        let value: Value = serde_json::from_str(&page).unwrap();
+        let messages = value["messages"].as_array().unwrap();
+        assert_eq!(messages[0]["content"].as_str().unwrap().chars().count(), 2400);
+        assert_eq!(messages[0]["content_truncated"], true);
+        assert_eq!(value["next_since_seq"], messages.last().unwrap()["seq"]);
+        assert_eq!(value["has_more"], true);
+    }
+
+    #[test]
+    fn shared_board_rejects_unknown_options_and_can_be_denied_by_role_policy() {
+        let error = serde_json::from_value::<ReadBoardInput>(json!({"team_id": "another-team"})).unwrap_err();
+        assert!(error.to_string().contains("unknown field"));
+        let denied = vec!["team_read_board".into()];
+        assert_eq!(
+            super::super::tools::authorize_role_tool(&denied, "team_read_board"),
+            Err("Role policy denies team_read_board".into())
+        );
+    }
+
     fn render(messages: Vec<MailboxMessage>, since_message_id: Option<&str>) -> RenderedInbox {
         render_inbox_page(inbox_page(messages, since_message_id).expect("page builds"))
     }
@@ -1915,6 +2080,7 @@ mod tests {
         assert_eq!(value["has_more"], false);
         assert_eq!(value["next_since_message_id"], Value::Null);
         assert_eq!(value["messages"][0]["message_id"], "message-01");
+        assert_eq!(value["messages"][0]["seq"], 1);
         assert_eq!(value["messages"][0]["from_slot"], "worker-01");
         assert_eq!(value["messages"][0]["type"], "message");
         assert_eq!(value["messages"][0]["content"], "first");
@@ -2118,6 +2284,7 @@ mod tests {
     #[test]
     fn build_send_message_queued_response_serializes_json_contract() {
         let response = build_send_message_queued_response(vec![AgentMessageQueueResult {
+            seq: 12,
             team_run_id: Some("run-1".into()),
             target: TeamSlotWorkPayload {
                 slot_id: "worker-1".into(),
@@ -2139,6 +2306,7 @@ mod tests {
         let text = serde_json::to_string(&response).unwrap();
         let payload: serde_json::Value = serde_json::from_str(&text).expect("team_send_message result must be JSON");
         assert_eq!(payload["team_run_id"], "run-1");
+        assert_eq!(payload["seq"], 12);
         assert_eq!(payload["target"]["slot_id"], "worker-1");
         assert_eq!(payload["target"]["state"], "queued");
         assert_eq!(payload["target"]["queued_background_count"], 1);

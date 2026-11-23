@@ -504,6 +504,10 @@ pub struct TeamInterruptAgentResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TeamSendMessageQueuedResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<i64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub seqs: Vec<i64>,
     pub team_run_id: Option<String>,
     pub target: TeamSlotWorkPayload,
 }
@@ -763,6 +767,8 @@ pub struct TeammateMessagePayload {
 /// (empty when the row had none or the stored JSON was malformed).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TeamMailboxMessageResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<i64>,
     pub id: String,
     pub team_id: String,
     pub from_agent_id: String,
@@ -895,6 +901,7 @@ mod tests {
             created_at: 1000,
             id: "m1".into(),
             message: Some(TeamMailboxMessageResponse {
+                seq: None,
                 id: "m1".into(),
                 team_id: "t1".into(),
                 from_agent_id: "a".into(),
@@ -1872,6 +1879,8 @@ mod tests {
     #[test]
     fn team_send_message_queued_response_serializes_authoritative_target() {
         let response = TeamSendMessageQueuedResponse {
+            seq: Some(12),
+            seqs: vec![],
             team_run_id: Some("run-1".into()),
             target: active_slot_work(),
         };
@@ -1962,6 +1971,7 @@ mod tests {
     #[test]
     fn team_mailbox_message_response_field_names_and_roundtrip() {
         let resp = TeamMailboxMessageResponse {
+            seq: None,
             id: "m1".into(),
             team_id: "t1".into(),
             from_agent_id: "a2".into(),
@@ -2066,6 +2076,7 @@ mod tests {
         let payload = TeamMailboxChangedPayload {
             team_id: "t1".into(),
             message: TeamMailboxMessageResponse {
+                seq: None,
                 id: "m1".into(),
                 team_id: "t1".into(),
                 from_agent_id: "a2".into(),

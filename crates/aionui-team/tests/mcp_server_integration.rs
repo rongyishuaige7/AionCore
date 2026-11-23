@@ -248,10 +248,20 @@ async fn mc1_correct_token_connects() {
     send_request(&mut stream, &req).await;
     let resp = read_response(&mut stream).await;
     let tools = resp["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 15);
+    assert_eq!(tools.len(), 16);
     let names: Vec<&str> = tools.iter().filter_map(|tool| tool["name"].as_str()).collect();
     assert!(!names.contains(&"team_list_models"));
 
+    env.server.stop();
+}
+
+#[tokio::test]
+async fn board_read_refuses_an_unknown_slot() {
+    let env = setup().await;
+    let mut stream = connect_and_init(env.server.port(), "test-token-123", "unknown-slot").await;
+    let resp = call_tool(&mut stream, 19, "team_read_board", json!({})).await;
+    assert!(is_error_response(&resp));
+    assert!(extract_text(&resp).contains("caller is not on this team"));
     env.server.stop();
 }
 
@@ -310,16 +320,17 @@ async fn mc3_no_token_rejected() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn tools_list_returns_all_15_tools() {
+async fn tools_list_returns_all_16_tools() {
     let env = setup().await;
     let mut stream = connect_and_init(env.server.port(), "test-token-123", "lead-1").await;
 
     let names = list_tools(&mut stream, 10).await;
-    assert_eq!(names.len(), 15);
+    assert_eq!(names.len(), 16);
 
     assert!(names.contains(&"team_remember".to_owned()));
     assert!(names.contains(&"team_progress".to_owned()));
     assert!(names.contains(&"team_read_messages".to_owned()));
+    assert!(names.contains(&"team_read_board".to_owned()));
     assert!(names.contains(&"team_send_message".to_owned()));
     assert!(names.contains(&"team_spawn_agent".to_owned()));
     assert!(names.contains(&"team_task_create".to_owned()));

@@ -36,6 +36,12 @@ If the result has `has_more: true`, call it again with `since_message_id` set to
 the returned `next_since_message_id` until it is false. Do not act on a message
 with `content_truncated: true` yet; it will be redelivered in full.
 
+## Shared Board & Concise Handoffs
+- Messages have stable team-local `#seq` references in wake payloads, inbox results and send receipts. Use the shared board (`team_read_board` / `team read-board`) to read the original.
+- Hand off with the task ID, what the next person should do, and the `#seq` of the report (e.g. "Verify #12 for task tk_xxx"). Read #12 with `since_seq: 11`. Keep reports on the board and avoid forwarding their full text.
+- Send a message only to a slot that needs to act now. An @mention in text does not wake anyone.
+- Let authors and reviewers handle changes and rechecks directly using the task ID and report sequence. Keep the required task review gate. Intervene for final acceptance, blockers, or scope decisions.
+
 ## Workflow
 1. Receive user request
    - Exception: if the user explicitly asked YOU to implement, fix, or edit something
@@ -263,7 +269,12 @@ replying to teammates, so you do not act on stale information. If the result has
 3. Use team_task_update to mark your task as "in_progress" when you start
 4. Do the actual work (read files, write code, search, etc.)
 5. When done, use team_task_update to mark the task "completed"
-6. Use team_send_message to report results to the leader slot_id
+6. Use team_send_message to report to the next person responsible for the task
+
+## Shared Board & Concise Handoffs
+- If a handoff cites #N, use `team_read_board` / `team read-board` with `since_seq: N-1` and confirm the returned sequence. Reading the shared board does not acknowledge your inbox.
+- Begin a completion report with `[done]`, a one-line result, and the relevant task ID, paths, or verification commands. Begin a blocked report with `[blocked]` and state who needs to decide what.
+- When a reviewer asks for changes, report the fix directly to that reviewer and use the task workflow for re-review. Keep the required review gate and involve the lead for final acceptance, blockers, or scope decisions.
 
 ## Standing By (CRITICAL — read carefully)
 "Standing by" or "waiting" means **end your current turn**, not generate idle text in a live LLM stream. The system holds you in an idle state and re-wakes you the instant new mailbox messages arrive — there is nothing you need to do meanwhile.
@@ -290,7 +301,7 @@ If you receive a message with type `shutdown_request`, the leader is asking you 
 
 ## Important Rules
 - Focus on your assigned tasks — don't go beyond what was asked
-- Report back to the leader when you finish, including a summary of what you did
+- Report the result to the reviewer when one is assigned, or to the leader otherwise
 - If you get stuck, send a message to the leader asking for guidance
 - You can communicate with other teammates directly if needed
 - Use your native tools (Read, Write, Bash, etc.) for implementation work"#;
@@ -360,6 +371,8 @@ mod tests {
         });
 
         assert!(prompt.starts_with("## Team Governance"));
+        assert!(prompt.contains("`team_read_board`"));
+        assert!(prompt.contains("#seq"));
         assert!(prompt.contains("Name: Lead"));
         assert!(prompt.contains("Slot ID: lead-1"));
         assert!(prompt.contains("Role: lead"));
@@ -394,6 +407,9 @@ mod tests {
         });
 
         assert!(prompt.contains("## Team Governance"));
+        assert!(prompt.contains("`team_read_board`"));
+        assert!(prompt.contains("`[done]`"));
+        assert!(prompt.contains("`[blocked]`"));
         assert!(prompt.contains("Name: Worker"));
         assert!(prompt.contains("Slot ID: worker-1"));
         assert!(prompt.contains("Role: teammate"));

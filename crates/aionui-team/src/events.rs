@@ -579,6 +579,7 @@ mod tests {
         let (emitter, bc) = make_emitter();
         emitter.broadcast_mailbox_changed(
             TeamMailboxMessageResponse {
+                seq: None,
                 id: "m1".into(),
                 team_id: "team-1".into(),
                 from_agent_id: "a2".into(),

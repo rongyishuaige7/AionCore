@@ -188,6 +188,7 @@ pub async fn init_database_memory() -> Result<Database, DbError> {
     // In-memory DBs are not shared across processes, so no advisory lock is
     // needed (and there is no on-disk path we could create one against).
     run_migrations(&pool).await?;
+    ensure_mailbox_seq_column(&pool).await?;
     ensure_system_user(&pool).await?;
 
     info!("In-memory database initialized");
@@ -283,6 +284,9 @@ async fn try_init_file_staged(path: &Path) -> Result<Database, DatabaseInitError
         .map_err(|e| DatabaseInitError::new("database.open", DbError::Query(e)))?;
 
     run_migrations_staged(&pool).await?;
+    ensure_mailbox_seq_column(&pool)
+        .await
+        .map_err(|e| DatabaseInitError::new("database.mailbox_seq", e))?;
 
     // Discard the bootstrap pool and reconnect on a FRESH pool before any
     // business query runs. Migrations DROP+rebuild tables (e.g. 030 rebuilt
@@ -517,6 +521,45 @@ impl Drop for MigrateLockGuard {
 async fn ensure_schema_columns(pool: &SqlitePool) -> Result<(), DbError> {
     reconcile_mcp_server_schema(pool).await?;
     crate::legacy_handoff::ensure_legacy_handoff_schema(pool).await?;
+    Ok(())
+}
+
+// An additive compatibility extension. Keep the migration ledger unchanged so
+// older backends can reopen the DB and still write rows with the default seq.
+async fn ensure_mailbox_seq_column(pool: &SqlitePool) -> Result<(), DbError> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let has_seq: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pragma_table_info('mailbox') WHERE name = 'seq')")
+            .fetch_one(&mut *tx)
+            .await?;
+    if !has_seq {
+        sqlx::query("ALTER TABLE mailbox ADD COLUMN seq INTEGER NOT NULL DEFAULT 0")
+            .execute(&mut *tx)
+            .await?;
+    }
+    // A partial index leaves old backends free to write unnumbered rows.
+    let needs_backfill: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM mailbox WHERE seq = 0)")
+        .fetch_one(&mut *tx)
+        .await?;
+    if needs_backfill {
+        sqlx::query(
+            "WITH base AS (
+                SELECT team_id, MAX(seq) AS max_seq FROM mailbox GROUP BY team_id
+             ), ranked AS MATERIALIZED (
+                SELECT m.id, b.max_seq + ROW_NUMBER() OVER (
+                    PARTITION BY m.team_id ORDER BY m.created_at, m.id
+                ) AS next_seq
+                FROM mailbox m JOIN base b ON b.team_id = m.team_id WHERE m.seq = 0
+             )
+             UPDATE mailbox SET seq = ranked.next_seq FROM ranked WHERE ranked.id = mailbox.id",
+        )
+        .execute(&mut *tx)
+        .await?;
+    }
+    sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_mailbox_team_seq ON mailbox(team_id, seq) WHERE seq > 0")
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
     Ok(())
 }
 

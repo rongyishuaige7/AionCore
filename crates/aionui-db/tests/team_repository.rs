@@ -15,7 +15,7 @@ use aionui_common::now_ms;
 use aionui_db::models::{MailboxMessageRow, TeamRow, TeamTaskRow};
 use aionui_db::{
     ActivityCursor, DbError, ITeamRepository, PageDirection, SqliteTeamRepository, UpdateTaskParams, UpdateTeamParams,
-    init_database_memory,
+    init_database, init_database_memory,
 };
 
 const DEFAULT_USER_ID: &str = "system_default_user";
@@ -53,6 +53,7 @@ fn make_team_for_user(id: &str, user_id: &str, name: &str) -> TeamRow {
 
 fn make_mailbox_msg(id: &str, team_id: &str, to: &str, from: &str, msg_type: &str) -> MailboxMessageRow {
     MailboxMessageRow {
+        seq: 0,
         id: id.into(),
         team_id: team_id.into(),
         to_agent_id: to.into(),
@@ -81,6 +82,137 @@ fn make_task(id: &str, team_id: &str, subject: &str) -> TeamTaskRow {
         created_at: now,
         updated_at: now,
     }
+}
+
+#[tokio::test]
+async fn shared_board_sequences_are_independent_under_concurrent_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_database(&dir.path().join("board.db")).await.unwrap();
+    let repo = Arc::new(SqliteTeamRepository::new(db.pool().clone()));
+    for team_id in ["team-a", "team-b"] {
+        repo.create_team(&make_team(team_id, team_id)).await.unwrap();
+    }
+
+    let mut writes = tokio::task::JoinSet::new();
+    for i in 0..24 {
+        let repo = Arc::clone(&repo);
+        writes.spawn(async move {
+            let team_id = if i % 2 == 0 { "team-a" } else { "team-b" };
+            let row = make_mailbox_msg(&format!("m{i}"), team_id, "lead", "author", "message");
+            (team_id, repo.write_message(DEFAULT_USER_ID, &row).await.unwrap())
+        });
+    }
+    assert_eq!(writes.join_all().await.len(), 24);
+    for team_id in ["team-a", "team-b"] {
+        let rows = repo
+            .list_board_messages(DEFAULT_USER_ID, team_id, 0, None, false, 100)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.iter().map(|row| row.seq).collect::<Vec<_>>(),
+            (1..=12).collect::<Vec<_>>()
+        );
+    }
+}
+
+#[tokio::test]
+async fn shared_board_backfills_legacy_and_rollback_rows_without_renumbering() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("board.db");
+    let db = init_database(&path).await.unwrap();
+    let repo = SqliteTeamRepository::new(db.pool().clone());
+    repo.create_team(&make_team("t1", "Team")).await.unwrap();
+    // Reconstruct the pre-feature schema and exercise the actual startup path.
+    sqlx::query("DROP INDEX idx_mailbox_team_seq; ALTER TABLE mailbox DROP COLUMN seq")
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    async fn legacy_write(db: &aionui_db::Database, id: &str, created_at: i64) {
+        sqlx::query(
+            "INSERT INTO mailbox (id, team_id, to_agent_id, from_agent_id, type, content, read, created_at)
+             VALUES (?, 't1', 'lead', 'author', 'message', 'report', 0, ?)",
+        )
+        .bind(id)
+        .bind(created_at)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    }
+    legacy_write(&db, "z", 100).await;
+    legacy_write(&db, "a", 100).await;
+    let previous_version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    db.close().await;
+
+    let db = init_database(&path).await.unwrap();
+    legacy_write(&db, "rollback", 1).await;
+    db.close().await;
+    let db = init_database(&path).await.unwrap();
+    let repo = SqliteTeamRepository::new(db.pool().clone());
+    let rows = repo
+        .list_board_messages(DEFAULT_USER_ID, "t1", 0, None, true, 100)
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.iter().map(|row| (row.id.as_str(), row.seq)).collect::<Vec<_>>(),
+        [("a", 1), ("z", 2), ("rollback", 3)]
+    );
+    let version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(version, previous_version);
+}
+
+#[tokio::test]
+async fn shared_board_filters_by_cursor_sender_and_type_without_acknowledging_rows() {
+    let (repo, _) = repo().await;
+    repo.create_team(&make_team("t1", "Team")).await.unwrap();
+    for (id, sender, kind) in [
+        ("m1", "author", "message"),
+        ("m2", "author", "idle_notification"),
+        ("m3", "verifier", "message"),
+        ("m4", "author", "message"),
+    ] {
+        repo.write_message(DEFAULT_USER_ID, &make_mailbox_msg(id, "t1", "lead", sender, kind))
+            .await
+            .unwrap();
+    }
+
+    let filtered = repo
+        .list_board_messages(DEFAULT_USER_ID, "t1", 1, Some("author"), false, 1)
+        .await
+        .unwrap();
+    assert_eq!(filtered.iter().map(|row| row.seq).collect::<Vec<_>>(), [4]);
+    let system = repo
+        .list_board_messages(DEFAULT_USER_ID, "t1", 1, None, true, 1)
+        .await
+        .unwrap();
+    assert_eq!(system[0].seq, 2);
+    assert_eq!(repo.peek_unread(DEFAULT_USER_ID, "t1", "lead").await.unwrap().len(), 4);
+    assert_eq!(repo.latest_mailbox_seq(DEFAULT_USER_ID, "t1").await.unwrap(), 4);
+}
+
+#[tokio::test]
+async fn shared_board_returns_no_rows_or_cursor_for_another_user() {
+    let (repo, _) = repo().await;
+    repo.create_team(&make_team("t1", "Team")).await.unwrap();
+    let row = make_mailbox_msg("m1", "t1", "lead", "author", "message");
+    repo.write_message(DEFAULT_USER_ID, &row).await.unwrap();
+    assert!(
+        repo.list_board_messages("other-user", "t1", 0, None, true, 100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(repo.latest_mailbox_seq("other-user", "t1").await.unwrap(), 0);
+    assert!(matches!(
+        repo.write_message("other-user", &row).await,
+        Err(DbError::NotFound(_))
+    ));
 }
 
 // ── Team CRUD Tests ──────────────────────────────────────────────────

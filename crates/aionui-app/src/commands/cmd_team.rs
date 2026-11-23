@@ -46,6 +46,7 @@ async fn run_team_inner(args: TeamArgs) -> Result<(), ExitCode> {
         }
         TeamCommand::Members => call_tool(vec!["members"]).await,
         TeamCommand::ReadMessages => call_tool(vec!["read-messages"]).await,
+        TeamCommand::ReadBoard => call_tool(vec!["read-board"]).await,
         TeamCommand::SendMessage => call_tool(vec!["send-message"]).await,
         TeamCommand::InterruptAgent => call_tool(vec!["interrupt-agent"]).await,
         TeamCommand::Task(task) => match task.command {

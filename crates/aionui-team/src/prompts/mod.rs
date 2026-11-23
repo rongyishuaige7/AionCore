@@ -131,8 +131,13 @@ pub fn build_wake_payload(
                 MailboxMessageType::IdleNotification => "idle_notification",
                 MailboxMessageType::ShutdownRequest => "shutdown_request",
             };
+            let seq_prefix = if msg.seq > 0 {
+                format!("#{} ", msg.seq)
+            } else {
+                String::new()
+            };
             payload.push_str(&format!(
-                "- From `{}` [{}]: {}\n",
+                "- {seq_prefix}From `{}` [{}]: {}\n",
                 msg.from_agent_id, type_label, msg.content,
             ));
             if let Some(ref summary) = msg.summary {
@@ -207,6 +212,7 @@ mod tests {
 
     fn make_message(from: &str, content: &str, msg_type: MailboxMessageType) -> MailboxMessage {
         MailboxMessage {
+            seq: 0,
             id: "msg-1".into(),
             team_id: "t1".into(),
             to_agent_id: "lead-1".into(),
@@ -383,11 +389,13 @@ mod tests {
     #[test]
     fn wake_payload_with_messages() {
         let agent = make_lead();
-        let msgs = vec![make_message("w1", "Task A done", MailboxMessageType::Message)];
+        let mut msg = make_message("w1", "Task A done", MailboxMessageType::Message);
+        msg.seq = 12;
+        let msgs = vec![msg];
         let payload = build_wake_payload(&agent, &[], &msgs, &roster(&["lead-1", "w1"]));
 
         assert!(payload.contains("New Messages"));
-        assert!(payload.contains("`w1`"));
+        assert!(payload.contains("#12 From `w1`"));
         assert!(payload.contains("[message]"));
         assert!(payload.contains("Task A done"));
     }

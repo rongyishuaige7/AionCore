@@ -204,6 +204,8 @@ impl MailboxMessageType {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MailboxMessage {
+    #[serde(default)]
+    pub seq: i64,
     pub id: String,
     pub team_id: String,
     pub to_agent_id: String,
@@ -320,6 +322,7 @@ impl MailboxMessage {
             .filter(|v| !v.is_empty());
         Some(Self {
             id: row.id.clone(),
+            seq: row.seq,
             team_id: row.team_id.clone(),
             to_agent_id: row.to_agent_id.clone(),
             from_agent_id: row.from_agent_id.clone(),
@@ -742,6 +745,7 @@ mod tests {
     #[test]
     fn mailbox_message_from_row_success() {
         let row = MailboxMessageRow {
+            seq: 0,
             id: "m1".into(),
             team_id: "t1".into(),
             to_agent_id: "a1".into(),
@@ -761,6 +765,7 @@ mod tests {
     #[test]
     fn mailbox_message_from_row_idle_notification() {
         let row = MailboxMessageRow {
+            seq: 0,
             id: "m2".into(),
             team_id: "t1".into(),
             to_agent_id: "lead".into(),
@@ -780,6 +785,7 @@ mod tests {
     #[test]
     fn mailbox_message_from_row_unknown_type() {
         let row = MailboxMessageRow {
+            seq: 0,
             id: "m3".into(),
             team_id: "t1".into(),
             to_agent_id: "a1".into(),
@@ -797,6 +803,7 @@ mod tests {
     #[test]
     fn mailbox_message_serializes_type_field() {
         let msg = MailboxMessage {
+            seq: 0,
             id: "m1".into(),
             team_id: "t1".into(),
             to_agent_id: "a1".into(),

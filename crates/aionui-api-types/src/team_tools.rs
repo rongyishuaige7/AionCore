@@ -67,6 +67,7 @@ pub enum TeamToolTransport {
 pub enum TeamToolName {
     TeamMembers,
     TeamReadMessages,
+    TeamReadBoard,
     TeamSendMessage,
     TeamInterruptAgent,
     TeamTaskCreate,
@@ -87,6 +88,7 @@ impl TeamToolName {
         match self {
             Self::TeamMembers => "team_members",
             Self::TeamReadMessages => "team_read_messages",
+            Self::TeamReadBoard => "team_read_board",
             Self::TeamSendMessage => "team_send_message",
             Self::TeamInterruptAgent => "team_interrupt_agent",
             Self::TeamTaskCreate => "team_task_create",
@@ -107,6 +109,7 @@ impl TeamToolName {
         Some(match value {
             "team_members" => Self::TeamMembers,
             "team_read_messages" => Self::TeamReadMessages,
+            "team_read_board" => Self::TeamReadBoard,
             "team_send_message" => Self::TeamSendMessage,
             "team_interrupt_agent" => Self::TeamInterruptAgent,
             "team_task_create" => Self::TeamTaskCreate,
@@ -351,6 +354,24 @@ fn tool_specs() -> Vec<TeamToolSpec> {
             cli_command: &["read-messages"],
             when: "Check queued messages",
             input_summary: "optional since_message_id",
+        },
+        TeamToolSpec {
+            name: TeamToolName::TeamReadBoard,
+            permission: TeamToolPermission::AnyTeamAgent,
+            description: "Read the team's shared mailbox in ascending sequence order without acknowledging any messages. To look up #N, use since_seq=N-1 and check the result's seq. Keep filters fixed when reusing next_since_seq. Broadcasts appear once for each recipient.",
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "since_seq": { "type": "integer", "minimum": 0, "description": "Return messages with seq greater than this cursor (default 0)" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 100, "description": "Page size (default 30, maximum 100)" },
+                    "include_system": { "type": "boolean", "description": "Include idle notifications and shutdown requests (default false)" },
+                    "from_slot_id": { "type": "string", "description": "Filter by the sender's slot ID" }
+                }
+            }),
+            cli_command: &["read-board"],
+            when: "Read shared team message board",
+            input_summary: "optional since_seq/limit/include_system/from_slot_id",
         },
         TeamToolSpec {
             name: TeamToolName::TeamSendMessage,
@@ -617,7 +638,7 @@ mod tests {
     #[test]
     fn descriptor_count_and_names_are_unique() {
         let descriptors = team_tool_descriptors();
-        assert_eq!(descriptors.len(), 15);
+        assert_eq!(descriptors.len(), 16);
         let names = descriptors
             .iter()
             .map(|descriptor| descriptor.name.as_str())
@@ -642,6 +663,7 @@ mod tests {
         let cases = [
             ("team_members", vec!["members"]),
             ("team_read_messages", vec!["read-messages"]),
+            ("team_read_board", vec!["read-board"]),
             ("team_send_message", vec!["send-message"]),
             ("team_interrupt_agent", vec!["interrupt-agent"]),
             ("team_task_create", vec!["task", "create"]),
@@ -675,6 +697,7 @@ mod tests {
         assert!(!names.contains(&"team_shutdown_agent".to_owned()));
         assert!(!names.contains(&"team_interrupt_agent".to_owned()));
         assert!(names.contains(&"team_read_messages".to_owned()));
+        assert!(names.contains(&"team_read_board".to_owned()));
         assert!(names.contains(&"team_send_message".to_owned()));
     }
 

@@ -69,6 +69,15 @@ pub struct ReadMessagesInput {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ReadBoardInput {
+    pub since_seq: Option<i64>,
+    pub limit: Option<i64>,
+    pub include_system: Option<bool>,
+    pub from_slot_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InterruptAgentInput {
     pub slot_id: String,
     pub message: String,
@@ -226,7 +235,7 @@ mod tests {
 
     #[test]
     fn all_descriptors_count() {
-        assert_eq!(all_tool_descriptors().len(), 15);
+        assert_eq!(all_tool_descriptors().len(), 16);
     }
 
     #[test]
@@ -235,7 +244,7 @@ mod tests {
         let mut names: Vec<&str> = descs.iter().map(|d| d.name.as_str()).collect();
         names.sort();
         names.dedup();
-        assert_eq!(names.len(), 15);
+        assert_eq!(names.len(), 16);
     }
 
     #[test]

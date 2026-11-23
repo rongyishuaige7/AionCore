@@ -215,6 +215,7 @@ pub(crate) enum TeamCommand {
     Context,
     Members,
     ReadMessages,
+    ReadBoard,
     SendMessage,
     InterruptAgent,
     Task(TeamTaskArgs),

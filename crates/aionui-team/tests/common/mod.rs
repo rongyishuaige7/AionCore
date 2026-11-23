@@ -3,6 +3,20 @@ use aionui_db::models::{MailboxMessageRow, TeamRow, TeamTaskRow};
 use aionui_db::{ActivityCursor, DbError, ITeamRepository, PageDirection, UpdateTaskParams, UpdateTeamParams};
 use std::sync::Mutex;
 
+fn push_numbered_message(messages: &mut Vec<MailboxMessageRow>, row: &MailboxMessageRow) -> i64 {
+    let mut row = row.clone();
+    row.seq = messages
+        .iter()
+        .filter(|message| message.team_id == row.team_id)
+        .map(|message| message.seq)
+        .max()
+        .unwrap_or_default()
+        + 1;
+    let seq = row.seq;
+    messages.push(row);
+    seq
+}
+
 #[derive(Default)]
 pub struct MockState {
     pub messages: Vec<MailboxMessageRow>,
@@ -45,9 +59,47 @@ impl ITeamRepository for MockTeamRepo {
         Ok(())
     }
 
-    async fn write_message(&self, _user_id: &str, row: &MailboxMessageRow) -> Result<(), DbError> {
-        self.state.lock().unwrap().messages.push(row.clone());
-        Ok(())
+    async fn write_message(&self, _user_id: &str, row: &MailboxMessageRow) -> Result<i64, DbError> {
+        Ok(push_numbered_message(&mut self.state.lock().unwrap().messages, row))
+    }
+
+    async fn list_board_messages(
+        &self,
+        _user_id: &str,
+        team_id: &str,
+        since_seq: i64,
+        from_agent_id: Option<&str>,
+        include_system: bool,
+        limit: i64,
+    ) -> Result<Vec<MailboxMessageRow>, DbError> {
+        let state = self.state.lock().unwrap();
+        let messages = &state.messages;
+        let mut rows: Vec<_> = messages
+            .iter()
+            .filter(|row| {
+                row.team_id == team_id
+                    && row.seq > since_seq
+                    && (include_system || row.msg_type == "message")
+                    && from_agent_id.is_none_or(|sender| row.from_agent_id == sender)
+            })
+            .cloned()
+            .collect();
+        rows.sort_by_key(|row| row.seq);
+        rows.truncate(limit as usize);
+        Ok(rows)
+    }
+
+    async fn latest_mailbox_seq(&self, _user_id: &str, team_id: &str) -> Result<i64, DbError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .messages
+            .iter()
+            .filter(|row| row.team_id == team_id)
+            .map(|row| row.seq)
+            .max()
+            .unwrap_or_default())
     }
 
     async fn read_unread_and_mark(

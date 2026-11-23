@@ -33,13 +33,21 @@ async fn team_capabilities_prints_contract_without_runtime_env() {
     let stdout: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(stdout["success"], true);
     assert_eq!(stdout["data"]["contract"], "agent-facing-team-cli");
-    assert_eq!(stdout["data"]["tools"].as_array().unwrap().len(), 15);
+    assert_eq!(stdout["data"]["tools"].as_array().unwrap().len(), 16);
     let spawn = stdout["data"]["tools"]
         .as_array()
         .unwrap()
         .iter()
         .find(|tool| tool["name"] == "team_spawn_agent")
         .unwrap();
+    let board = stdout["data"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "team_read_board")
+        .unwrap();
+    assert_eq!(board["lead_only"], false);
+    assert_eq!(board["stdin_json_schema"]["additionalProperties"], false);
     assert_eq!(spawn["lead_only"], true);
     assert!(spawn["stdin_json_schema"]["properties"]["assistant_id"].is_object());
 }
@@ -60,7 +68,9 @@ async fn team_help_prints_markdown_without_runtime_env() {
     let stdout: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(stdout["success"], true);
     assert_eq!(stdout["data"]["format"], "markdown");
-    assert!(stdout["data"]["text"].as_str().unwrap().contains("team send-message"));
+    let text = stdout["data"]["text"].as_str().unwrap();
+    assert!(text.contains("team send-message"));
+    assert!(text.contains("team read-board"));
 }
 
 #[tokio::test]

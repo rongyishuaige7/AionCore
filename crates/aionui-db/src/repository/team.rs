@@ -75,8 +75,22 @@ pub trait ITeamRepository: Send + Sync {
 
     // ── Mailbox ──────────────────────────────────────────────────────
 
-    /// Writes a message to the mailbox.
-    async fn write_message(&self, user_id: &str, row: &MailboxMessageRow) -> Result<(), DbError>;
+    /// Writes a message to the mailbox and returns its team-scoped sequence.
+    async fn write_message(&self, user_id: &str, row: &MailboxMessageRow) -> Result<i64, DbError>;
+
+    /// Lists shared messages after a sequence without changing read state.
+    async fn list_board_messages(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        since_seq: i64,
+        from_agent_id: Option<&str>,
+        include_system: bool,
+        limit: i64,
+    ) -> Result<Vec<MailboxMessageRow>, DbError>;
+
+    /// Returns zero for an empty or inaccessible team mailbox.
+    async fn latest_mailbox_seq(&self, user_id: &str, team_id: &str) -> Result<i64, DbError>;
 
     /// Atomically reads all unread messages for `to_agent_id` in a team
     /// and marks them as read. Uses `BEGIN IMMEDIATE` for atomicity.

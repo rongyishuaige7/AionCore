@@ -66,7 +66,8 @@ impl Mailbox {
         let files_json = files
             .filter(|f| !f.is_empty())
             .map(|f| serde_json::to_string(f).unwrap_or_default());
-        let row = MailboxMessageRow {
+        let mut row = MailboxMessageRow {
+            seq: 0,
             id: generate_id(),
             team_id: team_id.to_owned(),
             to_agent_id: to_agent_id.to_owned(),
@@ -79,7 +80,7 @@ impl Mailbox {
             created_at: now_ms(),
         };
 
-        self.repo.write_message(&self.user_id, &row).await?;
+        row.seq = self.repo.write_message(&self.user_id, &row).await?;
 
         debug!(
             team_id,

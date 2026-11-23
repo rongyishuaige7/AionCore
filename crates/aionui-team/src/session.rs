@@ -65,6 +65,7 @@ pub struct WakeInput {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentMessageQueueResult {
+    pub seq: i64,
     pub team_run_id: Option<String>,
     pub target: TeamSlotWorkPayload,
 }
@@ -959,6 +960,7 @@ impl TeamSession {
         let commit = self.commit_persisted_enqueue(&lease, mailbox_message.id).await?;
         self.event_loops.notify(to_slot_id);
         Ok(AgentMessageQueueResult {
+            seq: mailbox_message.seq,
             team_run_id: commit.team_run_id,
             target: TeamRunManager::slot_payload(&commit.slot),
         })

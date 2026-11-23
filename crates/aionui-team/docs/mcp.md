@@ -33,6 +33,14 @@ Team 创建是显式行为：由 Team UI 或 `/api/teams` REST API 发起。普�
 
 ---
 
+### 2.2 共享留言板
+
+团内成员可用 `team_read_board` 或向 `aioncore team read-board` 的标准输入传入 JSON 读取本队留言。读取留言板不改变收件箱的已读状态。查找 `#N` 时传入 `since_seq: N-1`，再核对返回的 `seq`。分页时固定筛选条件，使用 `next_since_seq` 继续。默认每页最多 30 条，系统消息默认隐藏。
+
+发送回执和唤醒消息包含团队内的稳定序号。广播会给每位收件人投递一条独立的留言，回执的 `seqs` 对应各条留言，`seq` 是第一条。正文预览可能截断，可通过交付路径或常规收件箱获取完整内容。
+
+---
+
 ## 3. TCP 协议
 
 每个 TeamSession 启动时开一个 TCP listener：

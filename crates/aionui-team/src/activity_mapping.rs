@@ -28,6 +28,7 @@ pub fn mailbox_row_to_response(row: &MailboxMessageRow) -> TeamMailboxMessageRes
         }),
     };
     TeamMailboxMessageResponse {
+        seq: (row.seq > 0).then_some(row.seq),
         id: row.id.clone(),
         team_id: row.team_id.clone(),
         from_agent_id: row.from_agent_id.clone(),
@@ -104,6 +105,7 @@ mod tests {
 
     fn row(files: Option<&str>) -> MailboxMessageRow {
         MailboxMessageRow {
+            seq: 0,
             id: "m1".into(),
             team_id: "t1".into(),
             to_agent_id: "a1".into(),

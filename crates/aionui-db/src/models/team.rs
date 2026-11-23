@@ -30,6 +30,8 @@ pub struct TeamRow {
 /// The `read` column tracks whether the message has been consumed.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct MailboxMessageRow {
+    #[sqlx(default)]
+    pub seq: i64,
     pub id: String,
     pub team_id: String,
     pub to_agent_id: String,
@@ -96,6 +98,7 @@ mod tests {
     #[test]
     fn mailbox_row_msg_type_field_maps_correctly() {
         let row = MailboxMessageRow {
+            seq: 0,
             id: "m1".into(),
             team_id: "t1".into(),
             to_agent_id: "a1".into(),

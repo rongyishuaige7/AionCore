@@ -132,6 +132,23 @@ struct ReadMessagesParams {
     since_message_id: Option<String>,
 }
 
+#[derive(Deserialize, serde::Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ReadBoardParams {
+    /// Return only messages after this sequence (default 0).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    since_seq: Option<i64>,
+    /// Page size (default 30, maximum 100).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    limit: Option<i64>,
+    /// Include idle notifications and shutdown requests.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    include_system: Option<bool>,
+    /// Limit results to this sender slot ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    from_slot_id: Option<String>,
+}
+
 #[derive(Deserialize, schemars::JsonSchema)]
 struct SendMessageParams {
     /// Target agent slot_id or "*" for broadcast.
@@ -312,6 +329,14 @@ impl TeamStdioServer {
         }
         self.forward_to_tcp("team_read_messages", &serde_json::Value::Object(arguments))
             .await
+    }
+
+    #[tool(
+        name = "team_read_board",
+        description = "Read the team's shared mailbox in ascending sequence order without acknowledging any messages. To look up #N, use since_seq=N-1 and check the result's seq. Keep filters fixed when reusing next_since_seq. Broadcasts appear once for each recipient."
+    )]
+    async fn read_board(&self, Parameters(params): Parameters<ReadBoardParams>) -> CallToolResult {
+        self.forward_to_tcp("team_read_board", &serde_json::json!(params)).await
     }
 
     #[tool(
@@ -908,7 +933,7 @@ mod tests {
     fn team_stdio_descriptions_match_prompt_registry() {
         let router = TeamStdioServer::tool_router();
         let tools = router.list_all();
-        assert_eq!(tools.len(), 15, "stdio must expose the complete shared registry");
+        assert_eq!(tools.len(), 16, "stdio must expose the complete shared registry");
         let mut actual_names: Vec<_> = tools.iter().map(|tool| tool.name.as_ref()).collect();
         actual_names.sort_unstable();
         let mut expected_names: Vec<_> = aionui_team_prompts::tools::team_tool_specs()

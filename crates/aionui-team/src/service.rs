@@ -549,6 +549,24 @@ impl TeamSessionService {
         Ok(row.user_id)
     }
 
+    /// Reads a shared mailbox page without observing or acknowledging any row.
+    pub(crate) async fn read_shared_board(
+        &self,
+        team_id: &str,
+        since_seq: i64,
+        from_slot_id: Option<&str>,
+        include_system: bool,
+        limit: i64,
+    ) -> Result<(Vec<TeamMailboxMessageResponse>, i64), TeamError> {
+        let user_id = self.team_owner_user_id(team_id).await?;
+        let latest = self.repo.latest_mailbox_seq(&user_id, team_id).await?;
+        let rows = self
+            .repo
+            .list_board_messages(&user_id, team_id, since_seq, from_slot_id, include_system, limit)
+            .await?;
+        Ok((rows.iter().map(mailbox_row_to_response).collect(), latest))
+    }
+
     /// Returns the most recent team-wide mailbox messages (all recipients),
     /// newest first, for the read-only activity view. `limit` is clamped to
     /// `[1, MAX_ACTIVITY_LIMIT]`. Ownership is enforced first via a scoped

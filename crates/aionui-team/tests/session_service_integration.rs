@@ -1022,11 +1022,29 @@ impl ITeamRepository for FullMockTeamRepo {
         Ok(())
     }
 
-    async fn write_message(&self, user_id: &str, row: &aionui_db::models::MailboxMessageRow) -> Result<(), DbError> {
+    async fn write_message(&self, user_id: &str, row: &aionui_db::models::MailboxMessageRow) -> Result<i64, DbError> {
         if *self.fail_message_writes.lock().unwrap() {
             return Err(DbError::Init("forced mailbox write failure".into()));
         }
         self.inner.write_message(user_id, row).await
+    }
+
+    async fn list_board_messages(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        since_seq: i64,
+        from_agent_id: Option<&str>,
+        include_system: bool,
+        limit: i64,
+    ) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
+        self.inner
+            .list_board_messages(user_id, team_id, since_seq, from_agent_id, include_system, limit)
+            .await
+    }
+
+    async fn latest_mailbox_seq(&self, user_id: &str, team_id: &str) -> Result<i64, DbError> {
+        self.inner.latest_mailbox_seq(user_id, team_id).await
     }
     async fn read_unread_and_mark(
         &self,
@@ -2353,6 +2371,7 @@ async fn recovery_creates_system_run_intents_without_restoring_old_memory_run() 
         .write_message(
             "user1",
             &aionui_db::models::MailboxMessageRow {
+                seq: 0,
                 id: "mailbox-orphan-1".into(),
                 team_id: created.id.clone(),
                 to_agent_id: lead_slot_id.clone(),
@@ -2446,7 +2465,9 @@ async fn teammate_first_wake_uses_canonical_prompt_at_service_boundary() {
     let first_message = &worker_request.content;
     assert!(first_message.contains("## Team Governance"));
     assert!(first_message.contains("You MUST use the `team_*` MCP tools for ALL team coordination."));
-    assert!(first_message.contains("Use team_send_message to report results to the leader"));
+    assert!(first_message.contains("Use team_send_message to report to the next person responsible for the task"));
+    assert!(first_message.contains("`team_read_board`"));
+    assert!(first_message.contains("Keep the required review gate"));
     assert!(first_message.contains("STOP GENERATING"));
     assert!(!first_message.contains(
         "You execute tasks assigned by the Lead Agent. Focus on completing your assigned work thoroughly and reporting back."
@@ -2533,6 +2554,7 @@ async fn ensure_session_does_not_run_self_message_only_recovery_turn() {
         .write_message(
             "user1",
             &aionui_db::models::MailboxMessageRow {
+                seq: 0,
                 id: "mailbox-self-1".into(),
                 team_id: created.id.clone(),
                 to_agent_id: lead_slot_id.clone(),
@@ -6646,6 +6668,26 @@ async fn lead_send_agent_message_without_active_run_opens_system_lifecycle_run()
         .expect("run-less run-scoped wake must now succeed");
     assert!(result.team_run_id.is_some(), "the wake must land inside a team run");
 
+    // The recipient can read the stored handoff through the shared tool executor.
+    let context = aionui_team::tool_executor::TeamToolContext {
+        team_id: created.id.clone(),
+        caller_slot_id: worker_slot_id.clone(),
+        caller_role: aionui_team::types::TeammateRole::Teammate,
+        user_id: Some("user1".into()),
+        conversation_id: None,
+        transport: aionui_api_types::TeamToolTransport::CliAssumed,
+    };
+    let call = aionui_team::tool_executor::team_tool_call_from_name(
+        "team_read_board",
+        serde_json::json!({ "since_seq": result.seq - 1, "limit": 1 }),
+    )
+    .unwrap();
+    let page = svc.execute_team_tool(&context, call).await.unwrap();
+    assert_eq!(page["messages"][0]["seq"], result.seq);
+    assert_eq!(page["messages"][0]["from_slot_id"], lead_slot_id);
+    assert_eq!(page["messages"][0]["to_slot_id"], worker_slot_id);
+    assert_eq!(page["messages"][0]["content"], "Do this");
+
     let run_state = svc.get_run_state("user1", &created.id).await.unwrap();
     let active_run = run_state
         .active_run
@@ -8558,6 +8600,7 @@ fn activity_team_row(id: &str, user_id: &str) -> aionui_db::models::TeamRow {
 
 fn activity_message_row(id: &str, team_id: &str, created_at: i64) -> aionui_db::models::MailboxMessageRow {
     aionui_db::models::MailboxMessageRow {
+        seq: 0,
         id: id.into(),
         team_id: team_id.into(),
         to_agent_id: "a1".into(),
