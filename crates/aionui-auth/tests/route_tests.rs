@@ -705,6 +705,22 @@ async fn t9_3_refresh_missing_token() {
 }
 
 #[tokio::test]
+async fn refresh_without_cookie_or_body_returns_unauthorized() {
+    let (app, _ctx) = test_app().await;
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/auth/refresh")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
+}
+
+#[tokio::test]
 async fn refresh_rejects_local_user_token_in_aionpro_mode() {
     let (app, ctx) = test_app_with_options_and_hook(false, Some("bootstrap-secret"), true, None).await;
     let token = ctx
