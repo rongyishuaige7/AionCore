@@ -49,6 +49,6 @@ pub use routes::role_routes;
 pub use service::{
     CuratedMemory, DebriefRecord, MAX_CHARTER_CHARS, MAX_KEPT_DEBRIEFS, MAX_MEMORY_ARCHIVES, MAX_MEMORY_BYTES,
     MAX_NOTE_CHARS, MAX_PROGRESS_STATE_CHARS, MAX_PROGRESS_TASKS, MAX_TASK_NAME_CHARS, ProgressUpdate, RememberedNote,
-    RoleService, ThreadMark, ThreadTurn, ThreadUpkeep,
+    RoleService, RunDeclaration, ThreadMark, ThreadTurn, ThreadUpkeep,
 };
 pub use state::{RoleExternalPort, RoleRouterState};

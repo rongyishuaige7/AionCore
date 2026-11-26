@@ -57,6 +57,9 @@ const HEADER_RUNTIME_TOKEN: &str = "x-aionui-runtime-token";
 
 /// Message type of the card a run's report leaves in the role's thread.
 const ROLE_REPORT_MESSAGE: &str = "role_report";
+/// Message type of the card a run that told the user nothing leaves in the
+/// role's thread: how it ended.
+pub(crate) const ROLE_RUN_MESSAGE: &str = "role_run";
 /// Announces a card left in a role's thread, carrying the message as stored.
 const ROLE_THREAD_CARD_EVENT: &str = "role.thread_card";
 
@@ -722,27 +725,50 @@ async fn card_in_thread(state: &RuntimeRoleState, user_id: &str, role_id: &str, 
         "run_conversation_id": report.conversation_id,
         "at": report.at,
     });
+    leave_thread_card(
+        state.conversations.as_ref(),
+        state.broadcaster.as_ref(),
+        user_id,
+        &thread,
+        ROLE_REPORT_MESSAGE,
+        content,
+        report.at,
+    )
+    .await;
+}
+
+/// Leave a card of `message_type` in a role's thread and show it to open
+/// clients. A failure is logged; `false` when the card was not left.
+pub(crate) async fn leave_thread_card(
+    conversations: &dyn IConversationRepository,
+    broadcaster: &dyn EventBroadcaster,
+    user_id: &str,
+    thread: &str,
+    message_type: &str,
+    content: Value,
+    at: i64,
+) -> bool {
     let row = MessageRow {
         id: ConversationService::mint_msg_id(),
-        conversation_id: thread.clone(),
+        conversation_id: thread.to_owned(),
         msg_id: None,
-        r#type: ROLE_REPORT_MESSAGE.into(),
+        r#type: message_type.into(),
         content: content.to_string(),
         position: Some("center".into()),
         status: Some("finish".into()),
         hidden: false,
-        created_at: report.at,
+        created_at: at,
         backend_turn_id: None,
     };
-    if let Err(error) = state.conversations.insert_message(user_id, &row).await {
+    if let Err(error) = conversations.insert_message(user_id, &row).await {
         // The thread may be gone; the user's next conversation with the role takes its place.
-        tracing::warn!(role_id, conversation_id = %thread, error = %error, "role report: card not left in the thread");
-        return;
+        tracing::warn!(conversation_id = %thread, message_type, error = %error, "role thread: card not left");
+        return false;
     }
-    tracing::info!(role_id, conversation_id = %thread, "role report: card left in the thread");
+    tracing::info!(conversation_id = %thread, message_type, "role thread: card left");
     // Its own event rather than a stream frame: a card is no turn, and the
     // conversation's turn tracking must not take it for one.
-    state.broadcaster.broadcast(WebSocketMessage::new(
+    broadcaster.broadcast(WebSocketMessage::new(
         ROLE_THREAD_CARD_EVENT,
         serde_json::json!({
             "user_id": user_id,
@@ -755,6 +781,7 @@ async fn card_in_thread(state: &RuntimeRoleState, user_id: &str, role_id: &str, 
             "created_at": row.created_at,
         }),
     ));
+    true
 }
 
 /// The resident role the calling conversation runs as. Refuses a caller whose

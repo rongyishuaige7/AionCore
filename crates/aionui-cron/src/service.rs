@@ -22,13 +22,14 @@ use tracing::{debug, error, info, warn};
 use crate::events::CronEventEmitter;
 
 use crate::error::CronError;
-use crate::executor::{ExecutionResult, JobExecutor, PreparedRunNow, RETRY_INTERVAL_MS};
+use crate::executor::{CronRunEnded, CronRunStatus, ExecutionResult, JobExecutor, PreparedRunNow, RETRY_INTERVAL_MS};
 use crate::follow_up::{
     FOLLOW_UP_MAX_RETRIES, FollowUp, MAX_FOLLOW_UP_MINUTES, MAX_FOLLOW_UP_NOTE_CHARS, MAX_PENDING_FOLLOW_UPS,
     follow_up_name, is_follow_up,
 };
 use crate::scheduler::{
-    CronScheduler, compute_next_run, compute_next_run_after_occurrence, validate_schedule, validate_timezone,
+    CronScheduler, MissedRun, compute_next_run, compute_next_run_after_occurrence, missed_run, slept_between,
+    validate_schedule, validate_timezone,
 };
 use crate::skill_file::{
     cron_skill_dir, cron_skill_name, delete_skill_file, has_skill_file, parse_skill_content, read_skill_content,
@@ -54,6 +55,11 @@ const PLACEHOLDER_PATTERNS: &[&str] = &[
 const RUN_LEASE_MS: i64 = 60_000;
 const RUN_LEASE_HEARTBEAT_MS: u64 = 20_000;
 const RUN_HISTORY_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
+/// How often the scheduler looks whether the machine slept.
+const SLEEP_WATCH_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+/// A wake handled this recently is not handled again: the desktop app's
+/// resume notice and the sleep watch both report the same one.
+const RESUME_DEBOUNCE_MS: i64 = 60_000;
 
 /// Port used by `/api/cron` routes to hold agent-authored cron changes targeting
 /// a resident role as pending approval proposals (`PLAN.md` §6).
@@ -86,6 +92,9 @@ pub struct CronService {
     data_dir: PathBuf,
     instance_id: String,
     role_proposal_port: Arc<std::sync::OnceLock<Arc<dyn CronRoleProposalPort>>>,
+    /// When the last wake was handled. Held while one is handled, so two
+    /// reports of the same wake do not both catch up on it.
+    last_resume_at: Arc<tokio::sync::Mutex<i64>>,
 }
 
 pub struct CronServiceDeps {
@@ -114,7 +123,67 @@ impl CronService {
             data_dir: deps.data_dir,
             instance_id: generate_prefixed_id("cron-owner"),
             role_proposal_port: Arc::new(std::sync::OnceLock::new()),
+            last_resume_at: Arc::new(tokio::sync::Mutex::new(i64::MIN)),
         }
+    }
+
+    /// Watches for the machine waking from sleep and handles it as the desktop
+    /// app's resume notice is handled. Timers wait on a clock that stops while
+    /// the machine sleeps, so on waking every run would be as late as the
+    /// sleep was long; a server that runs headless is told of no wake.
+    pub fn spawn_sleep_watch(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let service = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                let (wall, monotonic) = (now_ms(), std::time::Instant::now());
+                tokio::time::sleep(SLEEP_WATCH_EVERY).await;
+                let monotonic_elapsed = i64::try_from(monotonic.elapsed().as_millis()).unwrap_or(i64::MAX);
+                if slept_between(now_ms() - wall, monotonic_elapsed) {
+                    info!("Cron: the machine slept; catching up on its timers");
+                    service.handle_system_resume().await;
+                }
+            }
+        })
+    }
+
+    /// Tells the role a job runs as how one of its runs ended. Follow-ups and
+    /// jobs that run as no assistant have no role to tell.
+    async fn tell_role_run_ended(
+        &self,
+        job: &CronJob,
+        status: CronRunStatus,
+        conversation_id: Option<&str>,
+        scheduled_at: Option<i64>,
+        error: Option<&str>,
+    ) {
+        let Some(port) = self.executor.role_port() else {
+            return;
+        };
+        let Some(assistant_id) = job
+            .agent_config
+            .as_ref()
+            .and_then(|config| config.assistant_id.as_deref())
+            .filter(|id| !id.trim().is_empty())
+        else {
+            return;
+        };
+        if is_follow_up(job) {
+            return;
+        }
+        let Some(user_id) = self.owner_user_id_for_job(job).await else {
+            return;
+        };
+        port.run_ended(CronRunEnded {
+            user_id,
+            assistant_id: assistant_id.to_owned(),
+            job_id: job.id.clone(),
+            job_name: job.name.clone(),
+            status,
+            conversation_id: conversation_id.map(str::to_owned),
+            scheduled_at,
+            error: error.map(str::to_owned),
+        })
+        .await;
     }
 
     pub fn set_role_proposal_port(&self, port: Arc<dyn CronRoleProposalPort>) {
@@ -909,6 +978,8 @@ impl CronService {
                 if let Some(user_id) = self.owner_user_id_for_job(&job).await {
                     self.emitter.emit_job_executed(&user_id, job_id, "skipped", None);
                 }
+                self.tell_role_run_ended(&job, CronRunStatus::Skipped, None, Some(scheduled_at), None)
+                    .await;
                 return;
             }
             Err(error) => {
@@ -924,7 +995,7 @@ impl CronService {
         // a busy conversation is no obstacle either.
         if let Some(result) = self.executor.deliver_to_inbox(&job).await {
             heartbeat.abort();
-            self.handle_execution_result(job, scheduled_at, result).await;
+            self.handle_execution_result(job, scheduled_at, result, None).await;
             return;
         }
 
@@ -932,10 +1003,11 @@ impl CronService {
             Ok(prepared) => prepared,
             Err(result) => {
                 heartbeat.abort();
-                self.handle_execution_result(job, scheduled_at, result).await;
+                self.handle_execution_result(job, scheduled_at, result, None).await;
                 return;
             }
         };
+        let run_conversation = prepared.conversation_id.clone();
         let mut execution_job = job;
         if let Err(err) = self
             .bind_materialized_existing_conversation_if_needed(&mut execution_job, &prepared.conversation_id)
@@ -954,6 +1026,7 @@ impl CronService {
                 ExecutionResult::Error {
                     message: err.to_string(),
                 },
+                Some(&run_conversation),
             )
             .await;
             return;
@@ -961,10 +1034,16 @@ impl CronService {
 
         let result = self.executor.execute_prepared_scheduled(&execution_job, prepared).await;
         heartbeat.abort();
-        self.handle_execution_result(execution_job, scheduled_at, result).await;
+        self.handle_execution_result(execution_job, scheduled_at, result, Some(&run_conversation))
+            .await;
     }
 
     pub async fn handle_system_resume(&self) {
+        let mut last_resume_at = self.last_resume_at.lock().await;
+        if now_ms().saturating_sub(*last_resume_at) < RESUME_DEBOUNCE_MS {
+            info!("System resume: this wake was already handled");
+            return;
+        }
         let rows = match self.repo.list_enabled_system().await {
             Ok(r) => r,
             Err(e) => {
@@ -1006,16 +1085,30 @@ impl CronService {
                 && next_run < now
                 && !is_follow_up(&job)
             {
-                info!(
-                    job_id = %job.id,
-                    conversation_id = %job.conversation_id,
-                    "Resume: missed job detected, marking missed without auto-execution"
-                );
-                self.record_missed_execution(&job).await;
-                self.insert_missed_job_tips(&job).await;
-                self.reschedule_after_missed(&job).await;
-                if let Some(user_id) = self.owner_user_id_for_job(&job).await {
-                    self.emitter.emit_job_executed(&user_id, &job.id, "missed", None);
+                match missed_run(&job.schedule, next_run, now) {
+                    MissedRun::CatchUp { scheduled_at } => {
+                        info!(job_id = %job.id, scheduled_at, "Resume: running the occurrence the machine slept through");
+                        self.scheduler.schedule_retry(&job.id, scheduled_at, now);
+                    }
+                    MissedRun::Pass => {
+                        info!(job_id = %job.id, "Resume: missed occurrence passed, the next run is near");
+                        self.reschedule_after_missed(&job).await;
+                    }
+                    MissedRun::Missed => {
+                        info!(
+                            job_id = %job.id,
+                            conversation_id = %job.conversation_id,
+                            "Resume: missed job detected, marking missed without auto-execution"
+                        );
+                        self.record_missed_execution(&job).await;
+                        self.insert_missed_job_tips(&job).await;
+                        self.reschedule_after_missed(&job).await;
+                        if let Some(user_id) = self.owner_user_id_for_job(&job).await {
+                            self.emitter.emit_job_executed(&user_id, &job.id, "missed", None);
+                        }
+                        self.tell_role_run_ended(&job, CronRunStatus::Missed, None, Some(next_run), None)
+                            .await;
+                    }
                 }
                 continue;
             }
@@ -1023,6 +1116,7 @@ impl CronService {
             self.scheduler.reschedule_job(&job);
         }
 
+        *last_resume_at = now_ms();
         info!("System resume: all cron timers rescheduled");
     }
 
@@ -1047,8 +1141,12 @@ impl CronService {
         let job_id = job.id.clone();
         let user_id = user_id.to_owned();
 
+        let run_conversation = conversation_id.clone();
         tokio::spawn(async move {
             let result = service.executor.execute_prepared(&job, prepared).await;
+            service
+                .tell_role_run_ended_after(&job, &result, Some(&run_conversation), None)
+                .await;
             service.handle_run_now_result(&user_id, &job_id, result).await;
         });
 
@@ -1413,7 +1511,40 @@ impl CronService {
         true
     }
 
-    async fn handle_execution_result(&self, job: CronJob, scheduled_at: i64, result: ExecutionResult) {
+    /// Tells the role how a run that has an [`ExecutionResult`] ended; a run
+    /// that will be retried has not ended yet.
+    async fn tell_role_run_ended_after(
+        &self,
+        job: &CronJob,
+        result: &ExecutionResult,
+        run_conversation: Option<&str>,
+        scheduled_at: Option<i64>,
+    ) {
+        let (status, conversation_id, error) = match result {
+            ExecutionResult::Success { conversation_id } => (CronRunStatus::Ok, Some(conversation_id.as_str()), None),
+            ExecutionResult::Error { message } => (CronRunStatus::Error, run_conversation, Some(message.as_str())),
+            ExecutionResult::Skipped => (CronRunStatus::Skipped, None, None),
+            ExecutionResult::Retrying { .. } => return,
+        };
+        self.tell_role_run_ended(job, status, conversation_id, scheduled_at, error)
+            .await;
+    }
+
+    async fn handle_execution_result(
+        &self,
+        job: CronJob,
+        scheduled_at: i64,
+        result: ExecutionResult,
+        run_conversation: Option<&str>,
+    ) {
+        // The role hears once the job's own record is settled.
+        let (ended, outcome) = (job.clone(), result.clone());
+        self.settle_execution_result(job, scheduled_at, result).await;
+        self.tell_role_run_ended_after(&ended, &outcome, run_conversation, Some(scheduled_at))
+            .await;
+    }
+
+    async fn settle_execution_result(&self, job: CronJob, scheduled_at: i64, result: ExecutionResult) {
         let job_id = &job.id;
         let owner_user_id = self.owner_user_id_for_job(&job).await;
 

@@ -195,6 +195,10 @@ pub enum MessageType {
     CronTrigger,
     /// What a resident role's run elsewhere told the user, left in the role's thread.
     RoleReport,
+    /// How a resident role's scheduled run ended when it told the user nothing
+    /// (it stayed silent, failed, was skipped or slept through), left in the
+    /// role's thread. Shown to the user only.
+    RoleRun,
     /// What a project's keeper handed a conversation in the project before its
     /// first message. Shown to the user; the agent got it with that message.
     KeeperBrief,

@@ -115,6 +115,22 @@ pub struct RoleService {
     /// Serializes memory writes: members of one role can run in several teams
     /// at once, and the user can save the memory from the roles page meanwhile.
     memory_lock: Arc<Mutex<()>>,
+    /// What each run declared about how it ended, newest last, held until the
+    /// run ends. Only in memory: a run that outlives a restart ends unheard.
+    declarations: Arc<std::sync::Mutex<std::collections::VecDeque<(String, RunDeclaration)>>>,
+}
+
+/// How many runs' declarations are held at once; the oldest give way.
+const MAX_HELD_DECLARATIONS: usize = 256;
+
+/// What a run declared, with `role report`, about how it ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunDeclaration {
+    /// The last outcome it declared.
+    pub outcome: RoleReportOutcome,
+    /// It told the user something at least once, so a card in the role's
+    /// thread already stands for the run.
+    pub reported: bool,
 }
 
 impl RoleService {
@@ -126,7 +142,43 @@ impl RoleService {
             store: RoleStore::new(root),
             recall,
             memory_lock: Arc::new(Mutex::new(())),
+            declarations: Arc::default(),
         }
+    }
+
+    /// Hold what `conversation_id` declared until its run ends.
+    fn note_declaration(&self, conversation_id: &str, outcome: RoleReportOutcome) {
+        let mut held = self
+            .declarations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let reported_before = held
+            .iter()
+            .find(|(id, _)| id == conversation_id)
+            .is_some_and(|(_, declaration)| declaration.reported);
+        held.retain(|(id, _)| id != conversation_id);
+        held.push_back((
+            conversation_id.to_owned(),
+            RunDeclaration {
+                outcome,
+                reported: reported_before || outcome != RoleReportOutcome::Silent,
+            },
+        ));
+        while held.len() > MAX_HELD_DECLARATIONS {
+            held.pop_front();
+        }
+    }
+
+    /// What the run in `conversation_id` declared about how it ended, once it
+    /// has ended; `None` when it declared nothing. Asked once per run: the
+    /// declaration is let go.
+    pub fn take_declaration(&self, conversation_id: &str) -> Option<RunDeclaration> {
+        let mut held = self
+            .declarations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let index = held.iter().position(|(id, _)| id == conversation_id)?;
+        held.remove(index).map(|(_, declaration)| declaration)
     }
 
     /// Every defined role, oldest first. A role whose definition file cannot be
@@ -490,6 +542,7 @@ impl RoleService {
             )));
         }
         if outcome == RoleReportOutcome::Silent {
+            self.note_declaration(conversation_id, outcome);
             return Ok(None);
         }
         if summary.is_empty() {
@@ -513,6 +566,7 @@ impl RoleService {
         reports.push(report.clone());
         let dropped = reports.len().saturating_sub(MAX_KEPT_REPORTS);
         self.store.write_reports(id, &reports[dropped..]).await?;
+        self.note_declaration(conversation_id, outcome);
         Ok(Some(report))
     }
 

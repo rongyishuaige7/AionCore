@@ -3525,15 +3525,23 @@ async fn sc2_at_type_past_timestamp() {
 
 // ── SR-1: System resume detects missed jobs ──────────────────────
 
+fn every_6h() -> CronScheduleDto {
+    CronScheduleDto::Every {
+        every_ms: 6 * 60 * 60 * 1_000,
+        description: Some("every 6 hours".into()),
+    }
+}
+
 #[tokio::test]
 async fn sr1_system_resume_missed_job() {
     let (svc, repo, bc, conv_repo) = setup_with_conv_repo().await;
 
-    let req = make_create_req("Resume Job", every_60s());
+    // Three hours late is past catching up, and the next run is three hours off.
+    let req = make_create_req("Resume Job", every_6h());
     let job = svc.add_job("u1", req).await.unwrap();
     bc.take_events();
 
-    let past_ms = now_ms() - 10_000;
+    let past_ms = now_ms() - 3 * 60 * 60 * 1_000;
     let params = aionui_db::UpdateCronJobParams {
         next_run_at: Some(Some(past_ms)),
         ..Default::default()
@@ -3575,6 +3583,38 @@ async fn sr1_system_resume_missed_job() {
             event.name == "message.stream" && event.data["type"] == "tips" && event.data["conversation_id"] == "conv_1"
         }),
         "resume should emit a tips websocket message"
+    );
+
+    // The desktop app's resume notice and the sleep watch report the same wake.
+    repo.update_for_user("u1", &job.id, &params).await.unwrap();
+    svc.handle_system_resume().await;
+    assert!(conv_repo.take_messages().is_empty(), "a wake is handled once");
+}
+
+#[tokio::test]
+async fn sr2_system_resume_lets_a_frequent_run_pass_when_the_next_is_near() {
+    let (svc, repo, bc, conv_repo) = setup_with_conv_repo().await;
+
+    let job = svc.add_job("u1", make_create_req("Patrol", every_60s())).await.unwrap();
+    bc.take_events();
+
+    // Fifty seconds late is past half the interval; the next run is ten seconds off.
+    let params = aionui_db::UpdateCronJobParams {
+        next_run_at: Some(Some(now_ms() - 50_000)),
+        ..Default::default()
+    };
+    repo.update_for_user("u1", &job.id, &params).await.unwrap();
+
+    svc.handle_system_resume().await;
+
+    let updated = svc.get_job("u1", &job.id).await.unwrap();
+    assert_eq!(updated.last_status, None, "a run let pass is not marked missed");
+    assert!(updated.last_run_at.is_none());
+    assert!(updated.next_run_at.unwrap() > now_ms() - 2_000);
+    assert!(conv_repo.take_messages().is_empty());
+    assert!(
+        !bc.take_events().iter().any(|event| event.name == "cron.job-executed"),
+        "nothing is announced for a run let pass"
     );
 }
 

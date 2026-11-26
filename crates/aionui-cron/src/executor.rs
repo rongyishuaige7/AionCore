@@ -70,6 +70,47 @@ pub trait CronRolePort: Send + Sync {
     /// instead of running in full auto. `false` when the assistant is not a
     /// role.
     async fn asks_when_scheduled(&self, assistant_id: &str) -> bool;
+
+    /// A run of a job that runs as this assistant has ended, or never got to
+    /// start. Nothing to do when the assistant is not a role.
+    async fn run_ended(&self, _run: CronRunEnded) {}
+}
+
+/// How a run of a job ended, told to the role the job runs as.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CronRunEnded {
+    pub user_id: String,
+    pub assistant_id: String,
+    pub job_id: String,
+    pub job_name: String,
+    pub status: CronRunStatus,
+    /// The conversation the run took place in, once it had one.
+    pub conversation_id: Option<String>,
+    /// The occurrence it ran for; `None` for a run the user started.
+    pub scheduled_at: Option<i64>,
+    pub error: Option<String>,
+}
+
+/// How a run of a job ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CronRunStatus {
+    Ok,
+    Error,
+    /// It did not start: the job's last run was still going.
+    Skipped,
+    /// It came due while the machine slept and was too late to run on waking.
+    Missed,
+}
+
+impl CronRunStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Error => "error",
+            Self::Skipped => "skipped",
+            Self::Missed => "missed",
+        }
+    }
 }
 
 /// Reaches the inbox of a conversation that has one — a team member's
@@ -197,6 +238,11 @@ impl JobExecutor {
     }
 
     /// Wires the role lookup. Without it no run is treated as a role's run.
+    /// The role side of the runs, when the composition layer wired one.
+    pub(crate) fn role_port(&self) -> Option<&Arc<dyn CronRolePort>> {
+        self.role_port.as_ref()
+    }
+
     pub fn with_role_port(mut self, role_port: Arc<dyn CronRolePort>) -> Self {
         self.role_port = Some(role_port);
         self

@@ -261,6 +261,7 @@ pub async fn build_module_states(
     cron.cron_service
         .set_role_proposal_port(role_governance.clone() as Arc<dyn aionui_cron::CronRoleProposalPort>);
     cron.cron_service.init().await;
+    cron.cron_service.spawn_sleep_watch();
     spawn_role_dreamer_loop(role_governance.clone());
     tracing::info!(
         elapsed_ms = boot.elapsed().as_millis(),
@@ -794,9 +795,13 @@ impl aionui_cron::executor::CronInboxPort for TeamInboxCronPort {
 
 /// Adapts the role service to the scheduler's [`aionui_cron::executor::CronRolePort`]:
 /// a scheduled task run as a resident role is told who it is, with the same
-/// brief a team member gets, worded for a run that has no team around it.
+/// brief a team member gets, worded for a run that has no team around it; and
+/// how each run ended is left in the role's thread when the run told the user
+/// nothing itself.
 struct RoleServiceCronPort {
     roles: RoleServiceTeamPort,
+    conversations: Arc<dyn aionui_db::IConversationRepository>,
+    broadcaster: Arc<dyn aionui_realtime::EventBroadcaster>,
 }
 
 #[async_trait::async_trait]
@@ -826,6 +831,54 @@ impl aionui_cron::executor::CronRolePort for RoleServiceCronPort {
                 true
             }
         }
+    }
+
+    async fn run_ended(&self, run: aionui_cron::executor::CronRunEnded) {
+        use aionui_cron::executor::CronRunStatus;
+
+        let roles = &self.roles.service;
+        let thread = match roles.thread(&run.assistant_id).await {
+            Ok(Some(thread)) => thread,
+            Ok(None) | Err(RoleError::InvalidId(_) | RoleError::NotFound(_)) => return,
+            Err(error) => {
+                tracing::warn!(assistant_id = %run.assistant_id, error = %error, "cron: role thread unreadable, run not recorded");
+                return;
+            }
+        };
+        // A run in the thread itself is there to be read.
+        if run.conversation_id.as_deref() == Some(thread.as_str()) {
+            return;
+        }
+        let declaration = run
+            .conversation_id
+            .as_deref()
+            .and_then(|conversation_id| roles.take_declaration(conversation_id));
+        // What it told the user is in the thread already, as its report.
+        if run.status == CronRunStatus::Ok && declaration.is_some_and(|declaration| declaration.reported) {
+            return;
+        }
+        let at = aionui_common::now_ms();
+        let content = serde_json::json!({
+            "role_id": run.assistant_id,
+            "job_id": run.job_id,
+            "job_name": run.job_name,
+            "status": run.status.as_str(),
+            "outcome": declaration.map(|declaration| declaration.outcome.as_str()),
+            "run_conversation_id": run.conversation_id,
+            "scheduled_at": run.scheduled_at,
+            "error": run.error,
+            "at": at,
+        });
+        crate::router::runtime_role::leave_thread_card(
+            self.conversations.as_ref(),
+            self.broadcaster.as_ref(),
+            &run.user_id,
+            &thread,
+            crate::router::runtime_role::ROLE_RUN_MESSAGE,
+            content,
+            at,
+        )
+        .await;
     }
 }
 
@@ -1973,6 +2026,8 @@ pub fn build_cron_state(services: &AppServices) -> CronRouterState {
         )
         .with_role_port(Arc::new(RoleServiceCronPort {
             roles: role_team_port(services),
+            conversations: conv_service.conversation_repo().clone(),
+            broadcaster: services.event_bus.clone(),
         })),
     );
 

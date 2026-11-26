@@ -681,6 +681,34 @@ async fn a_silent_run_leaves_nothing_behind() {
 }
 
 #[tokio::test]
+async fn how_a_run_declared_it_ended_is_held_until_its_run_ends() {
+    let root = tempfile::tempdir().unwrap();
+    let service = service(&root);
+    service.upsert("builtin-office", request("", &[])).await.unwrap();
+    let report = |outcome, conversation_id: &'static str| {
+        let service = &service;
+        async move {
+            service
+                .record_report("builtin-office", outcome, "the figures are in", conversation_id, 1)
+                .await
+                .unwrap();
+        }
+    };
+
+    report(RoleReportOutcome::Silent, "quiet").await;
+    // A run that said something and then went quiet has still told the user.
+    report(RoleReportOutcome::Say, "spoke").await;
+    report(RoleReportOutcome::Silent, "spoke").await;
+
+    let quiet = service.take_declaration("quiet").unwrap();
+    assert_eq!((quiet.outcome, quiet.reported), (RoleReportOutcome::Silent, false));
+    let spoke = service.take_declaration("spoke").unwrap();
+    assert_eq!((spoke.outcome, spoke.reported), (RoleReportOutcome::Silent, true));
+    assert_eq!(service.take_declaration("quiet"), None, "asked once per run");
+    assert_eq!(service.take_declaration("never-reported"), None);
+}
+
+#[tokio::test]
 async fn a_report_needs_one_short_line_and_a_role_to_file_it_under() {
     let root = tempfile::tempdir().unwrap();
     let service = service(&root);

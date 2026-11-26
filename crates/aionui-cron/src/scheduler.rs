@@ -91,6 +91,77 @@ fn compute_cron_next_run(expr: &str, tz: Option<&str>, now: TimestampMs) -> Opti
 }
 
 // ---------------------------------------------------------------------------
+// Runs that came due while the machine slept
+// ---------------------------------------------------------------------------
+
+/// The latest a run that came due during a sleep is still made on waking.
+pub const CATCH_UP_LIMIT_MS: i64 = 2 * 60 * 60 * 1_000;
+
+/// What to do on waking with a job whose run came due while the machine slept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissedRun {
+    /// The latest occurrence is recent enough to be worth making: run it now.
+    CatchUp { scheduled_at: TimestampMs },
+    /// Too late for that, and the next run is near: let it come, unremarked.
+    Pass,
+    /// Too late to run and too long until the next: record it as missed.
+    Missed,
+}
+
+/// Runs the latest occurrence that came due by `now` when it is late by no
+/// more than half the job's interval, and never more than
+/// [`CATCH_UP_LIMIT_MS`]; otherwise lets it pass when the next run is that
+/// near anyway, and records it as missed only when the next run is far.
+pub fn missed_run(schedule: &CronSchedule, due: TimestampMs, now: TimestampMs) -> MissedRun {
+    let (latest, next) = match schedule {
+        CronSchedule::At { at_ms, .. } => (*at_ms, None),
+        CronSchedule::Every { every_ms, .. } if *every_ms > 0 => {
+            let latest = due + now.saturating_sub(due).div_euclid(*every_ms) * every_ms;
+            (latest, Some(latest + every_ms))
+        }
+        CronSchedule::Every { .. } => (due, None),
+        CronSchedule::Cron { expr, tz, .. } => latest_cron_occurrence(expr, tz.as_deref(), due, now),
+    };
+    let grace = next.map_or(CATCH_UP_LIMIT_MS, |next| ((next - latest) / 2).min(CATCH_UP_LIMIT_MS));
+    if now - latest <= grace {
+        MissedRun::CatchUp { scheduled_at: latest }
+    } else if next.is_some_and(|next| next - now <= CATCH_UP_LIMIT_MS) {
+        MissedRun::Pass
+    } else {
+        MissedRun::Missed
+    }
+}
+
+/// The latest occurrence of a cron schedule at or after `due` and no later
+/// than `now`, and the one after it.
+fn latest_cron_occurrence(
+    expr: &str,
+    tz: Option<&str>,
+    due: TimestampMs,
+    now: TimestampMs,
+) -> (TimestampMs, Option<TimestampMs>) {
+    let mut latest = due;
+    // A week of minutes is the most a sleep is walked through.
+    for _ in 0..10_080 {
+        match compute_cron_next_run(expr, tz, latest) {
+            Some(next) if next <= now => latest = next,
+            next => return (latest, next),
+        }
+    }
+    (latest, None)
+}
+
+/// Wall-clock time that passed beyond the timers' own clock between two looks,
+/// over which the machine is taken to have slept.
+const SLEEP_GAP_MS: i64 = 90_000;
+
+/// Whether the machine slept between two looks. Timers wait on a monotonic
+/// clock that stops while it sleeps; the wall clock does not.
+pub fn slept_between(wall_elapsed_ms: i64, monotonic_elapsed_ms: i64) -> bool {
+    wall_elapsed_ms - monotonic_elapsed_ms > SLEEP_GAP_MS
+}
+
+// ---------------------------------------------------------------------------
 // Schedule validation for create/update
 // ---------------------------------------------------------------------------
 
@@ -311,6 +382,97 @@ fn delay_until(target_ms: TimestampMs) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- missed_run ----------------------------------------------------------
+
+    const MIN: i64 = 60_000;
+    const HOUR: i64 = 60 * MIN;
+
+    fn every(every_ms: i64) -> CronSchedule {
+        CronSchedule::Every {
+            every_ms,
+            description: None,
+        }
+    }
+
+    fn cron(expr: &str, tz: &str) -> CronSchedule {
+        CronSchedule::Cron {
+            expr: expr.into(),
+            tz: Some(tz.into()),
+            description: None,
+        }
+    }
+
+    fn utc(rfc3339: &str) -> TimestampMs {
+        chrono::DateTime::parse_from_rfc3339(rfc3339)
+            .unwrap()
+            .timestamp_millis()
+    }
+
+    #[test]
+    fn a_run_late_by_less_than_half_its_interval_is_caught_up_at_its_latest_occurrence() {
+        let due = 1_000_000_000_000;
+        // Slept through four half-hourly runs; the latest was ten minutes ago.
+        let now = due + 3 * 30 * MIN + 10 * MIN;
+        assert_eq!(
+            missed_run(&every(30 * MIN), due, now),
+            MissedRun::CatchUp {
+                scheduled_at: due + 3 * 30 * MIN
+            }
+        );
+    }
+
+    #[test]
+    fn a_frequent_run_too_late_to_catch_up_passes_for_the_next() {
+        let due = 1_000_000_000_000;
+        assert_eq!(missed_run(&every(30 * MIN), due, due + 20 * MIN), MissedRun::Pass);
+    }
+
+    #[test]
+    fn a_daily_run_is_caught_up_within_two_hours_and_missed_after() {
+        let schedule = cron("0 0 9 * * *", "Asia/Shanghai");
+        let due = utc("2026-11-25T01:00:00Z"); // 09:00 in Shanghai
+        assert_eq!(
+            missed_run(&schedule, due, due + 90 * MIN),
+            MissedRun::CatchUp { scheduled_at: due }
+        );
+        assert_eq!(missed_run(&schedule, due, due + 5 * HOUR), MissedRun::Missed);
+    }
+
+    #[test]
+    fn the_night_gap_of_a_patrol_is_not_reported_missed() {
+        // Half-hourly from 07:00 to 01:30 in New York; the machine slept from
+        // 01:00 until 06:50 and woke ten minutes before the morning's first run.
+        let schedule = cron("0 0,30 0,7-23 * * *", "America/New_York");
+        let due = utc("2026-11-25T06:30:00Z"); // 01:30 in New York
+        let now = utc("2026-11-25T11:50:00Z"); // 06:50 in New York
+        assert_eq!(missed_run(&schedule, due, now), MissedRun::Pass);
+    }
+
+    #[test]
+    fn a_one_time_run_is_caught_up_within_two_hours_and_missed_after() {
+        let at = CronSchedule::At {
+            at_ms: 1_000_000_000_000,
+            description: None,
+        };
+        assert_eq!(
+            missed_run(&at, 1_000_000_000_000, 1_000_000_000_000 + HOUR),
+            MissedRun::CatchUp {
+                scheduled_at: 1_000_000_000_000
+            }
+        );
+        assert_eq!(
+            missed_run(&at, 1_000_000_000_000, 1_000_000_000_000 + 3 * HOUR),
+            MissedRun::Missed
+        );
+    }
+
+    #[test]
+    fn a_sleep_is_wall_time_the_timers_clock_did_not_count() {
+        assert!(!slept_between(30_000, 30_000));
+        assert!(!slept_between(80_000, 30_000), "a busy runtime may lag a little");
+        assert!(slept_between(8 * HOUR, 30_000));
+    }
 
     // -- compute_next_run ----------------------------------------------------
 
