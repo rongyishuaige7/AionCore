@@ -129,6 +129,9 @@ pub(crate) struct DreamerState {
     pub condensed_conversation_id: String,
     #[serde(default)]
     pub condensed_leaves_count: usize,
+    /// Why the last pass left a step undone; empty when it went well.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub last_dreamer_error: String,
 }
 
 #[derive(Debug, Clone)]

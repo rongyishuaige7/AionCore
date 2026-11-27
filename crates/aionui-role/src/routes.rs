@@ -314,7 +314,11 @@ async fn dream_role(
         .run_zero_llm_decay(&id, &today, now)
         .await
         .map_err(to_api_error)?;
-    state.service.mark_dreamer_ran(&id, now).await.map_err(to_api_error)?;
+    state
+        .service
+        .mark_dreamer_ran(&id, now, None)
+        .await
+        .map_err(to_api_error)?;
     Ok(Json(ApiResponse::ok(RoleDreamResponse {
         decayed_playbook,
         archived_progress,

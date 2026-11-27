@@ -15,6 +15,7 @@ mod id;
 mod pagination;
 mod timestamp;
 mod types;
+mod user_activity;
 
 pub use backend_capabilities::{CapabilityOrigin, McpTransportCapabilities, ResolvedBackendCapabilities};
 pub use case_convert::{camel_to_snake, normalize_keys_to_snake_case};
@@ -36,4 +37,5 @@ pub use types::{
     AuthenticatedUserId, CommandSpec, Confirmation, ConfirmationOption, EnvVar, ProviderWithModel, RuntimeHelperCaller,
     UpdateType, VersionInfo,
 };
+pub use user_activity::{note_user_activity, user_quiet_for};
 pub use user_paths::{UserDirNameError, user_dir_name};

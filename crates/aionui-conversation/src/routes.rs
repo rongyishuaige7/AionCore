@@ -323,6 +323,9 @@ async fn send_msg(
     body: Result<Json<SendMessageRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<SendMessageResponse>>), ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    // Only the user sends through this route; runs, teams and roles send
+    // from inside the backend.
+    aionui_common::note_user_activity();
     let response = state
         .service
         .send_message(&user.id, &id, req, &state.task_manager)

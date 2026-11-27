@@ -1676,3 +1676,24 @@ async fn a_kept_project_is_briefed_by_its_keeper_but_never_the_keepers_own_conve
         Some(("sitemap half submitted".to_owned(), "c9".to_owned()))
     );
 }
+
+#[tokio::test]
+async fn dreamer_status_keeps_why_the_last_pass_left_a_step_undone() {
+    let root = tempfile::tempdir().unwrap();
+    let service = service(&root);
+    service.upsert("seo", request("Watches search traffic.", &[])).await.unwrap();
+    assert_eq!(service.get("seo").await.unwrap().dreamer, RoleDreamerStatus::default());
+
+    service
+        .mark_dreamer_ran("seo", 10, Some("  curate: timed out "))
+        .await
+        .unwrap();
+    let status = service.get("seo").await.unwrap().dreamer;
+    assert_eq!(status.last_dreamer_at, 10);
+    assert_eq!(status.last_error.as_deref(), Some("curate: timed out"));
+
+    // A pass that goes well clears the reason.
+    service.mark_dreamer_ran("seo", 20, None).await.unwrap();
+    let status = service.dreamer_status("seo").await.unwrap();
+    assert_eq!((status.last_dreamer_at, status.last_error), (20, None));
+}

@@ -167,7 +167,7 @@ pub use role::{
     KeeperDebriefItemKind, KeeperDebriefResponse, KeeperDebriefStatus, KeeperDebriefWarning, KeeperDebriefsResponse,
     KeeperLastStop, MAX_ROLE_AUTO_HOPS, OutdatedKeeperLessonRequest, PlaybookDeltaOp, ROLE_CLI_SCHEMA_VERSION,
     ROLE_SEND_TOOL_NAME, RoleCliEnvelope, RoleCliError, RoleCliErrorCode, RoleCliMeta, RoleCommit, RoleCurateRequest,
-    RoleCurateResponse, RoleDreamResponse, RoleExpandMessage, RoleExpandRequest, RoleExpandResponse,
+    RoleCurateResponse, RoleDreamResponse, RoleDreamerStatus, RoleExpandMessage, RoleExpandRequest, RoleExpandResponse,
     RoleFollowUpRequest, RoleFollowUpResponse, RoleKeeper, RoleKeepersResponse, RoleKeptProject, RoleListResponse,
     RolePeerSummary, RolePeersResponse, RolePlaybookEntry, RoleProgress, RoleProgressRequest, RoleProgressResponse,
     RoleProjectClaim, RoleProposal, RoleProposalChange, RoleRecallBound, RoleRecallHit, RoleRecallKind,

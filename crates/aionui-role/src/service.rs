@@ -6,10 +6,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use aionui_api_types::{
-    KeeperBrief, PlaybookDeltaOp, ROLE_SEND_TOOL_NAME, RoleCommit, RoleExpandRequest, RoleExpandResponse, RoleKeeper,
-    RoleKeptProject, RoleProgress, RoleProjectClaim, RoleProposal, RoleProposalChange, RoleRecallRequest,
-    RoleRecallResponse, RoleReport, RoleReportOutcome, RoleResponse, SetRoleProjectsRequest, TeamToolName,
-    UpsertRoleRequest,
+    KeeperBrief, PlaybookDeltaOp, ROLE_SEND_TOOL_NAME, RoleCommit, RoleDreamerStatus, RoleExpandRequest,
+    RoleExpandResponse, RoleKeeper, RoleKeptProject, RoleProgress, RoleProjectClaim, RoleProposal, RoleProposalChange,
+    RoleRecallRequest, RoleRecallResponse, RoleReport, RoleReportOutcome, RoleResponse, SetRoleProjectsRequest,
+    TeamToolName, UpsertRoleRequest,
 };
 use aionui_common::now_ms;
 use tokio::sync::Mutex;
@@ -49,6 +49,8 @@ pub const MAX_REPORT_SUMMARY_CHARS: usize = 300;
 /// How many of the things a role told the user are kept; older ones are dropped.
 pub const MAX_KEPT_REPORTS: usize = 30;
 const MAX_ROLE_ID_LEN: usize = 128;
+/// Cap on the reason kept for a dreamer step left undone, in characters.
+const MAX_DREAMER_ERROR_CHARS: usize = 300;
 /// Cap on how many projects one role keeps.
 pub const MAX_KEPT_PROJECTS: usize = 20;
 /// Cap on the project name a role keeps beside a project id, in characters.
@@ -1089,13 +1091,28 @@ impl RoleService {
         Ok((state.last_retrospective_at, state.last_dreamer_at))
     }
 
-    /// Record that a dreamer maintenance cycle completed at `now`.
-    pub async fn mark_dreamer_ran(&self, id: &str, now: i64) -> Result<(), RoleError> {
+    /// Record that a dreamer maintenance cycle ended at `now`, with why a
+    /// step it was due to do was left undone (`None` when all went well).
+    pub async fn mark_dreamer_ran(&self, id: &str, now: i64, error: Option<&str>) -> Result<(), RoleError> {
         validate_role_id(id)?;
         let _guard = self.memory_lock.lock().await;
         let mut state = self.store.read_dreamer_state(id).await?;
         state.last_dreamer_at = now;
+        state.last_dreamer_error = error
+            .map(|error| error.trim().chars().take(MAX_DREAMER_ERROR_CHARS).collect())
+            .unwrap_or_default();
         self.store.write_dreamer_state(id, &state).await
+    }
+
+    /// Where `id`'s upkeep stands.
+    pub async fn dreamer_status(&self, id: &str) -> Result<RoleDreamerStatus, RoleError> {
+        validate_role_id(id)?;
+        let state = self.store.read_dreamer_state(id).await?;
+        Ok(RoleDreamerStatus {
+            last_dreamer_at: state.last_dreamer_at,
+            last_retrospective_at: state.last_retrospective_at,
+            last_error: (!state.last_dreamer_error.is_empty()).then_some(state.last_dreamer_error),
+        })
     }
 
     /// Next batch of `batch_size` uncondensed `D0` leaves for `id`'s current
@@ -1431,6 +1448,7 @@ impl RoleService {
             playbook: parse_playbook(&pb_raw, &pb_meta),
             proposals: self.store.read_proposals(id).await?,
             projects: definition.projects,
+            dreamer: self.dreamer_status(id).await?,
             created_at: definition.created_at,
             updated_at: definition.updated_at,
         })

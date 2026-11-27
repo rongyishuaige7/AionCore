@@ -48,6 +48,9 @@ pub struct RoleResponse {
     /// Projects this role keeps, in the order it took them on.
     #[serde(default)]
     pub projects: Vec<RoleKeptProject>,
+    /// Where the role's upkeep stands.
+    #[serde(default)]
+    pub dreamer: RoleDreamerStatus,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -804,6 +807,24 @@ pub struct RoleDreamResponse {
     pub curated_memory: bool,
     pub retrospective_ran: bool,
     pub condensed_batches: usize,
+    /// Why a step that was due did not get done; absent when all went well.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Where a role's upkeep stands: when the dreamer last went over it and when
+/// its lessons were last reviewed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleDreamerStatus {
+    /// When the last dreamer pass ended (ms), 0 if never.
+    #[serde(default)]
+    pub last_dreamer_at: i64,
+    /// When the role's lessons were last reviewed (ms), 0 if never.
+    #[serde(default)]
+    pub last_retrospective_at: i64,
+    /// Why the last pass left a step undone; absent when it went well.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 /// Summary of one peer resident role returned by `GET /api/runtime/role/peers`.

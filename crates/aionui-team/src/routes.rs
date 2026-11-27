@@ -510,6 +510,7 @@ async fn send_message(
     body: Result<Json<SendTeamMessageRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<TeamRunAckResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    aionui_common::note_user_activity();
     let ack = state
         .service
         .send_message(&user.id, &id, &req.content, req.files)
@@ -524,6 +525,7 @@ async fn send_message_to_agent(
     body: Result<Json<SendAgentMessageRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<TeamRunAckResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    aionui_common::note_user_activity();
     let ack = state
         .service
         .send_message_to_agent(&user.id, &params.id, &params.slot_id, &req.content, req.files)

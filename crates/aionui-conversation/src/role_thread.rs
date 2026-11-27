@@ -765,16 +765,18 @@ impl ConversationService {
                 return;
             };
             let _pass = crate::keeper_debrief::lock_role_pass(&assistant_id).await;
-            this.maybe_run_retrospective(
-                &user_id,
-                &assistant_id,
-                Some(&conversation_id),
-                generator.as_ref(),
-                "reflector",
-                "session rotation review",
-                false,
-            )
-            .await;
+            // A failure is logged where it happens; the next rotation tries again.
+            let _ = this
+                .maybe_run_retrospective(
+                    &user_id,
+                    &assistant_id,
+                    Some(&conversation_id),
+                    generator.as_ref(),
+                    "reflector",
+                    "session rotation review",
+                    false,
+                )
+                .await;
         });
     }
 
@@ -951,16 +953,17 @@ impl ConversationService {
             if condensed > 0 {
                 port.catch_up_recall(user_id, assistant_id).await;
             }
-            self.maybe_run_retrospective(
-                user_id,
-                assistant_id,
-                Some(conversation_id),
-                generator,
-                "reflector",
-                "thread summary review",
-                false,
-            )
-            .await;
+            let _ = self
+                .maybe_run_retrospective(
+                    user_id,
+                    assistant_id,
+                    Some(conversation_id),
+                    generator,
+                    "reflector",
+                    "thread summary review",
+                    false,
+                )
+                .await;
             info!(
                 conversation_id,
                 assistant_id,

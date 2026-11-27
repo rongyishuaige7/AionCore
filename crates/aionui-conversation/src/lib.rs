@@ -41,7 +41,7 @@ pub use error::ConversationError;
 pub use keeper_debrief::lock_role_pass;
 pub use response_middleware::{MessageMiddleware, MiddlewareResult, strip_think_tags};
 pub use role_retrospective::{
-    CONDENSE_BATCH_SIZE, DREAMER_CURATE_THRESHOLD_BYTES, RoleDreamTasksOutcome, RoleRetrospectiveContext,
+    CONDENSE_BATCH_SIZE, DREAMER_CURATE_THRESHOLD_BYTES, RoleDreamTasksOutcome, RoleRetrospectiveContext, dreamer_due,
 };
 pub use role_thread::{Line, RoleThreadMark, RoleThreadState, Speaker, is_unfinished_text_row, lines_of};
 pub use routes::conversation_routes;

@@ -13,7 +13,7 @@ use aionui_api_types::PlaybookDeltaOp;
 use aionui_common::now_ms;
 use aionui_db::{MessagePageDirection, MessagePageParams};
 use serde::Deserialize;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::role_thread::{RoleThreadMark, clean_leaf, lines_of};
 use crate::service::{ConversationRolePort, ConversationService};
@@ -26,6 +26,40 @@ const WEEKLY_RETROSPECTIVE_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
 pub const DREAMER_CURATE_THRESHOLD_BYTES: usize = 48 * 1024;
 /// Number of `D0` leaves merged into one condensed summary leaf (`D1`).
 pub const CONDENSE_BATCH_SIZE: usize = 6;
+
+const HOUR_MS: i64 = 60 * 60 * 1_000;
+/// A dreamer pass never comes sooner than this after the last one.
+const DREAMER_MIN_GAP_MS: i64 = 2 * HOUR_MS;
+/// How long the user has sent nothing before the daily pass may run: the
+/// user's own night, wherever the machine's clock says it is.
+pub const DREAMER_QUIET_MS: i64 = 2 * HOUR_MS;
+/// The daily pass, once the user is quiet.
+const DREAMER_DAILY_MS: i64 = 20 * HOUR_MS;
+/// A role whose user never goes quiet that long still gets its pass.
+const DREAMER_OVERDUE_MS: i64 = 44 * HOUR_MS;
+
+/// Whether a role's dreamer pass is due at `now`. `last_dreamer_at` is when
+/// the last pass ended (0 if never), `last_failed` whether a step it was due
+/// to do failed, `user_quiet_for` how long the user has sent no message, and
+/// `near_memory_cap` whether the memory is close to its cap. Passes stay at
+/// least two hours apart; a failed one is retried as soon as the user is
+/// quiet again.
+pub fn dreamer_due(
+    now: i64,
+    last_dreamer_at: i64,
+    last_failed: bool,
+    user_quiet_for: i64,
+    near_memory_cap: bool,
+) -> bool {
+    let since = now.saturating_sub(last_dreamer_at);
+    if since < DREAMER_MIN_GAP_MS {
+        return false;
+    }
+    if near_memory_cap || since >= DREAMER_OVERDUE_MS {
+        return true;
+    }
+    user_quiet_for >= DREAMER_QUIET_MS && (since >= DREAMER_DAILY_MS || last_failed)
+}
 const END_MARKER: &str = "[end]";
 
 /// Current role state supplied to a retrospective pass by [`ConversationRolePort`].
@@ -43,6 +77,8 @@ pub struct RoleDreamTasksOutcome {
     pub curated_memory: Option<String>,
     pub retrospective_ran: bool,
     pub condensed_batches: usize,
+    /// Why a step that was due did not get done, for the role's dreamer state.
+    pub error: Option<String>,
 }
 
 const RETROSPECTIVE_INSTRUCTIONS: &str = "\
@@ -131,6 +167,8 @@ pub(crate) fn condensed_span_header(leaves: &[String]) -> String {
 impl ConversationService {
     /// Run a retrospective pass for `assistant_id` if at least 24h have elapsed
     /// since `last_retrospective_at` (or immediately when `force` is true).
+    /// `Ok(false)` when there was nothing to review, `Err` with a short reason
+    /// when the engine could not write one.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn maybe_run_retrospective(
         &self,
@@ -141,19 +179,19 @@ impl ConversationService {
         actor: &str,
         reason: &str,
         force: bool,
-    ) -> bool {
+    ) -> Result<bool, String> {
         let Some(port) = self.role_port() else {
-            return false;
+            return Ok(false);
         };
         let Some(ctx) = port.retrospective_context(user_id, assistant_id).await else {
-            return false;
+            return Ok(false);
         };
         let now = now_ms();
         if !force
             && ctx.last_retrospective_at > 0
             && now.saturating_sub(ctx.last_retrospective_at) < RETROSPECTIVE_MIN_INTERVAL_MS
         {
-            return false;
+            return Ok(false);
         }
 
         let evidence = self
@@ -167,7 +205,7 @@ impl ConversationService {
             )
             .await;
         if evidence.trim().is_empty() {
-            return false;
+            return Ok(false);
         }
 
         let mut prompt = String::from(RETROSPECTIVE_INSTRUCTIONS);
@@ -196,12 +234,12 @@ impl ConversationService {
             match tokio::time::timeout(SUMMARY_TIMEOUT + Duration::from_secs(30), generator.summarize(&prompt)).await {
                 Ok(Ok(ans)) => ans,
                 Ok(Err(error)) => {
-                    debug!(assistant_id, error = %error, "role retrospective: summarize unsupported or failed");
-                    return false;
+                    warn!(assistant_id, error = %error, "role retrospective: summarize failed");
+                    return Err(format!("retrospective: {error}"));
                 }
                 Err(_) => {
                     warn!(assistant_id, "role retrospective: summarize timed out");
-                    return false;
+                    return Err("retrospective: timed out".to_owned());
                 }
             };
 
@@ -210,7 +248,7 @@ impl ConversationService {
                 assistant_id,
                 "role retrospective: model answer was not valid delta JSON"
             );
-            return false;
+            return Err("retrospective: the answer was not valid JSON".to_owned());
         };
 
         port.apply_retrospective(assistant_id, &playbook_ops, &boss_ops, actor, reason, now)
@@ -221,7 +259,7 @@ impl ConversationService {
             boss_ops = boss_ops.len(),
             "role retrospective completed"
         );
-        true
+        Ok(true)
     }
 
     async fn gather_retrospective_evidence(
@@ -333,9 +371,17 @@ impl ConversationService {
                     .await
                 {
                     Ok(Ok(ans)) => ans,
-                    _ => break,
+                    Ok(Err(error)) => {
+                        warn!(assistant_id, error = %error, "role leaves: condensing failed");
+                        break;
+                    }
+                    Err(_) => {
+                        warn!(assistant_id, "role leaves: condensing timed out");
+                        break;
+                    }
                 };
             let Some(summary) = clean_leaf(&answer) else {
+                warn!(assistant_id, "role leaves: condensed summary was cut off");
                 break;
             };
             let header = condensed_span_header(&batch);
@@ -380,33 +426,45 @@ impl ConversationService {
             return outcome;
         };
 
+        // The dreamer writes on the role's behalf, so it takes the isolated
+        // summarizer, which needs no reply of this runtime to have succeeded:
+        // a runtime woken for the pass has had none.
         let generator = if let Some(live) = task_manager.get_task(&conv_id) {
-            live.title_generator().await
+            live.summarizer().await
         } else {
             match self
                 .ensure_runtime_agent(user_id, &conv_id, task_manager, "role_dreamer")
                 .await
             {
-                Ok((agent, _)) => agent.title_generator().await,
+                Ok((agent, _)) => agent.summarizer().await,
                 Err(error) => {
-                    debug!(assistant_id, conversation_id = %conv_id, error = %error, "role dreamer: runtime unavailable for summarize");
-                    None
+                    warn!(assistant_id, conversation_id = %conv_id, error = %error, "role dreamer: runtime unavailable");
+                    outcome.error = Some(format!("engine unavailable: {error}"));
+                    return outcome;
                 }
             }
         };
         let Some(generator) = generator else {
+            warn!(assistant_id, conversation_id = %conv_id, "role dreamer: the engine has no summarizer");
+            outcome.error = Some("the engine has no summarizer".to_owned());
             return outcome;
         };
+        let mut errors = Vec::new();
 
         // 1. Verify & curate `MEMORY.md` when approaching the 64 KiB cap (>= 48 KiB)
         //    or when it has grown past 25 lines during a dreamer pass.
         let line_count = current_memory.lines().filter(|l| !l.trim().is_empty()).count();
-        if (current_memory.len() >= DREAMER_CURATE_THRESHOLD_BYTES || line_count >= 25)
-            && let Some(curated) = self
+        if current_memory.len() >= DREAMER_CURATE_THRESHOLD_BYTES || line_count >= 25 {
+            match self
                 .verify_and_curate_memory(assistant_id, thread_conversation_id, current_memory, generator.as_ref())
                 .await
-        {
-            outcome.curated_memory = Some(curated);
+            {
+                Ok(curated) => outcome.curated_memory = Some(curated),
+                Err(error) => {
+                    warn!(assistant_id, error = %error, "role dreamer: memory not curated");
+                    errors.push(error);
+                }
+            }
         }
 
         // 2. Retrospective (weekly in background dreamer, or immediately when forced).
@@ -420,7 +478,7 @@ impl ConversationService {
             false
         };
         if due_weekly {
-            outcome.retrospective_ran = self
+            match self
                 .maybe_run_retrospective(
                     user_id,
                     assistant_id,
@@ -430,7 +488,11 @@ impl ConversationService {
                     "nightly retrospective",
                     true,
                 )
-                .await;
+                .await
+            {
+                Ok(ran) => outcome.retrospective_ran = ran,
+                Err(error) => errors.push(error),
+            }
         }
 
         // 3. LCM leaf condensation (`D0` -> `condensed/`).
@@ -441,6 +503,9 @@ impl ConversationService {
             port.catch_up_recall(user_id, assistant_id).await;
         }
 
+        if !errors.is_empty() {
+            outcome.error = Some(errors.join("; "));
+        }
         outcome
     }
 
@@ -450,7 +515,7 @@ impl ConversationService {
         thread_conversation_id: Option<&str>,
         current_memory: &str,
         generator: &dyn TitleGenerator,
-    ) -> Option<String> {
+    ) -> Result<String, String> {
         let mut prompt = String::from(VERIFY_AND_CURATE_INSTRUCTIONS);
         if let Some(port) = self.role_port()
             && let Some(tid) = thread_conversation_id
@@ -466,17 +531,46 @@ impl ConversationService {
         prompt.push_str(current_memory.trim());
         prompt.push_str("\n</memory>");
 
-        let answer = tokio::time::timeout(SUMMARY_TIMEOUT + Duration::from_secs(30), generator.summarize(&prompt))
-            .await
-            .ok()?
-            .ok()?;
-        clean_leaf(&answer)
+        let answer =
+            match tokio::time::timeout(SUMMARY_TIMEOUT + Duration::from_secs(30), generator.summarize(&prompt)).await {
+                Ok(Ok(answer)) => answer,
+                Ok(Err(error)) => return Err(format!("curate: {error}")),
+                Err(_) => return Err("curate: timed out".to_owned()),
+            };
+        clean_leaf(&answer).ok_or_else(|| "curate: the answer was cut off".to_owned())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const NOW: i64 = 1_000 * HOUR_MS;
+
+    #[test]
+    fn dreamer_waits_for_the_user_to_go_quiet() {
+        let day_ago = NOW - 21 * HOUR_MS;
+        assert!(!dreamer_due(NOW, day_ago, false, HOUR_MS, false));
+        assert!(dreamer_due(NOW, day_ago, false, DREAMER_QUIET_MS, false));
+        // A role never run before goes on the first quiet stretch.
+        assert!(dreamer_due(NOW, 0, false, DREAMER_QUIET_MS, false));
+    }
+
+    #[test]
+    fn dreamer_runs_once_a_day_and_retries_a_failed_pass() {
+        let hours_ago = NOW - 3 * HOUR_MS;
+        assert!(!dreamer_due(NOW, hours_ago, false, 10 * HOUR_MS, false));
+        assert!(dreamer_due(NOW, hours_ago, true, 10 * HOUR_MS, false));
+        // Never sooner than the gap, failed or near the cap.
+        let just_now = NOW - HOUR_MS;
+        assert!(!dreamer_due(NOW, just_now, true, 10 * HOUR_MS, true));
+    }
+
+    #[test]
+    fn dreamer_goes_anyway_when_overdue_or_near_the_cap() {
+        assert!(dreamer_due(NOW, NOW - 45 * HOUR_MS, false, 0, false));
+        assert!(dreamer_due(NOW, NOW - 3 * HOUR_MS, false, 0, true));
+    }
 
     #[test]
     fn retrospective_parser_extracts_delta_ops_and_ignores_fences_or_think_tags() {

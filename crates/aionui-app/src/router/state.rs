@@ -1303,13 +1303,17 @@ impl RoleGovernanceAdapter {
             }
         }
 
-        let _ = self.roles.mark_dreamer_ran(role_id, aionui_common::now_ms()).await;
+        let _ = self
+            .roles
+            .mark_dreamer_ran(role_id, aionui_common::now_ms(), llm_outcome.error.as_deref())
+            .await;
         Ok(aionui_api_types::RoleDreamResponse {
             decayed_playbook,
             archived_progress,
             curated_memory,
             retrospective_ran: llm_outcome.retrospective_ran,
             condensed_batches: llm_outcome.condensed_batches,
+            error: llm_outcome.error,
         })
     }
 }
@@ -1537,9 +1541,13 @@ async fn reconcile_drifted_role_threads(adapter: &RoleGovernanceAdapter) {
     }
 }
 
+/// Go over every resident role while the user is away: every half hour, a
+/// role whose pass is due (see [`aionui_conversation::dreamer_due`]) gets one.
+/// "Away" is read from what the user does, not from the machine's clock, so
+/// it follows the user's own night wherever the machine keeps its time.
 fn spawn_role_dreamer_loop(adapter: Arc<RoleGovernanceAdapter>) {
-    use chrono::Timelike;
-
+    // Starting the backend is the user's doing: quiet time counts from here.
+    aionui_common::note_user_activity();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(30 * 60));
         // Skip the immediate startup tick so boot stays instant.
@@ -1549,15 +1557,16 @@ fn spawn_role_dreamer_loop(adapter: Arc<RoleGovernanceAdapter>) {
             let Ok(roles) = adapter.roles.list().await else {
                 continue;
             };
-            let now = aionui_common::now_ms();
-            let hour = chrono::Local::now().hour();
-            let is_night_window = (2..6).contains(&hour);
-
             for role in roles {
-                let (_, last_dreamer_at) = adapter.roles.dreamer_timestamps(&role.id).await.unwrap_or((0, 0));
+                let now = aionui_common::now_ms();
                 let near_memory_cap = role.memory.len() >= aionui_conversation::DREAMER_CURATE_THRESHOLD_BYTES;
-                let due_nightly = is_night_window && now.saturating_sub(last_dreamer_at) >= 20 * 60 * 60 * 1_000;
-                if !near_memory_cap && !due_nightly {
+                if !aionui_conversation::dreamer_due(
+                    now,
+                    role.dreamer.last_dreamer_at,
+                    role.dreamer.last_error.is_some(),
+                    aionui_common::user_quiet_for(now),
+                    near_memory_cap,
+                ) {
                     continue;
                 }
                 if let Err(error) = adapter.run_dreamer_pass("system_default_user", &role.id, false).await {
