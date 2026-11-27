@@ -15,10 +15,20 @@ use crate::event::{
 /// Rewrite agy's terminal error into something the user can act on.
 ///
 /// agy reports a signed-out run as `authentication failed or timed out`, which
-/// tells the user nothing about what to do. Everything else is passed through
-/// unchanged rather than guessed at.
+/// tells the user nothing about what to do. The same words also come back when
+/// the sign-in check with Google merely timed out, which a proxy does now and
+/// then: runs half an hour either side of such a failure went through with
+/// nobody signing in again. So the message names both and does not send the
+/// user off to sign in when that is usually not it. Everything else is passed
+/// through unchanged rather than guessed at.
 pub(crate) fn explain_turn_error(raw: &str) -> String {
     let lower = raw.to_ascii_lowercase();
+    if lower.contains("timed out") && lower.contains("authentication") {
+        return format!(
+            "Antigravity could not confirm its Google sign-in: the check timed out, usually on the network or proxy, \
+             or it is signed out. If it keeps failing, run `agy` in a terminal to check the sign-in. (agy: {raw})"
+        );
+    }
     if lower.contains("authentication") || lower.contains("not logged in") || lower.contains("sign in") {
         return format!(
             "Antigravity is not signed in. Run `agy` in a terminal to log in with your Google account, then try again. (agy: {raw})"
@@ -864,6 +874,15 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_sign_in_check_that_may_have_timed_out_is_not_called_a_sign_out() {
+        let text = explain_turn_error("authentication failed or timed out");
+        assert!(!text.contains("is not signed in"), "{text}");
+        assert!(text.contains("timed out") && text.contains("proxy"), "{text}");
+        // An unambiguous refusal still says what it is.
+        assert!(explain_turn_error("authentication failed").contains("is not signed in"));
     }
 
     #[test]

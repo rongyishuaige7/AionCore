@@ -29,6 +29,10 @@ use crate::types::{CronJob, ExecutionMode};
 
 pub const RETRY_INTERVAL_MS: u64 = 30_000;
 pub const MAX_RETRIES_DEFAULT: i64 = 3;
+/// How long a run waits before each further try of a turn that failed
+/// without having done anything, when the conversation layer says it may.
+/// Long enough for a dropped connection or a slow sign-in check to pass.
+const TRANSIENT_RETRY_DELAYS_MS: [u64; 2] = [30_000, 90_000];
 const DEPRECATED_AGENT_TYPE_MESSAGE: &str = "This agent type is no longer supported for new conversations.";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecutionResult {
@@ -134,6 +138,7 @@ pub struct JobExecutor {
     broadcaster: Arc<dyn EventBroadcaster>,
     agent_registry: Arc<AgentRegistry>,
     skill_suggest_detector: SkillSuggestDetector,
+    transient_retry_delays_ms: Vec<u64>,
 }
 
 impl JobExecutor {
@@ -159,7 +164,14 @@ impl JobExecutor {
             broadcaster,
             agent_registry,
             skill_suggest_detector,
+            transient_retry_delays_ms: TRANSIENT_RETRY_DELAYS_MS.to_vec(),
         }
+    }
+
+    #[cfg(test)]
+    fn with_transient_retry_delays(mut self, delays_ms: Vec<u64>) -> Self {
+        self.transient_retry_delays_ms = delays_ms;
+        self
     }
 
     /// Wires the inbox a run is delivered to when its conversation has one.
@@ -1007,7 +1019,7 @@ impl JobExecutor {
             }) as ConversationAgentTurnStartedCallback)
         };
 
-        let turn_req = ConversationAgentTurnRequest {
+        let mut turn_req = ConversationAgentTurnRequest {
             user_id: user_id.clone(),
             conversation_id: conversation_id.to_owned(),
             content: prompt,
@@ -1019,7 +1031,34 @@ impl JobExecutor {
             on_started,
         };
 
-        match self.conversation_service.run_agent_turn(turn_req).await {
+        // A turn that failed before it did anything, on an error that may pass
+        // (a dropped connection, a sign-in check that timed out), is tried
+        // again in the same conversation: nobody is there to press retry.
+        let mut tries = 0;
+        let turn = loop {
+            let turn = self.conversation_service.run_agent_turn(turn_req.clone()).await;
+            let Ok(outcome) = &turn else { break turn };
+            let delay = self.transient_retry_delays_ms.get(tries).copied();
+            let (ConversationAgentTurnStatus::Failed, true, Some(delay)) =
+                (outcome.status, outcome.auto_retry_allowed, delay)
+            else {
+                break turn;
+            };
+            tries += 1;
+            warn!(
+                job_id = %job.id,
+                conversation_id,
+                attempt = tries,
+                delay_ms = delay,
+                error = outcome.error_message.as_deref().unwrap_or_default(),
+                "Cron turn failed before doing anything; trying again"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            // The prompt is already in the conversation once.
+            turn_req.persist_user_message = false;
+        };
+
+        match turn {
             Ok(outcome) => {
                 if outcome.status == ConversationAgentTurnStatus::Failed {
                     return ExecutionResult::Error {
@@ -2469,6 +2508,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_run_that_failed_before_doing_anything_tries_again_in_its_conversation() {
+        let agent = Arc::new(RecordingAgent::new("conv_1", "default", true).failing_first(1));
+        let task_manager = Arc::new(RecordingTaskManager::new(AgentInstance::Mock(agent.clone())));
+        let executor = make_executor_with_task_manager(task_manager).with_transient_retry_delays(vec![1, 1]);
+        let job = CronJob {
+            execution_mode: ExecutionMode::NewConversation,
+            ..sample_job()
+        };
+
+        let result = executor.execute_inner(&job, "conv_1", None).await;
+
+        assert_eq!(
+            result,
+            ExecutionResult::Success {
+                conversation_id: "conv_1".into()
+            }
+        );
+        assert_eq!(agent.send_calls(), 2, "one failed try, then the one that went through");
+        let sent = agent.sent_messages().await;
+        assert_eq!(sent[0].content, sent[1].content, "the same prompt both times");
+    }
+
+    #[tokio::test]
+    async fn a_run_stops_trying_once_its_tries_are_spent() {
+        let agent = Arc::new(RecordingAgent::new("conv_1", "default", true).failing_first(5));
+        let task_manager = Arc::new(RecordingTaskManager::new(AgentInstance::Mock(agent.clone())));
+        let executor = make_executor_with_task_manager(task_manager).with_transient_retry_delays(vec![1, 1]);
+        let job = CronJob {
+            execution_mode: ExecutionMode::NewConversation,
+            ..sample_job()
+        };
+
+        let result = executor.execute_inner(&job, "conv_1", None).await;
+
+        assert!(matches!(result, ExecutionResult::Error { .. }), "{result:?}");
+        assert_eq!(agent.send_calls(), 3, "the first try and two more");
+    }
+
+    #[tokio::test]
+    async fn a_run_that_had_started_answering_is_not_tried_again() {
+        let agent = Arc::new(
+            RecordingAgent::new("conv_1", "default", true)
+                .failing_first(1)
+                .failing_after_text(),
+        );
+        let task_manager = Arc::new(RecordingTaskManager::new(AgentInstance::Mock(agent.clone())));
+        let executor = make_executor_with_task_manager(task_manager).with_transient_retry_delays(vec![1, 1]);
+        let job = CronJob {
+            execution_mode: ExecutionMode::NewConversation,
+            ..sample_job()
+        };
+
+        let result = executor.execute_inner(&job, "conv_1", None).await;
+
+        assert!(matches!(result, ExecutionResult::Error { .. }), "{result:?}");
+        assert_eq!(agent.send_calls(), 1);
+    }
+
+    #[tokio::test]
     async fn execute_inner_returns_conversation_turn_error_message() {
         let executor = make_executor_with_task_manager(Arc::new(FailingTaskManager::new(
             "ACP init failed: config file is invalid",
@@ -3046,6 +3144,11 @@ mod tests {
         initialized: bool,
         set_mode_calls: AtomicUsize,
         send_calls: AtomicUsize,
+        agent_type: AgentType,
+        /// Sends that fail with a retryable error before saying or doing anything.
+        clean_failures: AtomicUsize,
+        /// Whether a failing send streams some text before its error.
+        fail_after_text: bool,
     }
 
     impl RecordingAgent {
@@ -3061,7 +3164,22 @@ mod tests {
                 initialized,
                 set_mode_calls: AtomicUsize::new(0),
                 send_calls: AtomicUsize::new(0),
+                agent_type: AgentType::Acp,
+                clean_failures: AtomicUsize::new(0),
+                fail_after_text: false,
             }
+        }
+
+        /// A direct-CLI engine fails its first `count` sends on a dropped connection.
+        fn failing_first(mut self, count: usize) -> Self {
+            self.agent_type = AgentType::Antigravity;
+            self.clean_failures = AtomicUsize::new(count);
+            self
+        }
+
+        fn failing_after_text(mut self) -> Self {
+            self.fail_after_text = true;
+            self
         }
 
         fn with_text_response(mut self, content: &str) -> Self {
@@ -3089,7 +3207,7 @@ mod tests {
     #[async_trait::async_trait]
     impl IAgentTask for RecordingAgent {
         fn agent_type(&self) -> AgentType {
-            AgentType::Acp
+            self.agent_type
         }
 
         fn conversation_id(&self) -> &str {
@@ -3115,6 +3233,23 @@ mod tests {
         async fn send_message(&self, data: SendMessageData) -> Result<(), aionui_ai_agent::AgentSendError> {
             self.send_calls.fetch_add(1, Ordering::Relaxed);
             self.sent_messages.write().await.push(data);
+            let failing = self
+                .clean_failures
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| left.checked_sub(1))
+                .is_ok();
+            if failing {
+                if self.fail_after_text {
+                    let _ = self.event_tx.send(AgentStreamEvent::Text(TextEventData {
+                        content: "Checking the links".into(),
+                    }));
+                }
+                let error = aionui_ai_agent::AgentSendError::from_agent_error(
+                    aionui_ai_agent::AgentError::bad_gateway("connection error"),
+                )
+                .into_stream_error();
+                let _ = self.event_tx.send(AgentStreamEvent::Error(error));
+                return Ok(());
+            }
             if let Some(content) = self.response_text.as_ref() {
                 let _ = self.event_tx.send(AgentStreamEvent::Text(TextEventData {
                     content: content.clone(),
