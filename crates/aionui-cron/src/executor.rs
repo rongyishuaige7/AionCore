@@ -984,7 +984,7 @@ impl JobExecutor {
         };
 
         let prompt = self
-            .with_standing_role(job, conversation_id, build_prompt(job, saved_skill))
+            .with_standing_role(job, conversation_id, with_clock(build_prompt(job, saved_skill)))
             .await;
         let user_id = match self.resolve_target_conversation_user_id(conversation_id).await {
             Ok(user_id) => user_id,
@@ -1447,6 +1447,20 @@ async fn record_cron_trigger(
             warn!(job_id = %job.id, conversation_id, error = %e, "Failed to persist cron trigger artifact");
         }
     }
+}
+
+/// Leads a run's prompt with the time it starts on the user's clock, so "today"
+/// in a task means the user's day and not the host's.
+fn with_clock(prompt: String) -> String {
+    format!("{}\n{prompt}", clock_line(&aionui_common::user_now()))
+}
+
+fn clock_line(now: &chrono::DateTime<chrono_tz::Tz>) -> String {
+    format!(
+        "[Current time: {}, {}]",
+        now.format("%Y-%m-%d %H:%M %A"),
+        now.timezone().name()
+    )
 }
 
 fn build_prompt(job: &CronJob, saved_skill: Option<&SavedSkillContext>) -> String {
@@ -1918,6 +1932,20 @@ mod tests {
         };
         let prompt = build_prompt(&job, None);
         assert!(prompt.contains("create a file named \"SKILL_SUGGEST.md\""));
+    }
+
+    #[test]
+    fn a_run_is_told_the_time_on_the_users_clock() {
+        use chrono::TimeZone;
+        // 2026-11-27 14:30 UTC is 22:30 that Friday in Shanghai.
+        let at = chrono_tz::Asia::Shanghai
+            .timestamp_millis_opt(1_795_789_800_000)
+            .unwrap();
+        assert_eq!(
+            clock_line(&at),
+            "[Current time: 2026-11-27 22:30 Friday, Asia/Shanghai]"
+        );
+        assert!(with_clock("Task instruction".to_owned()).ends_with("]\nTask instruction"));
     }
 
     #[test]
@@ -2652,7 +2680,8 @@ mod tests {
         executor.execute_inner(&sample_job(), "conv_1", None).await;
         wait_for_agent_send(&agent, 1).await;
         let role_run = agent.sent_messages().await[0].content.clone();
-        assert!(role_run.starts_with("## Your Standing Role\n\nWatches the news.\n\n[Scheduled Task Execution]"));
+        assert!(role_run.starts_with("## Your Standing Role\n\nWatches the news.\n\n[Current time: "));
+        assert!(role_run.contains("]\n[Scheduled Task Execution]"));
         assert!(role_run.ends_with("do something"));
 
         // The same task run as an assistant that is no role is sent as before.
@@ -2661,7 +2690,8 @@ mod tests {
         executor.execute_inner(&plain_job, "conv_1", None).await;
         wait_for_agent_send(&agent, 2).await;
         let plain_run = agent.sent_messages().await[1].content.clone();
-        assert!(plain_run.starts_with("[Scheduled Task Execution]"));
+        assert!(plain_run.starts_with("[Current time: "));
+        assert!(plain_run.contains("]\n[Scheduled Task Execution]"));
     }
 
     #[tokio::test]

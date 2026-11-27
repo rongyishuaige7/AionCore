@@ -747,7 +747,7 @@ impl aionui_team::TeamRolePort for RoleServiceTeamPort {
         note: &str,
     ) -> Result<Option<aionui_team::TeamRoleMemoryNote>, String> {
         // Notes carry the day they were written, in the user's own time zone.
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let today = aionui_common::user_today();
         match self.service.remember(assistant_id, note, &today).await {
             Ok(noted) => Ok(Some(aionui_team::TeamRoleMemoryNote {
                 line: noted.line,
@@ -1289,7 +1289,7 @@ impl RoleGovernanceAdapter {
         let _pass = aionui_conversation::lock_role_pass(role_id).await;
         let role = self.roles.get(role_id).await.map_err(|e| e.to_string())?;
         let now = aionui_common::now_ms();
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let today = aionui_common::user_today();
         let (decayed_playbook, archived_progress) = self
             .roles
             .run_zero_llm_decay(role_id, &today, now)
@@ -1311,7 +1311,7 @@ impl RoleGovernanceAdapter {
         let mut curated_memory = false;
         let mut error = llm_outcome.error;
         if let Some(tidied) = llm_outcome.curated_memory {
-            let stamp = chrono::Local::now().format("%Y-%m-%d-%H%M%S").to_string();
+            let stamp = aionui_common::user_now().format("%Y-%m-%d-%H%M%S").to_string();
             // Only over the memory the dreamer read: a note the user took
             // back meanwhile is not brought back by the tidied copy.
             match self
@@ -1624,22 +1624,13 @@ const RETROSPECTIVE_TASK_CHARS: usize = 300;
 /// The minute of a millisecond timestamp in the user's own time zone
 /// (`YYYY-MM-DD HH:MM`), empty for a timestamp that names no moment.
 fn local_minute(timestamp_ms: i64) -> String {
-    chrono::DateTime::from_timestamp_millis(timestamp_ms)
-        .map(|moment| {
-            moment
-                .with_timezone(&chrono::Local)
-                .format("%Y-%m-%d %H:%M")
-                .to_string()
-        })
-        .unwrap_or_default()
+    aionui_common::user_minute(timestamp_ms)
 }
 
 /// The day of a millisecond timestamp in the user's own time zone
 /// (`YYYY-MM-DD`), empty for a timestamp that names no moment.
 fn local_day(timestamp_ms: i64) -> String {
-    chrono::DateTime::from_timestamp_millis(timestamp_ms)
-        .map(|moment| moment.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string())
-        .unwrap_or_default()
+    aionui_common::user_day(timestamp_ms)
 }
 
 /// Adapts the concrete conversation / team / project services to the sidebar's

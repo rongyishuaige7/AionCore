@@ -128,7 +128,7 @@ async fn remember(
         );
     }
     // Notes carry the day they were written, in the user's own time zone.
-    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let today = aionui_common::user_today();
     match state.roles.remember(&role.id, &request.note, &today).await {
         Ok(noted) => success(
             COMMAND,
@@ -168,7 +168,7 @@ async fn curate(
     }
     // The replaced memory is filed under the moment it was replaced, in the
     // user's own time zone.
-    let stamp = chrono::Local::now().format("%Y-%m-%d-%H%M%S").to_string();
+    let stamp = aionui_common::user_now().format("%Y-%m-%d-%H%M%S").to_string();
     match state.roles.curate_memory(&role.id, &request.memory, &stamp).await {
         Ok(curated) => success(
             COMMAND,

@@ -333,7 +333,7 @@ async fn dream_role(
             .map_err(|msg| ApiError::coded(StatusCode::BAD_REQUEST, "role_dream_failed", msg, None))?;
         return Ok(Json(ApiResponse::ok(report)));
     }
-    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let today = aionui_common::user_today();
     let now = now_ms();
     let (decayed_playbook, archived_progress) = state
         .service

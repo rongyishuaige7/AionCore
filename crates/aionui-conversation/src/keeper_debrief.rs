@@ -342,11 +342,11 @@ impl Drop for Scratch {
 
 /// The user's local day as `YYYY-MM-DD`, and when it began (ms).
 fn local_day() -> (String, i64) {
-    let now = chrono::Local::now();
+    let now = aionui_common::user_now();
     let start = now
         .date_naive()
         .and_hms_opt(0, 0, 0)
-        .and_then(|midnight| midnight.and_local_timezone(chrono::Local).earliest())
+        .and_then(|midnight| midnight.and_local_timezone(now.timezone()).earliest())
         .map_or(0, |midnight| midnight.timestamp_millis());
     (now.format("%Y-%m-%d").to_string(), start)
 }

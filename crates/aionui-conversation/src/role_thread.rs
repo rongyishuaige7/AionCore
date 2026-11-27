@@ -202,14 +202,7 @@ pub(crate) fn recent_start(lines: &[Line], rounds: usize) -> usize {
 
 /// The minute of a millisecond timestamp in the user's own time zone.
 fn minute(timestamp_ms: i64) -> String {
-    chrono::DateTime::from_timestamp_millis(timestamp_ms)
-        .map(|moment| {
-            moment
-                .with_timezone(&chrono::Local)
-                .format("%Y-%m-%d %H:%M")
-                .to_string()
-        })
-        .unwrap_or_default()
+    aionui_common::user_minute(timestamp_ms)
 }
 
 /// `text` cut to `cap` characters, keeping its start and end.

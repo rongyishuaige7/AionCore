@@ -29,7 +29,7 @@ use crate::follow_up::{
 };
 use crate::scheduler::{
     CronScheduler, MissedRun, compute_next_run, compute_next_run_after_occurrence, missed_run, slept_between,
-    validate_schedule, validate_timezone,
+    validate_schedule,
 };
 use crate::skill_file::{
     cron_skill_dir, cron_skill_name, delete_skill_file, has_skill_file, parse_skill_content, read_skill_content,
@@ -2708,24 +2708,18 @@ fn schedule_from_dto_with_existing_timezone(dto: &CronScheduleDto, existing: &Cr
     }
 }
 
-/// Resolve the host's IANA timezone name (e.g. `"Asia/Shanghai"`).
+/// Resolve the user's IANA timezone name (e.g. `"Asia/Shanghai"`): the one
+/// the user set, else the host's.
 ///
-/// Returns `None` when the local zone cannot be detected or is not present in
-/// the tz database; the caller then leaves the schedule without a timezone and
-/// the scheduler falls back to UTC.
+/// Returns `None` when neither names a zone the tz database knows; the caller
+/// then leaves the schedule without a timezone and the scheduler falls back to
+/// UTC.
 fn local_timezone_name() -> Option<String> {
-    let tz = match iana_time_zone::get_timezone() {
-        Ok(tz) => tz,
-        Err(err) => {
-            warn!(error = %err, "Failed to detect local timezone; conversation cron will use UTC");
-            return None;
-        }
-    };
-    if validate_timezone(&tz).is_err() {
-        warn!(timezone = %tz, "Local timezone not recognized by tz database; conversation cron will use UTC");
-        return None;
+    let tz = aionui_common::user_time_zone_name();
+    if tz.is_none() {
+        warn!("No user or host timezone recognized by the tz database; conversation cron will use UTC");
     }
-    Some(tz)
+    tz.map(str::to_owned)
 }
 
 /// Build the schedule for a conversation cron created via `cron current create`.
@@ -2762,6 +2756,7 @@ fn schedule_to_row_fields(schedule: &CronSchedule) -> (String, String, Option<St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scheduler::validate_timezone;
 
     // -- conversation cron timezone --------------------------------------------
 
@@ -2773,9 +2768,9 @@ mod tests {
         };
         assert_eq!(expr, "0 0 12 * * *");
         assert_eq!(description.as_deref(), Some("every day at 12:00"));
-        // The bare request has no timezone; the builder must stamp the host's
-        // local zone (previously hardcoded to None, which the scheduler treats
-        // as UTC).
+        // The bare request has no timezone; the builder must stamp the user's
+        // zone (previously hardcoded to None, which the scheduler treats as
+        // UTC).
         assert_eq!(tz, local_timezone_name());
         if let Some(tz) = tz {
             assert!(validate_timezone(&tz).is_ok(), "stamped timezone must be valid: {tz}");
@@ -2784,9 +2779,9 @@ mod tests {
 
     #[test]
     fn conversation_cron_fires_at_local_wall_clock() {
-        use chrono::{Local, TimeZone, Timelike};
+        use chrono::{TimeZone, Timelike};
 
-        // Only meaningful when the host's zone is detectable; otherwise the
+        // Only meaningful when the user's zone is detectable; otherwise the
         // schedule intentionally degrades to UTC (covered by the wiring test).
         if local_timezone_name().is_none() {
             return;
@@ -2797,10 +2792,11 @@ mod tests {
         // firing at the wrong hour on any non-UTC host.
         let dto = conversation_cron_schedule("0 0 12 * * *".into(), "every day at 12:00".into());
         let schedule = schedule_from_dto(&dto);
-        let now = Local.with_ymd_and_hms(2026, 7, 21, 8, 0, 0).unwrap().timestamp_millis();
+        let zone = aionui_common::user_time_zone();
+        let now = zone.with_ymd_and_hms(2026, 7, 21, 8, 0, 0).unwrap().timestamp_millis();
 
         let next = compute_next_run(&schedule, now).expect("cron should produce a next run");
-        let next_hour = Local.timestamp_millis_opt(next).single().unwrap().hour();
+        let next_hour = zone.timestamp_millis_opt(next).single().unwrap().hour();
 
         assert_eq!(
             next_hour, 12,

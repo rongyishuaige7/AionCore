@@ -15,7 +15,7 @@ use aionui_api_types::{
     RoleExpandMessage, RoleExpandRequest, RoleExpandResponse, RoleRecallBound, RoleRecallHit, RoleRecallKind,
     RoleRecallRequest, RoleRecallResponse, RoleRecallScope, RoleRecallSource,
 };
-use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, TimeZone};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone};
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, ErrorCode, OptionalExtension, params, params_from_iter};
 
@@ -599,7 +599,7 @@ fn parse_bound(bound: &RoleRecallBound, field: &str) -> Result<i64, RoleError> {
             }
             if let Ok(date) = NaiveDate::parse_from_str(text, "%Y-%m-%d")
                 && let Some(naive) = date.and_hms_opt(0, 0, 0)
-                && let Some(local) = Local.from_local_datetime(&naive).earliest()
+                && let Some(local) = aionui_common::user_time_zone().from_local_datetime(&naive).earliest()
             {
                 return Ok(local.timestamp_millis());
             }
@@ -618,7 +618,7 @@ fn parse_local_datetime_ms(text: &str) -> Option<i64> {
         "%Y-%m-%dT%H:%M",
     ] {
         if let Ok(naive) = NaiveDateTime::parse_from_str(text, fmt)
-            && let Some(local) = Local.from_local_datetime(&naive).earliest()
+            && let Some(local) = aionui_common::user_time_zone().from_local_datetime(&naive).earliest()
         {
             return Some(local.timestamp_millis());
         }

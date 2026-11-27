@@ -10,6 +10,10 @@ pub struct SystemInfoResponse {
     pub platform: String,
     /// CPU architecture: `x64` or `arm64`.
     pub arch: String,
+    /// The user's IANA time zone, which scheduled tasks and dated notes follow;
+    /// absent when none can be named.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_zone: Option<String>,
 }
 
 /// Request body for `POST /api/system/check-update`.
@@ -74,6 +78,7 @@ mod tests {
             log_dir: "/home/user/.local/state/aionui/logs".into(),
             platform: "linux".into(),
             arch: "x64".into(),
+            time_zone: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["cache_dir"], "/home/user/.cache/aionui");
@@ -83,6 +88,8 @@ mod tests {
         assert_eq!(json["arch"], "x64");
         // Verify snake_case
         assert!(json.get("cacheDir").is_none());
+        // A zone nobody could name is left out, not sent as null.
+        assert!(json.get("time_zone").is_none());
     }
 
     #[test]
@@ -93,6 +100,7 @@ mod tests {
             log_dir: "/tmp/logs".into(),
             platform: "darwin".into(),
             arch: "arm64".into(),
+            time_zone: Some("Asia/Shanghai".into()),
         };
         let serialized = serde_json::to_string(&original).unwrap();
         let parsed: SystemInfoResponse = serde_json::from_str(&serialized).unwrap();

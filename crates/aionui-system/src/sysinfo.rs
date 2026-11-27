@@ -83,6 +83,7 @@ pub fn get_system_info() -> SystemInfoResponse {
         log_dir: resolve_log_dir(),
         platform: map_platform().to_owned(),
         arch: map_arch().to_owned(),
+        time_zone: aionui_common::user_time_zone_name().map(str::to_owned),
     }
 }
 
