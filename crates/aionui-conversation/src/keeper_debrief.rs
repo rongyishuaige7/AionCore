@@ -407,6 +407,12 @@ impl ConversationService {
         };
         let extra = serde_json::from_str::<serde_json::Value>(&row.extra).unwrap_or_default();
         if !debrief_eligible(row.project_id.as_deref(), &extra) {
+            // Scheduled runs and team members write the role's memory
+            // themselves; asides and throwaway folders are not the project's.
+            debug!(
+                conversation_id,
+                "keeper save skipped: not a conversation the keeper takes in"
+            );
             return;
         }
         let Some(project_id) = row.project_id.clone() else {
@@ -440,6 +446,10 @@ impl ConversationService {
         let lines = lines_of(&rows);
         let new_chars: usize = lines.iter().map(|line| line.text.chars().count()).sum();
         if new_chars < MIN_NEW_CHARS {
+            debug!(
+                conversation_id,
+                new_chars, "keeper save waits: too little new since the last one"
+            );
             return;
         }
 
@@ -450,6 +460,7 @@ impl ConversationService {
             .keeper_debrief_context(&project_id, assistant_id.as_deref(), local_day().1)
             .await
         else {
+            debug!(conversation_id, project_id = %project_id, "keeper save skipped: the project has no keeper");
             return;
         };
         let _pass = lock_role_pass(&keeper.role_id).await;
@@ -494,7 +505,7 @@ impl ConversationService {
                     },
                     Ok(Err(BackendError::CommandNotSupported { .. })) => (KeeperDebriefStatus::Unsupported, None),
                     Ok(Err(error)) => {
-                        debug!(conversation_id, error = %error, "keeper save: summary not made");
+                        warn!(conversation_id, error = %error, "keeper save: summary not made");
                         (KeeperDebriefStatus::Failed, None)
                     }
                     Err(_) => {
