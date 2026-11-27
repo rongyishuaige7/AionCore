@@ -200,6 +200,41 @@ async fn send_as_agent(
 }
 
 #[tokio::test]
+async fn the_user_sees_and_takes_back_what_the_roles_know_about_them() {
+    use aionui_api_types::PlaybookDeltaOp;
+
+    let root = tempfile::tempdir().unwrap();
+    let service = Arc::new(RoleService::new(root.path().join("roles")));
+    let app = role_routes(RoleRouterState::new(service.clone()));
+    let (status, body) = send(&app, Method::GET, "/api/roles/_boss", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["items"], json!([]));
+
+    send(&app, Method::PUT, "/api/roles/scout", Some(json!({}))).await;
+    let learned = ["先给结论，再列数据。", "周末不发通知。"].map(|text| PlaybookDeltaOp::Add { content: text.into() });
+    service
+        .apply_retrospective("scout", &[], &learned, "reflector", "review", 1_000)
+        .await
+        .unwrap();
+    let (_, body) = send(&app, Method::GET, "/api/roles/_boss", None).await;
+    assert_eq!(
+        body["data"]["items"],
+        json!([{ "id": "u-0001", "text": "先给结论，再列数据。" }, { "id": "u-0002", "text": "周末不发通知。" }])
+    );
+
+    // Only the user takes an item back; a role asking is refused.
+    let (status, _) = send_as_agent(&app, Method::DELETE, "/api/roles/_boss/u-0001", "conv-scout", None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, body) = send(&app, Method::DELETE, "/api/roles/_boss/u-0001", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["data"]["items"],
+        json!([{ "id": "u-0002", "text": "周末不发通知。" }])
+    );
+    assert!(!service.boss_profile().await.unwrap().contains("先给结论"));
+}
+
+#[tokio::test]
 async fn agent_major_changes_become_proposals_while_tightening_applies_and_only_user_approves() {
     let root = tempfile::tempdir().unwrap();
     let app = app(&root);

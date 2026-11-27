@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use aionui_api_types::{
-    KeeperBrief, PlaybookDeltaOp, ROLE_SEND_TOOL_NAME, RoleCommit, RoleDreamerStatus, RoleExpandRequest,
+    KeeperBrief, PlaybookDeltaOp, ROLE_SEND_TOOL_NAME, RoleBossItem, RoleCommit, RoleDreamerStatus, RoleExpandRequest,
     RoleExpandResponse, RoleKeeper, RoleKeptProject, RoleProgress, RoleProjectClaim, RoleProposal, RoleProposalChange,
     RoleRecallRequest, RoleRecallResponse, RoleReport, RoleReportOutcome, RoleResponse, SetRoleProjectsRequest,
     TeamToolName, UpsertRoleRequest,
@@ -19,7 +19,7 @@ use crate::error::RoleError;
 use crate::git::{self, BOSS_TRACKED_PATHS, ROLE_TRACKED_PATHS};
 use crate::playbook::{
     PROGRESS_ARCHIVE_IDLE_DAYS, append_archived_playbook, apply_boss_deltas, apply_playbook_deltas, decay_playbook,
-    parse_playbook, prompt_playbook_lines, render_playbook,
+    parse_boss_items, parse_playbook, prompt_playbook_lines, render_playbook,
 };
 use crate::proposals::{classify_role_update, new_proposal_id};
 use crate::recall::{RecallIndex, RecallSync, RecallWatermark};
@@ -784,6 +784,42 @@ impl RoleService {
     /// role's standing prompt.
     pub async fn boss_profile(&self) -> Result<String, RoleError> {
         self.store.read_boss_profile().await
+    }
+
+    /// Everything the roles know about the user, in the order it was learned.
+    pub async fn boss_items(&self) -> Result<Vec<RoleBossItem>, RoleError> {
+        let raw = self.store.read_boss_profile().await?;
+        Ok(parse_boss_items(&raw)
+            .0
+            .into_iter()
+            .map(|(id, text)| RoleBossItem { id, text })
+            .collect())
+    }
+
+    /// Take one item (`u-NNNN`) out of what the roles know about the user, on
+    /// the user's word, and answer with what is left.
+    pub async fn remove_boss_item(&self, entry_id: &str, now: i64) -> Result<Vec<RoleBossItem>, RoleError> {
+        let entry_id = entry_id.trim();
+        let guard = self.memory_lock.lock().await;
+        let raw = self.store.read_boss_profile().await?;
+        let remove = [PlaybookDeltaOp::Remove {
+            id: entry_id.to_owned(),
+        }];
+        if let Some(updated) = apply_boss_deltas(&raw, &remove) {
+            let boss_dir = self.store.boss_dir();
+            git::ensure_baseline(boss_dir.clone(), BOSS_TRACKED_PATHS, now).await?;
+            self.store.write_boss_profile(&updated).await?;
+            git::commit(
+                boss_dir,
+                BOSS_TRACKED_PATHS,
+                "user".into(),
+                format!("boss: removed {entry_id}"),
+                now,
+            )
+            .await?;
+        }
+        drop(guard);
+        self.boss_items().await
     }
 
     /// Active playbook lines formatted for prompt injection.

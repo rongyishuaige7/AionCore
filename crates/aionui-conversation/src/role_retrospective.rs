@@ -24,6 +24,10 @@ pub(crate) const RETROSPECTIVE_MIN_INTERVAL_MS: i64 = 24 * 60 * 60 * 1_000;
 const WEEKLY_RETROSPECTIVE_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
 /// Byte threshold at which S5 dreamer curates `MEMORY.md` even mid-week (48 KiB of 64 KiB cap).
 pub const DREAMER_CURATE_THRESHOLD_BYTES: usize = 48 * 1024;
+/// Lines past which a pass curates `MEMORY.md` on its own.
+const DREAMER_CURATE_LINES: usize = 25;
+/// Lines past which a pass the user asked for curates it.
+const ON_DEMAND_CURATE_LINES: usize = 8;
 /// Number of `D0` leaves merged into one condensed summary leaf (`D1`).
 pub const CONDENSE_BATCH_SIZE: usize = 6;
 
@@ -486,14 +490,15 @@ impl ConversationService {
 
     /// Execute the LLM-assisted portions of S5 Nightly Dreamer for `assistant_id`
     /// (memory verify & curate when needed, weekly retrospective + boss profile,
-    /// and LCM leaf condensation).
+    /// and LCM leaf condensation). A pass the user asked for (`on_demand`)
+    /// reviews the lessons whenever there is evidence and tidies shorter notes.
     pub async fn run_role_dreamer_tasks(
         &self,
         user_id: &str,
         assistant_id: &str,
         thread_conversation_id: Option<&str>,
         current_memory: &str,
-        force_retrospective: bool,
+        on_demand: bool,
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> RoleDreamTasksOutcome {
         let mut outcome = RoleDreamTasksOutcome::default();
@@ -543,9 +548,14 @@ impl ConversationService {
         };
 
         // 1. Verify & curate `MEMORY.md` when approaching the 64 KiB cap (>= 48 KiB)
-        //    or when it has grown past 25 lines during a dreamer pass.
+        //    or when it has grown past its line count for this pass.
         let line_count = current_memory.lines().filter(|l| !l.trim().is_empty()).count();
-        if current_memory.len() >= DREAMER_CURATE_THRESHOLD_BYTES || line_count >= 25 {
+        let curate_lines = if on_demand {
+            ON_DEMAND_CURATE_LINES
+        } else {
+            DREAMER_CURATE_LINES
+        };
+        if current_memory.len() >= DREAMER_CURATE_THRESHOLD_BYTES || line_count >= curate_lines {
             match self
                 .verify_and_curate_memory(
                     assistant_id,
@@ -566,7 +576,7 @@ impl ConversationService {
 
         // 2. Retrospective (weekly in background dreamer, or immediately when forced).
         let due_weekly = ctx.as_ref().is_some_and(|ctx| {
-            force_retrospective
+            on_demand
                 || ctx.last_retrospective_at == 0
                 || now_ms().saturating_sub(ctx.last_retrospective_at) >= WEEKLY_RETROSPECTIVE_MS
         });

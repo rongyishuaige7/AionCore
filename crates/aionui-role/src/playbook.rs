@@ -316,10 +316,10 @@ pub(crate) fn append_archived_playbook(existing: &str, archived: &[RolePlaybookE
 
 /// Apply incremental ACE delta operations to `roles/_boss/USER.md` (`- [u-0001] <fact>`).
 /// Returns `Some(updated_markdown)` when at least one change took effect.
-pub(crate) fn apply_boss_deltas(existing_raw: &str, ops: &[PlaybookDeltaOp]) -> Option<String> {
-    if ops.is_empty() {
-        return None;
-    }
+/// The items of the boss profile as `(id, text)` in file order, and the
+/// highest `u-NNNN` number among them. A plain `- text` line written by hand
+/// gets the next number, so it can be named like any other.
+pub(crate) fn parse_boss_items(existing_raw: &str) -> (Vec<(String, String)>, u32) {
     let mut items: Vec<(String, String)> = Vec::new();
     let mut max_num: u32 = 0;
 
@@ -346,7 +346,14 @@ pub(crate) fn apply_boss_deltas(existing_raw: &str, ops: &[PlaybookDeltaOp]) -> 
             items.push((format!("u-{max_num:04}"), plain.to_owned()));
         }
     }
+    (items, max_num)
+}
 
+pub(crate) fn apply_boss_deltas(existing_raw: &str, ops: &[PlaybookDeltaOp]) -> Option<String> {
+    if ops.is_empty() {
+        return None;
+    }
+    let (mut items, max_num) = parse_boss_items(existing_raw);
     let mut next_num = max_num + 1;
     let mut changed = false;
 

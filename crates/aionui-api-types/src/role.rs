@@ -827,6 +827,22 @@ pub struct RoleDreamerStatus {
     pub last_error: Option<String>,
 }
 
+/// One thing the roles know about the user, shared by every role
+/// (`roles/_boss/USER.md`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleBossItem {
+    /// `u-NNNN`.
+    pub id: String,
+    pub text: String,
+}
+
+/// Response of `GET /api/roles/_boss` and `DELETE /api/roles/_boss/{entry_id}`:
+/// everything the roles know about the user, in the order it was learned.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleBossProfileResponse {
+    pub items: Vec<RoleBossItem>,
+}
+
 /// Summary of one peer resident role returned by `GET /api/runtime/role/peers`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RolePeerSummary {

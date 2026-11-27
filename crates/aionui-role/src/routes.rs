@@ -17,6 +17,8 @@
 //! - `POST /api/roles/{id}/revert` — create a forward git revert commit.
 //! - `POST /api/roles/{id}/dream` — run S5 dreamer maintenance on demand.
 //! - `DELETE /api/roles/{id}` — dismiss the role (and pause/clean its cron jobs).
+//! - `GET /api/roles/_boss` — what every role knows about the user.
+//! - `DELETE /api/roles/_boss/{entry_id}` — the user takes one of those back.
 //! - `GET /api/roles/keepers` — every kept project and the role keeping it.
 //! - `GET /api/roles/keepers/{project_id}/brief` — what the project's keeper would hand a new conversation.
 //! - `PUT /api/roles/{id}/projects` — the projects the role keeps (agents may only let go).
@@ -26,9 +28,9 @@
 
 use aionui_api_types::{
     ApiResponse, ForgetKeeperDebriefItemRequest, KeeperBriefResponse, KeeperDebrief, KeeperDebriefResponse,
-    KeeperDebriefsResponse, OutdatedKeeperLessonRequest, RoleDreamResponse, RoleKeepersResponse, RoleListResponse,
-    RoleProposalChange, RoleResponse, RoleRevertRequest, RoleTimelineResponse, SetRoleProjectsRequest,
-    UpdateRoleMemoryRequest, UpsertRoleRequest,
+    KeeperDebriefsResponse, OutdatedKeeperLessonRequest, RoleBossProfileResponse, RoleDreamResponse,
+    RoleKeepersResponse, RoleListResponse, RoleProposalChange, RoleResponse, RoleRevertRequest, RoleTimelineResponse,
+    SetRoleProjectsRequest, UpdateRoleMemoryRequest, UpsertRoleRequest,
 };
 use aionui_common::{ApiError, AuthenticatedUserId, RuntimeHelperCaller, now_ms};
 use axum::extract::{Extension, Path, State};
@@ -45,6 +47,8 @@ const DEFAULT_USER_ID: &str = "system_default_user";
 pub fn role_routes(state: RoleRouterState) -> Router {
     Router::new()
         .route("/api/roles", get(list_roles))
+        .route("/api/roles/_boss", get(get_boss_profile))
+        .route("/api/roles/_boss/{entry_id}", delete(delete_boss_item))
         .route("/api/roles/keepers", get(list_keepers))
         .route("/api/roles/keepers/{project_id}/brief", get(get_keeper_brief))
         .route("/api/roles/{id}", get(get_role).put(put_role).delete(delete_role))
@@ -200,6 +204,28 @@ async fn delete_playbook_entry(
         .await
         .map_err(to_api_error)?;
     Ok(Json(ApiResponse::ok(role)))
+}
+
+async fn get_boss_profile(
+    State(state): State<RoleRouterState>,
+) -> Result<Json<ApiResponse<RoleBossProfileResponse>>, ApiError> {
+    let items = state.service.boss_items().await.map_err(to_api_error)?;
+    Ok(Json(ApiResponse::ok(RoleBossProfileResponse { items })))
+}
+
+/// Only the user takes back what the roles know about them.
+async fn delete_boss_item(
+    State(state): State<RoleRouterState>,
+    helper: Option<Extension<RuntimeHelperCaller>>,
+    Path(entry_id): Path<String>,
+) -> Result<Json<ApiResponse<RoleBossProfileResponse>>, ApiError> {
+    require_human_caller(&helper)?;
+    let items = state
+        .service
+        .remove_boss_item(&entry_id, now_ms())
+        .await
+        .map_err(to_api_error)?;
+    Ok(Json(ApiResponse::ok(RoleBossProfileResponse { items })))
 }
 
 async fn approve_proposal(
