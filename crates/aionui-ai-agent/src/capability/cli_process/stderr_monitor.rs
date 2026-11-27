@@ -2,6 +2,15 @@ use crate::error::AgentError;
 #[cfg(any(unix, windows))]
 use tracing::{debug, error};
 
+/// macOS answers a group signal with EPERM, not ESRCH, while every member of
+/// the group is a zombie: killed (often by an earlier sweep of the same group)
+/// but not reaped yet. Nothing in such a group can run again, so the sweep has
+/// nothing left to do. Elsewhere EPERM still means a member we may not signal.
+#[cfg(unix)]
+fn group_members_are_exiting(err: &std::io::Error) -> bool {
+    cfg!(target_os = "macos") && err.raw_os_error() == Some(libc::EPERM)
+}
+
 /// Force-kill a process by PID, plus any descendants.
 ///
 /// Uses platform-native shell commands:
@@ -47,6 +56,14 @@ pub(super) fn force_kill(pid: u32, process_group_id: Option<u32>) -> Result<(), 
                     pid,
                     process_group = group_id,
                     "Process group already exited before SIGKILL"
+                );
+                return kill_pid(pid);
+            }
+            if group_members_are_exiting(&err) {
+                debug!(
+                    pid,
+                    process_group = group_id,
+                    "Process group already killed and not yet reaped"
                 );
                 return kill_pid(pid);
             }
@@ -181,6 +198,24 @@ mod force_kill_tests {
         // unix `kill` non-zero exit and Windows `taskkill` rc=128 are mapped to
         // Ok in `force_kill`, so this should not produce an error.
         force_kill(pid, Some(pid)).expect("force_kill on dead pid must not error");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn force_kill_again_before_the_group_is_reaped_is_ok() {
+        let mut child = spawn_blocker();
+        let pid = child.id();
+
+        force_kill(pid, Some(pid)).expect("first sweep kills the group");
+        // Let the kill land without reaping, leaving a group of zombies: what a
+        // second sweep of the same group meets (macOS answers it with EPERM).
+        std::thread::sleep(Duration::from_millis(300));
+        force_kill(pid, Some(pid)).expect("sweeping a killed, unreaped group must not error");
+
+        assert!(
+            wait_for_exit(&mut child, Duration::from_secs(5)),
+            "process pid={pid} should be reaped after the sweeps",
+        );
     }
 
     #[cfg(unix)]

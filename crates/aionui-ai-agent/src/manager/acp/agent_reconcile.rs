@@ -101,6 +101,16 @@ impl AcpAgentManager {
                             );
                             return Err(e);
                         }
+                        if matches!(e, AcpError::MethodNotFound { .. }) {
+                            // An agent without session/set_mode (dsh) keeps its own
+                            // mode; nothing went wrong on our side.
+                            warn!(
+                                conversation_id = %self.params.conversation_id,
+                                mode_id = %normalized,
+                                "reconcile_session: agent does not support set_mode"
+                            );
+                            continue;
+                        }
                         error!(
                             conversation_id = %self.params.conversation_id,
                             mode_id = %normalized,
