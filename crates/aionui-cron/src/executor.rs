@@ -23,6 +23,7 @@ use crate::prompt::{
     build_existing_conversation_prompt, build_new_conversation_prompt_with_skill_suggest,
     build_new_conversation_with_skill_prompt,
 };
+use crate::run_archive::archive_stale_runs;
 use crate::skill_file::{cron_skill_name, read_skill_content, write_raw_skill_file, write_skill_file};
 use crate::skill_suggest::SkillSuggestDetector;
 use crate::types::{CronJob, ExecutionMode};
@@ -913,6 +914,9 @@ impl JobExecutor {
             conversation_id = %response.id,
             "Created new conversation for cron job"
         );
+        if purpose == ConversationPurpose::NewConversationExecution {
+            archive_stale_runs(self.conversation_repo.as_ref(), &user_id, &job.id, &job.conversation_id).await;
+        }
 
         Ok(response.id)
     }

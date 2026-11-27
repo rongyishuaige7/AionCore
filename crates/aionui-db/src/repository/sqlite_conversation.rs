@@ -661,6 +661,56 @@ impl IConversationRepository for SqliteConversationRepository {
         Ok(rows)
     }
 
+    async fn archive_stale_cron_runs(
+        &self,
+        user_id: &str,
+        cron_job_id: &str,
+        keep_id: &str,
+        keep_latest: u32,
+        idle_before: TimestampMs,
+        archived_at: TimestampMs,
+    ) -> Result<Vec<String>, DbError> {
+        let ids = sqlx::query_scalar::<_, String>(
+            "UPDATE conversations SET archived_at = ? \
+             WHERE id IN ( \
+               SELECT c.id FROM conversations c \
+               WHERE c.user_id = ? \
+                 AND (json_extract(c.extra, '$.cronJobId') = ? OR json_extract(c.extra, '$.cron_job_id') = ?) \
+                 AND c.archived_at IS NULL \
+                 AND c.id <> ? \
+                 AND c.updated_at < ? \
+                 AND c.pinned = 0 \
+                 AND COALESCE(NULLIF(json_extract(c.extra, '$.team_id'), ''), \
+                              NULLIF(json_extract(c.extra, '$.teamId'), '')) IS NULL \
+                 AND NOT EXISTS ( \
+                   SELECT 1 FROM user_order o \
+                   WHERE o.user_id = c.user_id AND o.item_type = 'conversation' AND o.item_id = c.id) \
+                 AND c.id NOT IN ( \
+                   SELECT r.id FROM conversations r \
+                   WHERE r.user_id = ? \
+                     AND (json_extract(r.extra, '$.cronJobId') = ? OR json_extract(r.extra, '$.cron_job_id') = ?) \
+                     AND r.id <> ? \
+                   ORDER BY r.created_at DESC, r.id DESC \
+                   LIMIT ?) \
+             ) \
+             RETURNING id",
+        )
+        .bind(archived_at)
+        .bind(user_id)
+        .bind(cron_job_id)
+        .bind(cron_job_id)
+        .bind(keep_id)
+        .bind(idle_before)
+        .bind(user_id)
+        .bind(cron_job_id)
+        .bind(cron_job_id)
+        .bind(keep_id)
+        .bind(i64::from(keep_latest))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(ids)
+    }
+
     async fn list_scheduled_for_assistant(&self, user_id: &str, assistant_id: &str) -> Result<Vec<String>, DbError> {
         let ids = sqlx::query_scalar::<_, String>(
             "SELECT c.id \
@@ -2531,6 +2581,58 @@ mod tests {
 
         let result = repo.list_by_cron_job(SYSTEM_USER_ID, "cron_1").await.unwrap();
         assert_eq!(result.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn archive_stale_cron_runs_keeps_recent_pinned_team_and_own_conversations() {
+        let (repo, db) = setup().await;
+        let run = |created_at: i64, updated_at: i64, extra: &str| {
+            let mut row = sample_conversation(SYSTEM_USER_ID);
+            row.extra = extra.to_string();
+            row.created_at = created_at;
+            row.updated_at = updated_at;
+            row
+        };
+        let job = r#"{"cron_job_id":"cron_1"}"#;
+        let own = run(100, 100, job);
+        let stale = run(500, 500, r#"{"cronJobId":"cron_1"}"#);
+        let pinned = run(1_000, 1_000, job);
+        let team = run(2_000, 2_000, r#"{"cron_job_id":"cron_1","teamId":"team_1"}"#);
+        let touched = run(3_000, 20_000, job);
+        let newer = run(4_000, 4_000, job);
+        let newest = run(5_000, 5_000, job);
+        let other_job = run(600, 600, r#"{"cron_job_id":"cron_2"}"#);
+        for row in [&own, &stale, &pinned, &team, &touched, &newer, &newest, &other_job] {
+            repo.create(row).await.unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO user_order (user_id, scene, item_type, item_id, order_key, created_at, updated_at) \
+             VALUES (?, 'pinned', 'conversation', ?, 1, 1, 1)",
+        )
+        .bind(SYSTEM_USER_ID)
+        .bind(&pinned.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let archived = repo
+            .archive_stale_cron_runs(SYSTEM_USER_ID, "cron_1", &own.id, 2, 10_000, 30_000)
+            .await
+            .unwrap();
+        assert_eq!(archived, vec![stale.id.clone()]);
+
+        let archived_at: Option<i64> = sqlx::query_scalar("SELECT archived_at FROM conversations WHERE id = ?")
+            .bind(&stale.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(archived_at, Some(30_000));
+
+        let again = repo
+            .archive_stale_cron_runs(SYSTEM_USER_ID, "cron_1", &own.id, 2, 10_000, 40_000)
+            .await
+            .unwrap();
+        assert!(again.is_empty(), "an archived run is not archived twice");
     }
 
     /// Feeds the startup sweep that reaps orphan skill view directories, so it

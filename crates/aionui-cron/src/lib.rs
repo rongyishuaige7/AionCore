@@ -8,6 +8,7 @@ pub mod executor;
 pub mod follow_up;
 pub mod prompt;
 pub mod routes;
+mod run_archive;
 pub mod scheduler;
 pub mod service;
 pub mod skill_file;

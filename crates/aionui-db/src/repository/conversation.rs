@@ -138,6 +138,25 @@ pub trait IConversationRepository: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Archives the scheduled runs of `cron_job_id` (`extra.cronJobId` or
+    /// `extra.cron_job_id`) that are older than its newest `keep_latest` runs
+    /// and have not been updated since `idle_before`. Pinned runs, team-bound
+    /// runs and `keep_id` (the job's own conversation) are left alone.
+    /// Returns the ids it archived.
+    ///
+    /// Defaults to archiving nothing so test doubles need no body.
+    async fn archive_stale_cron_runs(
+        &self,
+        _user_id: &str,
+        _cron_job_id: &str,
+        _keep_id: &str,
+        _keep_latest: u32,
+        _idle_before: TimestampMs,
+        _archived_at: TimestampMs,
+    ) -> Result<Vec<String>, DbError> {
+        Ok(Vec::new())
+    }
+
     /// Lists conversations sharing the same `extra.workspace` value.
     /// The conversation identified by `conversation_id` is excluded.
     async fn list_associated(&self, user_id: &str, conversation_id: &str) -> Result<Vec<ConversationRow>, DbError>;
