@@ -1681,7 +1681,10 @@ async fn a_kept_project_is_briefed_by_its_keeper_but_never_the_keepers_own_conve
 async fn dreamer_status_keeps_why_the_last_pass_left_a_step_undone() {
     let root = tempfile::tempdir().unwrap();
     let service = service(&root);
-    service.upsert("seo", request("Watches search traffic.", &[])).await.unwrap();
+    service
+        .upsert("seo", request("Watches search traffic.", &[]))
+        .await
+        .unwrap();
     assert_eq!(service.get("seo").await.unwrap().dreamer, RoleDreamerStatus::default());
 
     service

@@ -407,11 +407,69 @@ pub(crate) fn apply_boss_deltas(existing_raw: &str, ops: &[PlaybookDeltaOp]) -> 
     Some(out)
 }
 
+/// Marks that end a sentence; a rule cut at one still reads whole.
+const SENTENCE_ENDS: [char; 8] = ['。', '！', '？', '；', '.', '!', '?', ';'];
+/// Marks between clauses, the next best place to stop.
+const CLAUSE_BREAKS: [char; 5] = ['，', '、', '：', ',', ':'];
+
+/// `raw` on one line and at most `max_chars` long. A longer text stops at the
+/// last sentence end within the cap, else at the last clause break, else
+/// between two words, and a stop that is not a sentence end is marked `…`.
+/// None is looked for in the first half of the cap, which would lose too
+/// much, and an ASCII mark counts only before a space, so `v1.2` or `10:30`
+/// is never taken for one.
 fn flatten_capped(raw: &str, max_chars: usize) -> String {
     let flat = raw.split_whitespace().collect::<Vec<_>>().join(" ");
-    if flat.chars().count() <= max_chars {
-        flat
-    } else {
-        flat.chars().take(max_chars).collect::<String>().trim_end().to_owned()
+    let chars: Vec<char> = flat.chars().collect();
+    if chars.len() <= max_chars {
+        return flat;
+    }
+    let last = |is_stop: &dyn Fn(char) -> bool| {
+        (max_chars / 2..max_chars).rev().find(|&at| {
+            let mark = chars[at];
+            is_stop(mark) && (mark == ' ' || !mark.is_ascii() || chars.get(at + 1).is_none_or(|next| *next == ' '))
+        })
+    };
+    if let Some(end) = last(&|mark| SENTENCE_ENDS.contains(&mark)) {
+        return chars[..=end].iter().collect();
+    }
+    let stop = last(&|mark| CLAUSE_BREAKS.contains(&mark))
+        .or_else(|| last(&|mark| mark == ' '))
+        .unwrap_or(max_chars - 1);
+    let kept: String = chars[..stop].iter().collect();
+    format!("{}…", kept.trim_end())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::flatten_capped;
+
+    #[test]
+    fn a_short_rule_only_loses_its_line_breaks() {
+        assert_eq!(flatten_capped("先写结论，\n  再给细节。", 40), "先写结论， 再给细节。");
+    }
+
+    #[test]
+    fn a_long_rule_stops_at_its_last_whole_sentence() {
+        let raw = "汇报前先核对数据源和上一次的读数是否一致。只报和上次不同的地方，例如出口 IP 的变化";
+        assert_eq!(flatten_capped(raw, 30), "汇报前先核对数据源和上一次的读数是否一致。");
+    }
+
+    #[test]
+    fn a_long_rule_without_a_sentence_end_stops_at_a_clause() {
+        let raw = "Check the exit IP and the latency, then the loss rate before every report";
+        assert_eq!(flatten_capped(raw, 40), "Check the exit IP and the latency…");
+    }
+
+    #[test]
+    fn a_dot_inside_a_version_or_path_is_not_a_sentence_end() {
+        let raw = "Run probe v1.2 against config.yaml whenever the proxy restarts overnight";
+        assert_eq!(flatten_capped(raw, 30), "Run probe v1.2 against…");
+    }
+
+    #[test]
+    fn a_rule_with_no_stop_at_all_is_cut_within_the_cap() {
+        let capped = flatten_capped(&"长".repeat(50), 20);
+        assert_eq!(capped, format!("{}…", "长".repeat(19)));
     }
 }

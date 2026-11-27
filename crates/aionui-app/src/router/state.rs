@@ -1110,7 +1110,7 @@ impl aionui_conversation::ConversationRolePort for RoleServiceConversationPort {
         user_id: &str,
         assistant_id: &str,
     ) -> Option<aionui_conversation::RoleRetrospectiveContext> {
-        let _role = self.roles.service.find(assistant_id).await.ok()??;
+        let role = self.roles.service.find(assistant_id).await.ok()??;
         let (last_retrospective_at, _) = self.roles.service.dreamer_timestamps(assistant_id).await.ok()?;
         let playbook_lines = self
             .roles
@@ -1137,11 +1137,37 @@ impl aionui_conversation::ConversationRolePort for RoleServiceConversationPort {
                 }
             }
         }
+        let progress = role
+            .progress
+            .iter()
+            .map(|task| {
+                let state: String = task.state.split_whitespace().collect::<Vec<_>>().join(" ");
+                let state: String = state.chars().take(RETROSPECTIVE_TASK_CHARS).collect();
+                format!("- {} ({}): {state}", task.task, local_day(task.updated_at))
+            })
+            .collect();
+        let reports = role
+            .reported
+            .iter()
+            .rev()
+            .map(|report| {
+                let line = format!(
+                    "{} [{}] {}",
+                    local_minute(report.at),
+                    report.outcome.as_str(),
+                    report.summary
+                );
+                (report.at, line)
+            })
+            .collect();
         Some(aionui_conversation::RoleRetrospectiveContext {
             last_retrospective_at,
             playbook_lines,
             boss_profile,
             failed_runs,
+            memory: role.memory,
+            progress,
+            reports,
         })
     }
 
@@ -1576,6 +1602,9 @@ fn spawn_role_dreamer_loop(adapter: Arc<RoleGovernanceAdapter>) {
         }
     });
 }
+
+/// How much of an open task's state a retrospective reads.
+const RETROSPECTIVE_TASK_CHARS: usize = 300;
 
 /// The minute of a millisecond timestamp in the user's own time zone
 /// (`YYYY-MM-DD HH:MM`), empty for a timestamp that names no moment.

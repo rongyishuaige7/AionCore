@@ -69,6 +69,115 @@ pub struct RoleRetrospectiveContext {
     pub playbook_lines: Vec<String>,
     pub boss_profile: String,
     pub failed_runs: Vec<String>,
+    /// The role's notes (`MEMORY.md`), so a pass does not write them again.
+    pub memory: String,
+    /// Each open task as `task (day): where it stands`.
+    pub progress: Vec<String>,
+    /// What the role's runs told the user, oldest first: when, and the line
+    /// as `YYYY-MM-DD HH:MM [say|ask] summary`.
+    pub reports: Vec<(i64, String)>,
+}
+
+/// How much of the role's notes a pass reads: the newest, as the role does.
+const MEMORY_CONTEXT_CHARS: usize = 8_000;
+/// How many of the role's latest reports the organizer checks the notes against.
+const CURATE_REPORTS: usize = 10;
+
+/// The newest whole lines of `text` that fit in `max_chars`.
+fn newest_lines(text: &str, max_chars: usize) -> String {
+    let mut kept = Vec::new();
+    let mut used = 0;
+    for line in text.trim().lines().rev() {
+        used += line.chars().count() + 1;
+        if used > max_chars {
+            break;
+        }
+        kept.push(line);
+    }
+    kept.reverse();
+    kept.join("\n")
+}
+
+/// `<tag>` with the non-blank `lines` one per line, or `(empty)`.
+fn push_block<'a>(prompt: &mut String, tag: &str, lines: impl IntoIterator<Item = &'a str>) {
+    prompt.push_str(&format!("\n\n<{tag}>\n"));
+    let mut empty = true;
+    for line in lines
+        .into_iter()
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+    {
+        prompt.push_str(line);
+        prompt.push('\n');
+        empty = false;
+    }
+    if empty {
+        prompt.push_str("(empty)\n");
+    }
+    prompt.push_str(&format!("</{tag}>"));
+}
+
+/// What the role already holds, for a pass to build on and not repeat: its
+/// rules, the boss profile, the newest of its notes, and its open tasks.
+fn push_role_state(prompt: &mut String, ctx: &RoleRetrospectiveContext, with_memory: bool) {
+    let playbook: Vec<String> = ctx.playbook_lines.iter().map(|line| format!("- {line}")).collect();
+    push_block(prompt, "current-playbook", playbook.iter().map(String::as_str));
+    push_block(prompt, "current-boss-profile", ctx.boss_profile.lines());
+    if with_memory {
+        push_block(
+            prompt,
+            "role-memory",
+            newest_lines(&ctx.memory, MEMORY_CONTEXT_CHARS).lines(),
+        );
+    }
+    push_block(prompt, "open-tasks", ctx.progress.iter().map(String::as_str));
+}
+
+/// The retrospective's whole prompt: its rules, what the role holds, and the
+/// evidence since the last review.
+fn retrospective_prompt(ctx: &RoleRetrospectiveContext, evidence: &str) -> String {
+    let mut prompt = String::from(RETROSPECTIVE_INSTRUCTIONS);
+    push_role_state(&mut prompt, ctx, true);
+    prompt.push_str("\n\n<evidence>\n");
+    prompt.push_str(evidence);
+    prompt.push_str("\n</evidence>");
+    prompt
+}
+
+/// The organizer's whole prompt: its rules, what the role holds besides its
+/// notes, the latest summaries and reports to check them against, and the notes.
+fn curate_prompt(ctx: &RoleRetrospectiveContext, leaves: &[&str], memory: &str) -> String {
+    let mut prompt = String::from(VERIFY_AND_CURATE_INSTRUCTIONS);
+    push_role_state(&mut prompt, ctx, false);
+    let skip = ctx.reports.len().saturating_sub(CURATE_REPORTS);
+    let reports = ctx.reports.iter().skip(skip).map(|(_, line)| line.as_str());
+    let evidence: Vec<&str> = leaves.iter().copied().chain(reports).collect();
+    if !evidence.is_empty() {
+        prompt.push_str("\n\n<recent-evidence>\n");
+        prompt.push_str(&evidence.join("\n\n"));
+        prompt.push_str("\n</recent-evidence>");
+    }
+    prompt.push_str("\n\n<memory>\n");
+    prompt.push_str(memory.trim());
+    prompt.push_str("\n</memory>");
+    prompt
+}
+
+/// What the role's runs told the user since the last review: the evidence a
+/// role that only runs on a schedule has.
+fn reports_since_review(ctx: &RoleRetrospectiveContext) -> Option<String> {
+    let lines: Vec<&str> = ctx
+        .reports
+        .iter()
+        .filter(|(at, _)| *at > ctx.last_retrospective_at)
+        .map(|(_, line)| line.as_str())
+        .collect();
+    (!lines.is_empty()).then(|| {
+        format!(
+            "What the role's runs told the user (oldest first):\n{}",
+            lines.join("\n")
+        )
+    })
 }
 
 /// Outcome of the LLM-assisted steps in an S5 dreamer pass.
@@ -89,12 +198,15 @@ ONLY incremental JSON delta operations to improve how this role works.
 Strict rules (Hermes & ACE):
 1. Write ONLY durable rules backed by concrete evidence in the material below. When nothing new and durable was learned, return empty arrays.
 2. Treat user corrections, pushbacks, and answers to `[ask]` report cards as primary playbook signals: ADD a specific rule, or UPDATE an existing rule's `helpful_delta` / `harmful_delta` (integers 0..3) and wording.
-3. NEVER record transient environment, network, proxy, rate-limit, or API outages.
-4. NEVER record negative conclusions claiming a tool, skill, or command \"does not work\" or \"is broken\".
-5. Put role-specific operating checklists and domain lessons in `playbook`; put cross-role facts about the boss (communication style, formatting preferences, priorities, review habits) in `boss_profile`.
-6. Write in the language the user predominantly uses.
-7. Output a single JSON object (no markdown commentary) followed on its own final line by `[end]`:
-{\"playbook\": [{\"op\": \"ADD\", \"content\": \"...\"}, {\"op\": \"UPDATE\", \"id\": \"p-0001\", \"helpful_delta\": 1, \"harmful_delta\": 0}, {\"op\": \"REMOVE\", \"id\": \"p-0002\"}], \"boss_profile\": [{\"op\": \"ADD\", \"content\": \"...\"}]}
+3. When the evidence shows an existing rule being followed, UPDATE it: `helpful_delta` 1 when it helped, `harmful_delta` 1 when following it went wrong.
+4. Each item is ONE complete rule of at most about 200 characters: what to do and when. No example lists, no one-off values such as a single IP, count, or date.
+5. Do NOT ADD what the role's memory, the boss profile, or another item already says. UPDATE an existing item with shorter complete `content` when it is cut off, longer than that, or mixes several rules; REMOVE one that only repeats another item, the memory, or the boss profile.
+6. NEVER record transient environment, network, proxy, rate-limit, or API outages.
+7. NEVER record negative conclusions claiming a tool, skill, or command \"does not work\" or \"is broken\".
+8. Put role-specific operating checklists and domain lessons in `playbook`; put cross-role facts about the boss (communication style, formatting preferences, priorities, review habits) in `boss_profile`.
+9. Write in the language the user predominantly uses.
+10. Output a single JSON object (no markdown commentary) followed on its own final line by `[end]`:
+{\"playbook\": [{\"op\": \"ADD\", \"content\": \"...\"}, {\"op\": \"UPDATE\", \"id\": \"p-0001\", \"content\": \"(only when rewording)\", \"helpful_delta\": 1, \"harmful_delta\": 0}, {\"op\": \"REMOVE\", \"id\": \"p-0002\"}], \"boss_profile\": [{\"op\": \"ADD\", \"content\": \"...\"}]}
 [end]";
 
 const CONDENSE_INSTRUCTIONS: &str = "\
@@ -113,6 +225,8 @@ You are verifying and curating a resident role's `MEMORY.md` against its recent 
 
 Rules:
 - Merge duplicate or overlapping notes into single concise `- YYYY-MM-DD <fact>` bullets (keeping the newest date when merged).
+- When several notes record successive values of the same changing reading (an IP, a file's timestamp, a count, a status), keep only the newest one.
+- Remove run-by-run readings that the open tasks already hold, and lines that only restate a playbook rule or a boss-profile item.
 - Remove claims that recent evidence directly contradicts or shows are obsolete.
 - Keep exact file paths, identifiers, preferences, and standing decisions intact.
 - Do NOT add speculative notes or environment error noise; if the memory is already clean, return it unchanged.
@@ -195,40 +309,12 @@ impl ConversationService {
         }
 
         let evidence = self
-            .gather_retrospective_evidence(
-                &port,
-                user_id,
-                assistant_id,
-                thread_conversation_id,
-                ctx.last_retrospective_at,
-                &ctx.failed_runs,
-            )
+            .gather_retrospective_evidence(&port, user_id, assistant_id, thread_conversation_id, &ctx)
             .await;
         if evidence.trim().is_empty() {
             return Ok(false);
         }
-
-        let mut prompt = String::from(RETROSPECTIVE_INSTRUCTIONS);
-        prompt.push_str("\n\n<current-playbook>\n");
-        if ctx.playbook_lines.is_empty() {
-            prompt.push_str("(empty)\n");
-        } else {
-            for line in &ctx.playbook_lines {
-                prompt.push_str("- ");
-                prompt.push_str(line);
-                prompt.push('\n');
-            }
-        }
-        prompt.push_str("</current-playbook>\n\n<current-boss-profile>\n");
-        if ctx.boss_profile.trim().is_empty() {
-            prompt.push_str("(empty)\n");
-        } else {
-            prompt.push_str(ctx.boss_profile.trim());
-            prompt.push('\n');
-        }
-        prompt.push_str("</current-boss-profile>\n\n<evidence>\n");
-        prompt.push_str(&evidence);
-        prompt.push_str("\n</evidence>");
+        let prompt = retrospective_prompt(&ctx, &evidence);
 
         let answer =
             match tokio::time::timeout(SUMMARY_TIMEOUT + Duration::from_secs(30), generator.summarize(&prompt)).await {
@@ -268,9 +354,9 @@ impl ConversationService {
         user_id: &str,
         assistant_id: &str,
         thread_conversation_id: Option<&str>,
-        since_ms: i64,
-        failed_runs: &[String],
+        ctx: &RoleRetrospectiveContext,
     ) -> String {
+        let since_ms = ctx.last_retrospective_at;
         let mut sections = Vec::new();
 
         if let Some(tid) = thread_conversation_id {
@@ -339,9 +425,10 @@ impl ConversationService {
             }
         }
 
-        if !failed_runs.is_empty() {
-            sections.push(format!("Recent failed scheduled runs:\n{}", failed_runs.join("\n")));
+        if !ctx.failed_runs.is_empty() {
+            sections.push(format!("Recent failed scheduled runs:\n{}", ctx.failed_runs.join("\n")));
         }
+        sections.extend(reports_since_review(ctx));
 
         sections.join("\n\n")
     }
@@ -450,13 +537,23 @@ impl ConversationService {
             return outcome;
         };
         let mut errors = Vec::new();
+        let ctx = match self.role_port() {
+            Some(port) => port.retrospective_context(user_id, assistant_id).await,
+            None => None,
+        };
 
         // 1. Verify & curate `MEMORY.md` when approaching the 64 KiB cap (>= 48 KiB)
         //    or when it has grown past 25 lines during a dreamer pass.
         let line_count = current_memory.lines().filter(|l| !l.trim().is_empty()).count();
         if current_memory.len() >= DREAMER_CURATE_THRESHOLD_BYTES || line_count >= 25 {
             match self
-                .verify_and_curate_memory(assistant_id, thread_conversation_id, current_memory, generator.as_ref())
+                .verify_and_curate_memory(
+                    assistant_id,
+                    thread_conversation_id,
+                    current_memory,
+                    ctx.as_ref(),
+                    generator.as_ref(),
+                )
                 .await
             {
                 Ok(curated) => outcome.curated_memory = Some(curated),
@@ -468,15 +565,11 @@ impl ConversationService {
         }
 
         // 2. Retrospective (weekly in background dreamer, or immediately when forced).
-        let due_weekly = if let Some(port) = self.role_port()
-            && let Some(ctx) = port.retrospective_context(user_id, assistant_id).await
-        {
+        let due_weekly = ctx.as_ref().is_some_and(|ctx| {
             force_retrospective
                 || ctx.last_retrospective_at == 0
                 || now_ms().saturating_sub(ctx.last_retrospective_at) >= WEEKLY_RETROSPECTIVE_MS
-        } else {
-            false
-        };
+        });
         if due_weekly {
             match self
                 .maybe_run_retrospective(
@@ -514,22 +607,19 @@ impl ConversationService {
         assistant_id: &str,
         thread_conversation_id: Option<&str>,
         current_memory: &str,
+        ctx: Option<&RoleRetrospectiveContext>,
         generator: &dyn TitleGenerator,
     ) -> Result<String, String> {
-        let mut prompt = String::from(VERIFY_AND_CURATE_INSTRUCTIONS);
+        let mut leaves = Vec::new();
         if let Some(port) = self.role_port()
             && let Some(tid) = thread_conversation_id
             && let Some(state) = port.thread_state(assistant_id, tid).await
-            && !state.leaves.is_empty()
         {
-            let recent: Vec<&str> = state.leaves.iter().rev().take(2).rev().map(String::as_str).collect();
-            prompt.push_str("\n\n<recent-evidence>\n");
-            prompt.push_str(&recent.join("\n\n"));
-            prompt.push_str("\n</recent-evidence>");
+            leaves = state.leaves.into_iter().rev().take(2).rev().collect();
         }
-        prompt.push_str("\n\n<memory>\n");
-        prompt.push_str(current_memory.trim());
-        prompt.push_str("\n</memory>");
+        let leaves: Vec<&str> = leaves.iter().map(String::as_str).collect();
+        let fallback = RoleRetrospectiveContext::default();
+        let prompt = curate_prompt(ctx.unwrap_or(&fallback), &leaves, current_memory);
 
         let answer =
             match tokio::time::timeout(SUMMARY_TIMEOUT + Duration::from_secs(30), generator.summarize(&prompt)).await {
@@ -578,6 +668,62 @@ mod tests {
         let (pb, boss) = parse_retrospective_output(raw).unwrap();
         assert_eq!(pb.len(), 2);
         assert_eq!(boss.len(), 1);
+    }
+
+    fn context() -> RoleRetrospectiveContext {
+        RoleRetrospectiveContext {
+            last_retrospective_at: 20,
+            playbook_lines: vec!["[p-0001] (+1/-0) 只报和上次不同的地方。".to_owned()],
+            boss_profile: "- [u-0001] 先写结论。\n".to_owned(),
+            failed_runs: Vec::new(),
+            memory: "- 2026-11-01 旧出口 IP 1.1.1.1\n- 2026-11-20 出口 IP 2.2.2.2\n".to_owned(),
+            progress: vec!["- 巡检 (2026-11-25): 第 3 轮".to_owned()],
+            reports: (1..=12)
+                .map(|n| (n * 10, format!("2026-11-{n:02} 09:00 [say] report {n}")))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn newest_lines_keep_the_latest_whole_lines_that_fit() {
+        assert_eq!(newest_lines("- a\n- bb\n- ccc\n", 11), "- bb\n- ccc");
+        assert_eq!(newest_lines("", 10), "");
+    }
+
+    #[test]
+    fn a_retrospective_sees_the_notes_and_tasks_it_must_not_repeat() {
+        let prompt = retrospective_prompt(&context(), "evidence");
+        assert!(
+            prompt.contains(
+                "<role-memory>\n- 2026-11-01 旧出口 IP 1.1.1.1\n- 2026-11-20 出口 IP 2.2.2.2\n</role-memory>"
+            )
+        );
+        assert!(prompt.contains("<open-tasks>\n- 巡检 (2026-11-25): 第 3 轮\n</open-tasks>"));
+        assert!(prompt.contains("<current-playbook>\n- [p-0001]"));
+        assert!(prompt.ends_with("<evidence>\nevidence\n</evidence>"));
+    }
+
+    #[test]
+    fn a_scheduled_role_has_its_reports_since_the_last_review_as_evidence() {
+        let evidence = reports_since_review(&context()).unwrap();
+        assert!(!evidence.contains("report 2\n"));
+        assert!(evidence.contains("report 3\n"));
+        assert!(evidence.ends_with("report 12"));
+        let reviewed = RoleRetrospectiveContext {
+            last_retrospective_at: 120,
+            ..context()
+        };
+        assert_eq!(reports_since_review(&reviewed), None);
+    }
+
+    #[test]
+    fn the_organizer_checks_notes_against_the_latest_reports_and_the_rules() {
+        let prompt = curate_prompt(&context(), &["leaf"], "- 2026-11-20 note");
+        assert!(prompt.contains("<current-boss-profile>\n- [u-0001] 先写结论。\n</current-boss-profile>"));
+        assert!(!prompt.contains("<role-memory>"));
+        assert!(!prompt.contains("report 2\n"));
+        assert!(prompt.contains("<recent-evidence>\nleaf\n\n2026-11-03 09:00 [say] report 3"));
+        assert!(prompt.ends_with("<memory>\n- 2026-11-20 note\n</memory>"));
     }
 
     #[test]
