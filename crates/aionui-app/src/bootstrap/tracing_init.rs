@@ -45,6 +45,21 @@ const AIONRS_TARGETS: &[&str] = &[
 
 const RAW_AIONRS_PAYLOAD_TARGETS: &[&str] = &["aion_agent", "aion_providers"];
 
+/// Log files the dated writers create, as `YYYY-MM-DD.<suffix>`.
+const BACKEND_LOG_SUFFIX: &str = "aioncore.log";
+const AIONRS_LOG_SUFFIX: &str = "aionrs.log";
+
+/// Days of logs kept on disk. Each time a day's file opens, files from days
+/// older than this are removed. `AIONUI_LOG_RETENTION_DAYS` overrides it; 0
+/// keeps every day.
+const DEFAULT_LOG_RETENTION_DAYS: u32 = 30;
+const LOG_RETENTION_ENV: &str = "AIONUI_LOG_RETENTION_DAYS";
+
+fn log_retention_days(raw: Option<&str>) -> u32 {
+    raw.and_then(|value| value.trim().parse().ok())
+        .unwrap_or(DEFAULT_LOG_RETENTION_DAYS)
+}
+
 fn build_env_filter(log_level: Option<&str>) -> EnvFilter {
     let user_directives = log_level.unwrap_or("info");
     let suppressions = NOISE_SUPPRESSIONS.join(",");
@@ -179,7 +194,9 @@ pub fn init_tracing(
     let console_layer = fmt::layer().with_target(true).with_filter(build_env_filter(log_level));
 
     // Backend file layer — excludes aion_* targets
-    let file_appender = DailyDatedLogWriter::new(log_dir.to_path_buf(), "aioncore.log");
+    let retention_days = log_retention_days(std::env::var(LOG_RETENTION_ENV).ok().as_deref());
+    let file_appender =
+        DailyDatedLogWriter::new(log_dir.to_path_buf(), BACKEND_LOG_SUFFIX).with_retention(retention_days);
     let (non_blocking, backend_guard) = tracing_appender::non_blocking(file_appender);
 
     let backend_file_layer = fmt::layer()
@@ -201,7 +218,7 @@ pub fn init_tracing(
         .with_field("filter", aionrs_level.clone())
         .with_field("logDir", active_log_dir.display().to_string())
     })?;
-    let aionrs_appender = DailyDatedLogWriter::new(log_dir.to_path_buf(), "aionrs.log");
+    let aionrs_appender = DailyDatedLogWriter::new(log_dir.to_path_buf(), AIONRS_LOG_SUFFIX);
     let (aionrs_non_blocking, aionrs_guard) = tracing_appender::non_blocking(aionrs_appender);
     let aionrs_layer = fmt::layer()
         .json()
@@ -268,6 +285,10 @@ impl LogDate {
     fn file_name(self, suffix: &str) -> String {
         format!("{:04}-{:02}-{:02}.{}", self.year, self.month, self.day, suffix)
     }
+
+    fn naive(self) -> Option<chrono::NaiveDate> {
+        chrono::NaiveDate::from_ymd_opt(self.year, self.month, self.day)
+    }
 }
 
 fn dated_log_dir_for(log_root: &Path, date: LogDate) -> PathBuf {
@@ -281,12 +302,77 @@ fn dated_log_file_path(log_root: &Path, date: LogDate, suffix: &str) -> PathBuf 
     dated_log_dir_for(log_root, date).join(date.file_name(suffix))
 }
 
+/// Removes the writers' log files from `YYYY/MM/DD` partitions older than
+/// `retention_days` before `today`, then the partitions they leave empty.
+/// Nothing else under the root is touched. Best-effort and silent: it runs
+/// inside the log writer, where logging would recurse.
+fn prune_expired_log_days(log_root: &Path, today: LogDate, retention_days: u32) {
+    if retention_days == 0 {
+        return;
+    }
+    let Some(cutoff) = today
+        .naive()
+        .and_then(|date| date.checked_sub_days(chrono::Days::new(retention_days.into())))
+    else {
+        return;
+    };
+    for (year_dir, year) in numbered_dirs(log_root, 4) {
+        let mut pruned_in_year = false;
+        for (month_dir, month) in numbered_dirs(&year_dir, 2) {
+            let mut pruned_in_month = false;
+            for (day_dir, day) in numbered_dirs(&month_dir, 2) {
+                let date = LogDate {
+                    year: year as i32,
+                    month,
+                    day,
+                };
+                if date.naive().is_none_or(|date| date >= cutoff) {
+                    continue;
+                }
+                for suffix in [BACKEND_LOG_SUFFIX, AIONRS_LOG_SUFFIX] {
+                    let _ = std::fs::remove_file(day_dir.join(date.file_name(suffix)));
+                }
+                // Fails, and keeps the day, when anything else is in it.
+                let _ = std::fs::remove_dir(&day_dir);
+                pruned_in_month = true;
+            }
+            if pruned_in_month {
+                let _ = std::fs::remove_dir(&month_dir);
+                pruned_in_year = true;
+            }
+        }
+        if pruned_in_year {
+            let _ = std::fs::remove_dir(&year_dir);
+        }
+    }
+}
+
+/// Subdirectories of `dir` named by exactly `width` digits, with that number.
+fn numbered_dirs(dir: &Path, width: usize) -> Vec<(PathBuf, u32)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            if name.len() != width || !name.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            Some((entry.path(), name.parse().ok()?))
+        })
+        .collect()
+}
+
 struct DailyDatedLogWriter {
     log_root: PathBuf,
     filename_suffix: &'static str,
     date_provider: Box<dyn Fn() -> LogDate + Send + Sync>,
     active_date: Option<LogDate>,
     active_file: Option<File>,
+    /// Days of logs to keep; `None` leaves pruning to another writer.
+    retention_days: Option<u32>,
 }
 
 impl DailyDatedLogWriter {
@@ -305,12 +391,22 @@ impl DailyDatedLogWriter {
             date_provider,
             active_date: None,
             active_file: None,
+            retention_days: None,
         }
+    }
+
+    /// Prunes days older than `days` whenever a new day's file opens.
+    fn with_retention(mut self, days: u32) -> Self {
+        self.retention_days = Some(days);
+        self
     }
 
     fn active_file(&mut self) -> io::Result<&mut File> {
         let date = (self.date_provider)();
         if self.active_date != Some(date) {
+            if let Some(days) = self.retention_days {
+                prune_expired_log_days(&self.log_root, date, days);
+            }
             let file_path = dated_log_file_path(&self.log_root, date, self.filename_suffix);
             if let Some(parent) = file_path.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -455,6 +551,87 @@ mod tests {
             "july 3\n"
         );
         assert!(!tmp.path().join("2026/07/02/2026-07-03.aioncore.log").exists());
+    }
+
+    fn touch(root: &Path, relative: &str) {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
+        std::fs::write(path, b"x").expect("write file");
+    }
+
+    #[test]
+    fn retention_removes_only_the_writers_files_from_expired_days() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let root = tmp.path();
+        touch(root, "2025/12/31/2025-12-31.aioncore.log");
+        touch(root, "2026/05/31/2026-05-31.aioncore.log");
+        touch(root, "2026/05/31/2026-05-31.aionrs.log");
+        touch(root, "2026/05/20/2026-05-20.aioncore.log");
+        touch(root, "2026/05/20/notes.txt");
+        touch(root, "2026/06/01/2026-06-01.aioncore.log");
+        touch(root, "yi-webui-launch.log");
+        touch(root, "archive/2026-01-01.aioncore.log");
+
+        let today = LogDate {
+            year: 2026,
+            month: 7,
+            day: 1,
+        };
+        prune_expired_log_days(root, today, 30);
+
+        assert!(!root.join("2025").exists(), "an emptied year goes with its days");
+        assert!(!root.join("2026/05/31").exists());
+        assert!(!root.join("2026/05/20/2026-05-20.aioncore.log").exists());
+        assert!(root.join("2026/05/20/notes.txt").exists(), "foreign files stay");
+        assert!(
+            root.join("2026/06/01/2026-06-01.aioncore.log").exists(),
+            "the oldest kept day is exactly retention days back"
+        );
+        assert!(root.join("yi-webui-launch.log").exists());
+        assert!(root.join("archive/2026-01-01.aioncore.log").exists());
+    }
+
+    #[test]
+    fn retention_of_zero_days_keeps_everything() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        touch(tmp.path(), "2020/01/01/2020-01-01.aioncore.log");
+        let today = LogDate {
+            year: 2026,
+            month: 7,
+            day: 1,
+        };
+        prune_expired_log_days(tmp.path(), today, 0);
+        assert!(tmp.path().join("2020/01/01/2020-01-01.aioncore.log").exists());
+    }
+
+    #[test]
+    fn retention_days_come_from_the_env_value_or_the_default() {
+        assert_eq!(log_retention_days(None), DEFAULT_LOG_RETENTION_DAYS);
+        assert_eq!(log_retention_days(Some(" 7 ")), 7);
+        assert_eq!(log_retention_days(Some("0")), 0);
+        assert_eq!(log_retention_days(Some("week")), DEFAULT_LOG_RETENTION_DAYS);
+    }
+
+    #[test]
+    fn writer_with_retention_prunes_when_a_new_day_opens() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        touch(tmp.path(), "2026/06/29/2026-06-29.aionrs.log");
+        let today = LogDate {
+            year: 2026,
+            month: 7,
+            day: 1,
+        };
+        let mut writer = DailyDatedLogWriter::new_with_date_provider(
+            tmp.path().to_path_buf(),
+            "aioncore.log",
+            Box::new(move || today),
+        )
+        .with_retention(1);
+
+        std::io::Write::write_all(&mut writer, b"july 1\n").expect("write");
+
+        assert!(!tmp.path().join("2026/06/29").exists());
+        assert!(tmp.path().join("2026/07/01/2026-07-01.aioncore.log").exists());
     }
 
     #[test]
