@@ -342,9 +342,17 @@ const KEEPER_BRIEF_MESSAGE: &str = "keeper_brief";
 /// the conversation's turn tracking reads.
 const KEEPER_BRIEF_EVENT: &str = "role.keeper_brief";
 
-/// `extra` keys of a conversation the user opens beside something else: never
-/// a role's thread.
-pub(crate) const THREAD_ASIDE_KEYS: [&str; 2] = ["companion_of", "jot_trial"];
+/// `extra` keys of a conversation the user opens beside something else (a
+/// companion, a jot card's exploration or trial run): never a role's thread.
+const THREAD_ASIDE_KEYS: [&str; 3] = ["companion_of", "jot_explore", "jot_trial"];
+
+/// Whether the conversation `extra` belongs to was opened beside something
+/// else, so a turn in it is not the user's own talk with the role.
+pub(crate) fn opened_aside(extra: &serde_json::Value) -> bool {
+    THREAD_ASIDE_KEYS
+        .iter()
+        .any(|key| extra.get(*key).is_some_and(|value| !value.is_null()))
+}
 
 /// `extra` keys of a conversation a schedule or a team creates. Those put the
 /// role to work with their own wording of its section, so such a conversation
@@ -1435,11 +1443,9 @@ impl ConversationService {
             return content;
         };
         let extra = serde_json::from_str::<serde_json::Value>(&row.extra).unwrap_or_default();
-        // Nor is a companion beside another conversation, or a jot card's trial
-        // run, the user's own talk with the role.
-        let aside = THREAD_ASIDE_KEYS
-            .iter()
-            .any(|key| extra.get(*key).is_some_and(|v| !v.is_null()));
+        // Nor is a companion beside another conversation, or a jot card's
+        // exploration or trial run, the user's own talk with the role.
+        let aside = opened_aside(&extra);
         if put_to_work(&extra) || aside {
             return content;
         }
@@ -1494,7 +1500,7 @@ impl ConversationService {
 
     /// Whether the turn about to start may be handed its project keeper's
     /// brief: the conversation is in a project, is the user's own (not a
-    /// schedule's, a team's, a companion or a jot trial), was not created with
+    /// schedule's, a team's, a companion or a jot card's run), was not created with
     /// the brief turned off, has not been briefed, and has no earlier text, so
     /// this is its first message. Checked before that message is stored.
     async fn keeper_brief_due(&self, user_id: &str, row: &ConversationRow) -> bool {
@@ -1502,9 +1508,7 @@ impl ConversationService {
             return false;
         }
         let extra = serde_json::from_str::<serde_json::Value>(&row.extra).unwrap_or_default();
-        let aside = THREAD_ASIDE_KEYS
-            .iter()
-            .any(|key| extra.get(*key).is_some_and(|v| !v.is_null()));
+        let aside = opened_aside(&extra);
         if put_to_work(&extra)
             || aside
             || extra.get(KEEPER_BRIEF_OFF_KEY).and_then(serde_json::Value::as_bool) == Some(true)
@@ -1936,10 +1940,7 @@ impl ConversationService {
             && source == ConversationSource::Aionui
             && req.channel_chat_id.is_none()
             && !put_to_work(&extra)
-            && !THREAD_ASIDE_KEYS
-                .iter()
-                .any(|key| extra.get(*key).is_some_and(|v| !v.is_null()))
-            && extra.get("jot_explore").is_none_or(serde_json::Value::is_null)
+            && !opened_aside(&extra)
             && extra.get("is_health_check").and_then(serde_json::Value::as_bool) != Some(true);
 
         let mut resident_claim: Option<(

@@ -32,8 +32,7 @@ use tracing::{debug, info, warn};
 
 use crate::role_thread::{RoleThreadMark, lines_of, render_tail};
 use crate::service::{
-    ConversationService, KEEPER_BRIEF_OFF_KEY, KeeperDebriefInput, THREAD_ASIDE_KEYS, is_temp_session_workspace,
-    put_to_work,
+    ConversationService, KEEPER_BRIEF_OFF_KEY, KeeperDebriefInput, is_temp_session_workspace, opened_aside, put_to_work,
 };
 
 /// How long a conversation stays quiet before its keeper saves what happened.
@@ -147,15 +146,13 @@ impl KeeperDebriefs {
 
 /// Whether a conversation's keeper may save what happened in it: it is in a
 /// project, is the user's own (not a schedule's, a team's, a companion or a
-/// jot trial), was not opened with the keeper left out, and does not run in
+/// jot card's exploration or trial), was not opened with the keeper left out, and does not run in
 /// a throwaway folder.
 pub(crate) fn debrief_eligible(project_id: Option<&str>, extra: &serde_json::Value) -> bool {
     if project_id.is_none_or(|id| id.trim().is_empty()) {
         return false;
     }
-    let aside = THREAD_ASIDE_KEYS
-        .iter()
-        .any(|key| extra.get(*key).is_some_and(|value| !value.is_null()));
+    let aside = opened_aside(extra);
     let left_out = extra.get(KEEPER_BRIEF_OFF_KEY).and_then(serde_json::Value::as_bool) == Some(true);
     let temporary = extra.get("is_temporary_workspace").and_then(serde_json::Value::as_bool) == Some(true)
         || extra

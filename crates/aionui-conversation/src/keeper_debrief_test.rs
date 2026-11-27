@@ -62,6 +62,7 @@ fn only_the_users_own_project_conversations_are_saved() {
         "teamId",
         "team_id",
         "companion_of",
+        "jot_explore",
         "jot_trial",
     ] {
         let extra = json!({ "workspace": "/Users/me/store", key: "x" });
