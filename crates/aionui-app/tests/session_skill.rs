@@ -81,7 +81,10 @@ fn the_skill_states_the_non_negotiable_rules() {
     // Team conversations use the team surface instead (spec §9.2).
     assert!(body.contains("Use `team send-message` instead"), "{body}");
     // rate_limited means stop, not retry (spec §6.7).
-    assert!(body.contains("On `rate_limited`, STOP delivering"), "{body}");
+    assert!(
+        body.contains("On `rate_limited` or `hop_limit_reached`, STOP delivering"),
+        "{body}"
+    );
     assert!(body.contains("Do not retry"), "{body}");
     // Wording discipline for `queued` (spec §8.6 rule 11).
     assert!(body.contains("Never claim a message was read"), "{body}");
