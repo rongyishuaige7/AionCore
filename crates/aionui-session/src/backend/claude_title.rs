@@ -7,7 +7,10 @@ use aionui_common::CommandSpec;
 use aionui_process::Spawner;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use crate::{AgentIo, BackendError, ManagedProcessIo, TITLE_INSTRUCTIONS, TitleGenerator};
+use crate::{
+    AgentIo, BackendError, ManagedProcessIo, SUMMARY_INSTRUCTIONS, SUMMARY_MAX_BYTES, SUMMARY_TIMEOUT,
+    TITLE_INSTRUCTIONS, TitleGenerator,
+};
 
 pub(super) struct ClaudeTitleGenerator {
     pub spawner: Arc<dyn Spawner>,
@@ -17,16 +20,51 @@ pub(super) struct ClaudeTitleGenerator {
 #[async_trait::async_trait]
 impl TitleGenerator for ClaudeTitleGenerator {
     async fn generate(&self, description: &str) -> Result<String, BackendError> {
+        self.ask(self.command.clone(), description, std::time::Duration::from_secs(60))
+            .await
+    }
+
+    async fn summarize(&self, prompt: &str) -> Result<String, BackendError> {
+        let answer = self
+            .ask(summary_command(&self.command), prompt, SUMMARY_TIMEOUT)
+            .await?;
+        if answer.len() > SUMMARY_MAX_BYTES {
+            return Err(BackendError::Transport("Claude summary was too long".into()));
+        }
+        Ok(answer)
+    }
+}
+
+impl ClaudeTitleGenerator {
+    /// One print call of `command` with `input` on stdin.
+    async fn ask(
+        &self,
+        command: CommandSpec,
+        input: &str,
+        timeout: std::time::Duration,
+    ) -> Result<String, BackendError> {
         let process = self
             .spawner
-            .spawn_quiet(self.command.clone(), &[], "aionui-session-title")
+            .spawn_quiet(command, &[], "aionui-session-title")
             .await
             .map_err(|_| BackendError::Transport("Claude title process could not start".into()))?;
         let io = ManagedProcessIo::new(process);
-        let result = tokio::time::timeout(std::time::Duration::from_secs(60), exchange(&io, description)).await;
+        let result = tokio::time::timeout(timeout, exchange(&io, input)).await;
         io.terminate().await;
         result.map_err(|_| BackendError::Transport("Claude title request timed out".into()))?
     }
+}
+
+/// The title call with its system prompt swapped for the digest one: a
+/// summary request carries its own instructions.
+fn summary_command(title: &CommandSpec) -> CommandSpec {
+    let mut command = title.clone();
+    if let Some(at) = command.args.iter().position(|arg| arg == "--system-prompt")
+        && let Some(system) = command.args.get_mut(at + 1)
+    {
+        *system = SUMMARY_INSTRUCTIONS.into();
+    }
+    command
 }
 
 pub(super) fn command(config: &super::SessionConfig, model: Option<String>) -> CommandSpec {
@@ -113,6 +151,18 @@ mod tests {
         assert!(command.args.windows(2).any(|a| a == ["--tools", ""]));
         assert!(command.args.contains(&"--no-session-persistence".into()));
         assert!(command.args.contains(&"--strict-mcp-config".into()));
+
+        // A digest keeps the same isolated call and only reframes it.
+        let summary = summary_command(&command);
+        assert!(
+            summary
+                .args
+                .windows(2)
+                .any(|a| a == ["--system-prompt", SUMMARY_INSTRUCTIONS])
+        );
+        assert!(!summary.args.contains(&TITLE_INSTRUCTIONS.into()));
+        assert!(summary.args.windows(2).any(|a| a == ["--tools", ""]));
+        assert_eq!(summary.args.len(), command.args.len());
     }
     #[tokio::test]
     async fn accepts_only_complete_successful_result_and_passes_context_on_stdin() {

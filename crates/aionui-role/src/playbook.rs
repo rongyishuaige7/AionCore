@@ -314,13 +314,13 @@ pub(crate) fn append_archived_playbook(existing: &str, archived: &[RolePlaybookE
     out
 }
 
-/// Apply incremental ACE delta operations to `roles/_boss/USER.md` (`- [u-0001] <fact>`).
-/// Returns `Some(updated_markdown)` when at least one change took effect.
 /// The items of the boss profile as `(id, text)` in file order, and the
 /// highest `u-NNNN` number among them. A plain `- text` line written by hand
-/// gets the next number, so it can be named like any other.
+/// gets a number past every one the file already holds, wherever it stands,
+/// so it can be named like any other and never shares a name.
 pub(crate) fn parse_boss_items(existing_raw: &str) -> (Vec<(String, String)>, u32) {
-    let mut items: Vec<(String, String)> = Vec::new();
+    // `None` for a hand-written line, still to be numbered.
+    let mut parsed: Vec<(Option<String>, String)> = Vec::new();
     let mut max_num: u32 = 0;
 
     for line in existing_raw.lines() {
@@ -337,18 +337,29 @@ pub(crate) fn parse_boss_items(existing_raw: &str) -> (Vec<(String, String)>, u3
                 if let Some(num) = extract_id_num(id, "u-") {
                     max_num = max_num.max(num);
                 }
-                items.push((id.to_owned(), content.to_owned()));
+                parsed.push((Some(id.to_owned()), content.to_owned()));
                 continue;
             }
         }
         if let Some(plain) = trimmed.strip_prefix("- ").map(str::trim).filter(|s| !s.is_empty()) {
-            max_num += 1;
-            items.push((format!("u-{max_num:04}"), plain.to_owned()));
+            parsed.push((None, plain.to_owned()));
         }
     }
+    let items = parsed
+        .into_iter()
+        .map(|(id, text)| {
+            let id = id.unwrap_or_else(|| {
+                max_num += 1;
+                format!("u-{max_num:04}")
+            });
+            (id, text)
+        })
+        .collect();
     (items, max_num)
 }
 
+/// Apply incremental ACE delta operations to `roles/_boss/USER.md` (`- [u-0001] <fact>`).
+/// Returns `Some(updated_markdown)` when at least one change took effect.
 pub(crate) fn apply_boss_deltas(existing_raw: &str, ops: &[PlaybookDeltaOp]) -> Option<String> {
     if ops.is_empty() {
         return None;
@@ -442,14 +453,22 @@ fn flatten_capped(raw: &str, max_chars: usize) -> String {
     }
     let stop = last(&|mark| CLAUSE_BREAKS.contains(&mark))
         .or_else(|| last(&|mark| mark == ' '))
-        .unwrap_or(max_chars - 1);
+        .unwrap_or(max_chars.saturating_sub(1));
     let kept: String = chars[..stop].iter().collect();
     format!("{}…", kept.trim_end())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::flatten_capped;
+    use super::{flatten_capped, parse_boss_items};
+
+    #[test]
+    fn a_line_written_by_hand_never_takes_a_numbered_items_name() {
+        let (items, max) = parse_boss_items("- 先写结论\n- [u-0001] 不要表情符号\n- 用中文\n");
+        let ids: Vec<&str> = items.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, ["u-0002", "u-0001", "u-0003"]);
+        assert_eq!(max, 3);
+    }
 
     #[test]
     fn a_short_rule_only_loses_its_line_breaks() {

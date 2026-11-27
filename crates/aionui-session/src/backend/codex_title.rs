@@ -64,21 +64,28 @@ const TITLE_TIMEOUT_SECS: u64 = 60;
 /// session with no reason to outlive the call.
 pub(crate) async fn generate_title(io: Box<dyn AgentIo>, req: &TitleRequest) -> Option<String> {
     let timeout = std::time::Duration::from_secs(TITLE_TIMEOUT_SECS);
-    let outcome = tokio::time::timeout(timeout, run_exchange(io.as_ref(), req)).await;
+    ask(io, req, TITLE_INSTRUCTIONS, timeout).await
+}
+
+/// The same throwaway exchange under `instructions`, bounded by `timeout`.
+async fn ask(
+    io: Box<dyn AgentIo>,
+    req: &TitleRequest,
+    instructions: &str,
+    timeout: std::time::Duration,
+) -> Option<String> {
+    let outcome = tokio::time::timeout(timeout, run_exchange(io.as_ref(), req, instructions)).await;
     io.terminate().await;
     match outcome {
-        Ok(title) => title,
+        Ok(answer) => answer,
         Err(_) => {
-            tracing::warn!(
-                timeout_secs = TITLE_TIMEOUT_SECS,
-                "codex title generation timed out; conversation keeps its placeholder name for now"
-            );
+            tracing::warn!(timeout_secs = timeout.as_secs(), "codex isolated exchange timed out");
             None
         }
     }
 }
 
-async fn run_exchange(io: &dyn AgentIo, req: &TitleRequest) -> Option<String> {
+async fn run_exchange(io: &dyn AgentIo, req: &TitleRequest, instructions: &str) -> Option<String> {
     let (mut stdin, stdout) = io.take_stdio().await?;
     let mut lines = BufReader::new(stdout).lines();
 
@@ -98,7 +105,7 @@ async fn run_exchange(io: &dyn AgentIo, req: &TitleRequest) -> Option<String> {
         // Live-verified: an ephemeral thread writes no rollout file and no
         // session_index entry, so this never pollutes `codex resume`.
         "ephemeral": true,
-        "baseInstructions": TITLE_INSTRUCTIONS,
+        "baseInstructions": instructions,
         // Verified: generated v2/ThreadStartParams.json and its SandboxMode /
         // AskForApproval definitions (codex app-server generate-json-schema).
         "sandbox": "read-only",
@@ -458,6 +465,25 @@ impl crate::TitleGenerator for CodexTitleGenerator {
         .await
         .ok_or_else(|| crate::BackendError::Transport("Codex title generation failed".into()))
     }
+
+    async fn summarize(&self, prompt: &str) -> Result<String, crate::BackendError> {
+        let io = self
+            .source
+            .open()
+            .await
+            .ok_or_else(|| crate::BackendError::Transport("Codex summary process could not start".into()))?;
+        let request = TitleRequest {
+            description: prompt.to_owned(),
+            model: self.model.clone(),
+        };
+        let answer = ask(io, &request, crate::SUMMARY_INSTRUCTIONS, crate::SUMMARY_TIMEOUT)
+            .await
+            .ok_or_else(|| crate::BackendError::Transport("Codex summary failed".into()))?;
+        if answer.len() > crate::SUMMARY_MAX_BYTES {
+            return Err(crate::BackendError::Transport("Codex summary was too long".into()));
+        }
+        Ok(answer)
+    }
 }
 
 #[cfg(test)]
@@ -703,5 +729,37 @@ mod tests {
             .unwrap_or_else(|| panic!("no thread/start on the wire: {written}"));
         assert!(start_frame.contains(r#""ephemeral":true"#), "frame: {start_frame}");
         assert!(start_frame.contains(r#""model":"gpt-5.4""#), "frame: {start_frame}");
+    }
+
+    #[tokio::test]
+    async fn a_digest_rides_the_same_throwaway_thread_under_its_own_instructions() {
+        let generator = CodexTitleGenerator {
+            source: scripted_source(vec![scripted_codex()]),
+            model: None,
+        };
+        let answer = crate::TitleGenerator::summarize(&generator, "Tidy these notes.").await;
+        assert_eq!(answer.unwrap(), "Fix login bug");
+
+        let fake = FakeAgentIo::never_exits(scripted_codex());
+        let captured = fake.captured_stdin();
+        let request = TitleRequest {
+            description: "Tidy these notes.".to_string(),
+            model: None,
+        };
+        let _ = ask(
+            Box::new(fake),
+            &request,
+            crate::SUMMARY_INSTRUCTIONS,
+            crate::SUMMARY_TIMEOUT,
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let written = String::from_utf8_lossy(&captured.lock().await.clone()).to_string();
+        let start_frame = written
+            .lines()
+            .find(|l| l.contains(r#""method":"thread/start""#))
+            .unwrap_or_else(|| panic!("no thread/start on the wire: {written}"));
+        assert!(start_frame.contains("faithful digests"), "frame: {start_frame}");
+        assert!(start_frame.contains(r#""ephemeral":true"#), "frame: {start_frame}");
     }
 }

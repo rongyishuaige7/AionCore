@@ -949,7 +949,7 @@ impl ConversationService {
         }
         if kept > 0 {
             port.catch_up_recall(user_id, assistant_id).await;
-            let condensed = self.condense_leaves_for_role(assistant_id, generator).await;
+            let (condensed, _) = self.condense_leaves_for_role(assistant_id, generator).await;
             if condensed > 0 {
                 port.catch_up_recall(user_id, assistant_id).await;
             }

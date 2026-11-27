@@ -1309,11 +1309,12 @@ impl RoleGovernanceAdapter {
             .await;
 
         let mut curated_memory = false;
+        let mut error = llm_outcome.error;
         if let Some(tidied) = llm_outcome.curated_memory {
             let stamp = chrono::Local::now().format("%Y-%m-%d-%H%M%S").to_string();
             // Only over the memory the dreamer read: a note the user took
             // back meanwhile is not brought back by the tidied copy.
-            if let Ok(Some(done)) = self
+            match self
                 .roles
                 .curate_memory_from(
                     role_id,
@@ -1325,13 +1326,27 @@ impl RoleGovernanceAdapter {
                 )
                 .await
             {
-                curated_memory = done.archived_as.is_some();
+                Ok(Some(done)) => curated_memory = done.archived_as.is_some(),
+                Ok(None) => {
+                    tracing::info!(
+                        role_id,
+                        "role dreamer: notes changed during the pass; the tidied copy is dropped"
+                    );
+                }
+                Err(curate_error) => {
+                    tracing::warn!(role_id, error = %curate_error, "role dreamer: tidied notes not saved");
+                    let reason = format!("curate: {curate_error}");
+                    error = Some(match error {
+                        Some(earlier) => format!("{earlier}; {reason}"),
+                        None => reason,
+                    });
+                }
             }
         }
 
         let _ = self
             .roles
-            .mark_dreamer_ran(role_id, aionui_common::now_ms(), llm_outcome.error.as_deref())
+            .mark_dreamer_ran(role_id, aionui_common::now_ms(), error.as_deref())
             .await;
         Ok(aionui_api_types::RoleDreamResponse {
             decayed_playbook,
@@ -1339,7 +1354,7 @@ impl RoleGovernanceAdapter {
             curated_memory,
             retrospective_ran: llm_outcome.retrospective_ran,
             condensed_batches: llm_outcome.condensed_batches,
-            error: llm_outcome.error,
+            error,
         })
     }
 }

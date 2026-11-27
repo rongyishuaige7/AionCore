@@ -47,7 +47,8 @@ const DREAMER_OVERDUE_MS: i64 = 44 * HOUR_MS;
 /// to do failed, `user_quiet_for` how long the user has sent no message, and
 /// `near_memory_cap` whether the memory is close to its cap. Passes stay at
 /// least two hours apart; a failed one is retried as soon as the user is
-/// quiet again.
+/// quiet again. A role never run before waits for the user to go quiet like
+/// any other: it is not overdue, only new.
 pub fn dreamer_due(
     now: i64,
     last_dreamer_at: i64,
@@ -59,7 +60,7 @@ pub fn dreamer_due(
     if since < DREAMER_MIN_GAP_MS {
         return false;
     }
-    if near_memory_cap || since >= DREAMER_OVERDUE_MS {
+    if near_memory_cap || (last_dreamer_at > 0 && since >= DREAMER_OVERDUE_MS) {
         return true;
     }
     user_quiet_for >= DREAMER_QUIET_MS && (since >= DREAMER_DAILY_MS || last_failed)
@@ -304,21 +305,46 @@ impl ConversationService {
         let Some(ctx) = port.retrospective_context(user_id, assistant_id).await else {
             return Ok(false);
         };
-        let now = now_ms();
         if !force
             && ctx.last_retrospective_at > 0
-            && now.saturating_sub(ctx.last_retrospective_at) < RETROSPECTIVE_MIN_INTERVAL_MS
+            && now_ms().saturating_sub(ctx.last_retrospective_at) < RETROSPECTIVE_MIN_INTERVAL_MS
         {
             return Ok(false);
         }
+        self.run_retrospective(
+            &port,
+            user_id,
+            assistant_id,
+            thread_conversation_id,
+            &ctx,
+            generator,
+            actor,
+            reason,
+        )
+        .await
+    }
 
+    /// One retrospective over `ctx`, the role as it stands now.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_retrospective(
+        &self,
+        port: &Arc<dyn ConversationRolePort>,
+        user_id: &str,
+        assistant_id: &str,
+        thread_conversation_id: Option<&str>,
+        ctx: &RoleRetrospectiveContext,
+        generator: &dyn TitleGenerator,
+        actor: &str,
+        reason: &str,
+    ) -> Result<bool, String> {
+        let now = now_ms();
         let evidence = self
-            .gather_retrospective_evidence(&port, user_id, assistant_id, thread_conversation_id, &ctx)
+            .gather_retrospective_evidence(port, user_id, assistant_id, thread_conversation_id, ctx)
             .await;
         if evidence.trim().is_empty() {
             return Ok(false);
         }
-        let prompt = retrospective_prompt(&ctx, &evidence);
+        let prompt = retrospective_prompt(ctx, &evidence);
 
         let answer =
             match tokio::time::timeout(SUMMARY_TIMEOUT + Duration::from_secs(30), generator.summarize(&prompt)).await {
@@ -438,12 +464,18 @@ impl ConversationService {
     }
 
     /// Condense batches of [`CONDENSE_BATCH_SIZE`] uncondensed `D0` leaves into
-    /// `condensed/` higher-level summaries. Returns how many batches were condensed.
-    pub(crate) async fn condense_leaves_for_role(&self, assistant_id: &str, generator: &dyn TitleGenerator) -> usize {
+    /// `condensed/` higher-level summaries. Returns how many batches were
+    /// condensed, and why it stopped short when the engine failed a batch.
+    pub(crate) async fn condense_leaves_for_role(
+        &self,
+        assistant_id: &str,
+        generator: &dyn TitleGenerator,
+    ) -> (usize, Option<String>) {
         let Some(port) = self.role_port() else {
-            return 0;
+            return (0, None);
         };
         let mut batches_done = 0;
+        let mut failure = None;
         // Cap per pass so one call stays bounded.
         for _ in 0..4 {
             let Some((conv_id, start_idx, batch)) = port
@@ -464,15 +496,18 @@ impl ConversationService {
                     Ok(Ok(ans)) => ans,
                     Ok(Err(error)) => {
                         warn!(assistant_id, error = %error, "role leaves: condensing failed");
+                        failure = Some(format!("condense: {error}"));
                         break;
                     }
                     Err(_) => {
                         warn!(assistant_id, "role leaves: condensing timed out");
+                        failure = Some("condense: timed out".to_owned());
                         break;
                     }
                 };
             let Some(summary) = clean_leaf(&answer) else {
                 warn!(assistant_id, "role leaves: condensed summary was cut off");
+                failure = Some("condense: the answer was cut off".to_owned());
                 break;
             };
             let header = condensed_span_header(&batch);
@@ -485,7 +520,7 @@ impl ConversationService {
             }
             batches_done += 1;
         }
-        batches_done
+        (batches_done, failure)
     }
 
     /// Execute the LLM-assisted portions of S5 Nightly Dreamer for `assistant_id`
@@ -502,6 +537,13 @@ impl ConversationService {
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> RoleDreamTasksOutcome {
         let mut outcome = RoleDreamTasksOutcome::default();
+        let line_count = current_memory.lines().filter(|l| !l.trim().is_empty()).count();
+        let curate_lines = if on_demand {
+            ON_DEMAND_CURATE_LINES
+        } else {
+            DREAMER_CURATE_LINES
+        };
+        let curate_due = current_memory.len() >= DREAMER_CURATE_THRESHOLD_BYTES || line_count >= curate_lines;
 
         // Pick a conversation of this role to snapshot a `TitleGenerator` from
         // (thread first, else most recent scheduled run).
@@ -515,6 +557,11 @@ impl ConversationService {
                 .and_then(|mut runs| runs.pop()),
         };
         let Some(conv_id) = candidate_conv else {
+            // Without a conversation there is nothing to review or condense,
+            // but notes that need tidying are left undone.
+            if curate_due {
+                outcome.error = Some("no conversation of this role to tidy its notes with yet".to_owned());
+            }
             return outcome;
         };
 
@@ -542,20 +589,15 @@ impl ConversationService {
             return outcome;
         };
         let mut errors = Vec::new();
-        let ctx = match self.role_port() {
+        let port = self.role_port();
+        let mut ctx = match &port {
             Some(port) => port.retrospective_context(user_id, assistant_id).await,
             None => None,
         };
 
         // 1. Verify & curate `MEMORY.md` when approaching the 64 KiB cap (>= 48 KiB)
         //    or when it has grown past its line count for this pass.
-        let line_count = current_memory.lines().filter(|l| !l.trim().is_empty()).count();
-        let curate_lines = if on_demand {
-            ON_DEMAND_CURATE_LINES
-        } else {
-            DREAMER_CURATE_LINES
-        };
-        if current_memory.len() >= DREAMER_CURATE_THRESHOLD_BYTES || line_count >= curate_lines {
+        if curate_due {
             match self
                 .verify_and_curate_memory(
                     assistant_id,
@@ -566,7 +608,13 @@ impl ConversationService {
                 )
                 .await
             {
-                Ok(curated) => outcome.curated_memory = Some(curated),
+                Ok(curated) => {
+                    // The review below reads the notes as they are about to be.
+                    if let Some(ctx) = ctx.as_mut() {
+                        ctx.memory.clone_from(&curated);
+                    }
+                    outcome.curated_memory = Some(curated);
+                }
                 Err(error) => {
                     warn!(assistant_id, error = %error, "role dreamer: memory not curated");
                     errors.push(error);
@@ -575,21 +623,21 @@ impl ConversationService {
         }
 
         // 2. Retrospective (weekly in background dreamer, or immediately when forced).
-        let due_weekly = ctx.as_ref().is_some_and(|ctx| {
-            on_demand
+        if let (Some(port), Some(ctx)) = (&port, &ctx)
+            && (on_demand
                 || ctx.last_retrospective_at == 0
-                || now_ms().saturating_sub(ctx.last_retrospective_at) >= WEEKLY_RETROSPECTIVE_MS
-        });
-        if due_weekly {
+                || now_ms().saturating_sub(ctx.last_retrospective_at) >= WEEKLY_RETROSPECTIVE_MS)
+        {
             match self
-                .maybe_run_retrospective(
+                .run_retrospective(
+                    port,
                     user_id,
                     assistant_id,
                     thread_conversation_id,
+                    ctx,
                     generator.as_ref(),
                     "dreamer",
                     "nightly retrospective",
-                    true,
                 )
                 .await
             {
@@ -599,9 +647,11 @@ impl ConversationService {
         }
 
         // 3. LCM leaf condensation (`D0` -> `condensed/`).
-        outcome.condensed_batches = self.condense_leaves_for_role(assistant_id, generator.as_ref()).await;
-        if outcome.condensed_batches > 0
-            && let Some(port) = self.role_port()
+        let (condensed, condense_error) = self.condense_leaves_for_role(assistant_id, generator.as_ref()).await;
+        outcome.condensed_batches = condensed;
+        errors.extend(condense_error);
+        if condensed > 0
+            && let Some(port) = &port
         {
             port.catch_up_recall(user_id, assistant_id).await;
         }
@@ -652,8 +702,9 @@ mod tests {
         let day_ago = NOW - 21 * HOUR_MS;
         assert!(!dreamer_due(NOW, day_ago, false, HOUR_MS, false));
         assert!(dreamer_due(NOW, day_ago, false, DREAMER_QUIET_MS, false));
-        // A role never run before goes on the first quiet stretch.
+        // A role never run before goes on the first quiet stretch, not sooner.
         assert!(dreamer_due(NOW, 0, false, DREAMER_QUIET_MS, false));
+        assert!(!dreamer_due(NOW, 0, false, 0, false));
     }
 
     #[test]

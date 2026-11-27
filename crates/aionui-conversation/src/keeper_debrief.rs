@@ -470,6 +470,7 @@ impl ConversationService {
             .await
             .filter(|context| context.role_id == keeper.role_id)
         else {
+            debug!(conversation_id, role_id = %keeper.role_id, "keeper save skipped: the project's keeper changed meanwhile");
             return;
         };
         if context.saves_today >= MAX_SAVES_PER_DAY {
@@ -616,7 +617,10 @@ impl ConversationService {
         let role_id = context.role_id.as_str();
         let engine = match self.keeper_engine(user_id, role_id).await {
             Ok(Some(engine)) => engine,
-            Ok(None) => return (Summarizer::Unavailable, Scratch::none()),
+            Ok(None) => {
+                debug!(role_id, "keeper save: the keeper has no engine set");
+                return (Summarizer::Unavailable, Scratch::none());
+            }
             Err(error) => {
                 warn!(role_id, error = %error, "keeper save: engine unknown");
                 return (Summarizer::Unavailable, Scratch::none());
