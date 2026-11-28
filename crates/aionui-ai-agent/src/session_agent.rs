@@ -2926,6 +2926,9 @@ fn spawn_event_pump(
         // window precisely: a trailing result rides the OLD gen (FIFO stdout), the
         // next turn's frames ride the new gen.
         let mut last_seen_turn_gen: u64 = 0;
+        let mut requested_compaction = None;
+        let mut confirmed_compaction = None;
+        let mut last_compaction_id = None;
         // 1s heartbeat for live progress cards. A background task has NO frames
         // between task_started and its terminal notification (verified: the
         // 2.1.220 bg capture goes 27 task_started → 41 task_updated with nothing
@@ -2961,6 +2964,24 @@ fn spawn_event_pump(
                     continue;
                 }
             };
+            if let SessionEvent::ContextCompactionRequested { pending } = &env.event {
+                if *pending {
+                    requested_compaction = Some(env.turn_gen);
+                } else if requested_compaction == Some(env.turn_gen) {
+                    requested_compaction = None;
+                }
+                continue;
+            }
+            let current_context = env.turn_gen >= last_seen_turn_gen;
+            if let SessionEvent::ContextCompacted { id, manual, .. } = &env.event {
+                if !current_context || id.as_ref().is_some_and(|id| Some(id) == last_compaction_id.as_ref()) {
+                    continue;
+                }
+                last_compaction_id.clone_from(id);
+                if *manual {
+                    confirmed_compaction = Some(env.turn_gen);
+                }
+            }
             runtime.touch();
             tracing::debug!(conv_id = %conversation_id, event = session_event_name(&env.event), "session-pump: backend event");
 
@@ -3430,14 +3451,45 @@ fn spawn_event_pump(
                     // crash error elsewhere, not a "the model had nothing to say" tip, and
                     // ACP likewise only tips on a completed prompt. An error result is
                     // excluded because it already terminates as `AgentStreamEvent::Error`.
-                    if let SessionEvent::TurnResult {
-                        is_error: false,
-                        outcome,
-                        ..
-                    } = &env.event
-                        && !saw_visible_output
-                    {
-                        pending_empty_turn_tip = empty_turn_tip(outcome);
+                    if let SessionEvent::TurnResult { is_error, outcome, .. } = &env.event {
+                        let requested = requested_compaction == Some(env.turn_gen);
+                        let confirmed = confirmed_compaction == Some(env.turn_gen);
+                        if requested {
+                            requested_compaction = None;
+                        }
+                        if confirmed {
+                            confirmed_compaction = None;
+                        }
+                        if !is_error {
+                            pending_empty_turn_tip = if current_context
+                                && (requested || confirmed)
+                                && matches!(
+                                    outcome,
+                                    aionui_session::TurnOutcome::EndTurn
+                                        | aionui_session::TurnOutcome::Completed {
+                                            stop_reason: aionui_session::StopReason::EndTurn
+                                        }
+                                ) {
+                                Some(TipsEventData {
+                                    content: String::new(),
+                                    tip_type: TipType::Info,
+                                    code: Some(
+                                        if confirmed {
+                                            "CONTEXT_COMPACTED"
+                                        } else {
+                                            "CONTEXT_COMPACT_UNCONFIRMED"
+                                        }
+                                        .into(),
+                                    ),
+                                    params: None,
+                                    supersedes_key: None,
+                                })
+                            } else if !saw_visible_output {
+                                empty_turn_tip(outcome)
+                            } else {
+                                None
+                            };
+                        }
                     }
                     // Live tool-output accumulators are per-turn; the authoritative
                     // full output already rode each ToolResult. Drop them so a long
@@ -3460,14 +3512,24 @@ fn spawn_event_pump(
             // Persist the Tier-2 side-effects the legacy ACP path wrote via
             // AcpSessionSyncService (which this direct-CLI path bypasses). Best-effort:
             // a repo error is warn-logged, never fatal to the stream.
-            if let Some(repo) = session_repo.as_ref() {
-                persist_side_effects(repo.as_ref(), &user_id, &conversation_id, &env.event).await;
+            if let Some(repo) = session_repo.as_ref()
+                && (current_context || !matches!(&env.event, SessionEvent::UsageDelta { report_id: Some(_), .. }))
+                && let Some(reading) = persist_side_effects(repo.as_ref(), &user_id, &conversation_id, &env.event).await
+                && let Some(bus) = broadcaster.as_ref()
+            {
+                broadcast_session_frame(
+                    bus.as_ref(),
+                    &conversation_id,
+                    &user_id,
+                    &AgentStreamEvent::AcpContextUsage(reading),
+                );
             }
             // Usage must ALSO reach the live view directly. claude reports it on the
             // `result` frame, which lands after the relay has already broken on
             // Finish, so the translated frame below would be shouted into an empty
             // room. Broadcasting straight from the pump (session-scoped, still alive)
             // is what turns claude's indicator on without waiting for a reload.
+            let identified_report = matches!(&env.event, SessionEvent::UsageDelta { report_id: Some(_), .. });
             if let (Some(bus), Some(_)) = (broadcaster.as_ref(), informative_usage(&env.event)) {
                 broadcast_usage_frame(
                     bus.as_ref(),
@@ -3476,6 +3538,11 @@ fn spawn_event_pump(
                     &env.event,
                     terminal_result_seen,
                 );
+                // Identified results travel on the conversation stream even
+                // when their originating turn has already lost its relay.
+                if identified_report {
+                    continue;
+                }
             }
             for mut ev in translate_event(env.event, &conversation_id, terminal_result_seen) {
                 // Keep the tool name alive across a call's multi-frame lifecycle (see
@@ -3626,7 +3693,7 @@ async fn persist_side_effects(
     user_id: &str,
     conversation_id: &str,
     event: &SessionEvent,
-) {
+) -> Option<serde_json::Value> {
     // Self-heal a dead resume anchor: a turn that failed *because* the stored
     // backend session id no longer resolves must null that id, or every subsequent
     // send re-resumes the same dead session and the conversation wedges forever.
@@ -3680,9 +3747,14 @@ async fn persist_side_effects(
         // AFTER the relay has already broken on Finish.
         _ => {}
     }
-    if let Some(usage) = informative_usage(event) {
-        persist_context_usage(repo, user_id, conversation_id, usage).await;
+    if matches!(
+        event,
+        SessionEvent::ContextCompacted { .. } | SessionEvent::ConfigChanged { model: Some(_), .. }
+    ) || informative_usage(event).is_some()
+    {
+        return persist_context_usage(repo, user_id, conversation_id, event).await;
     }
+    None
 }
 
 /// The single gate on whether a usage report says anything about context
@@ -3703,9 +3775,8 @@ async fn persist_side_effects(
 ///
 /// Note the successful compaction contradicts itself: `usage` reads zero while
 /// `modelUsage` reports what the compaction actually spent. Recording the zero
-/// overwrites a real occupancy figure — not merely stale but wrong, since a
-/// compaction leaves the context SMALLER, never empty. Dropping it keeps the last
-/// true reading until the next real turn reports the post-compaction size.
+/// overwrites a real occupancy figure. The boundary invalidates the snapshot
+/// and the next measured main call replaces it.
 ///
 /// DO NOT be tempted by `system{subtype:"compact_boundary"}`, which carries
 /// `compact_metadata{pre_tokens, post_tokens, cumulative_dropped_tokens}`. Its
@@ -3728,7 +3799,7 @@ fn informative_usage(event: &SessionEvent) -> Option<&SessionEvent> {
         // Discarding is silent otherwise, which makes "the indicator is stuck on an
         // old number" undiagnosable from logs. One line per no-op turn is cheap.
         SessionEvent::UsageDelta { .. } => {
-            tracing::debug!("usage report has no context measurement or billed tokens; keeping the previous reading");
+            tracing::debug!("usage report has no context measurement or billed tokens");
             None
         }
         _ => None,
@@ -3745,10 +3816,8 @@ fn informative_usage(event: &SessionEvent) -> Option<&SessionEvent> {
 /// by the time claude's arrives its turn is already closed, so there is no message
 /// to attach it to. The indicator reads `data`, keyed by conversation.
 ///
-/// A billed report goes through the open relay OR this late-report path. Sending
-/// both copies would bill the spend ledger twice, because the relay carries a
-/// turn id while the session-scoped frame does not. Context-only reports remain
-/// safe to duplicate and reach inactive views immediately.
+/// Identified reports always go through this path. For legacy billed reports
+/// without a stable identity, the open relay takes precedence over this path.
 fn broadcast_usage_frame(
     bus: &dyn EventBroadcaster,
     conversation_id: &str,
@@ -3757,18 +3826,21 @@ fn broadcast_usage_frame(
     terminal_result_seen: bool,
 ) {
     if !terminal_result_seen
-        && matches!(event, SessionEvent::UsageDelta { input_tokens, output_tokens, breakdown, .. }
+        && matches!(event, SessionEvent::UsageDelta { report_id: None, input_tokens, output_tokens, breakdown, .. }
             if *input_tokens > 0 || *output_tokens > 0 || !breakdown.is_empty())
     {
         return;
     }
-    let Some(frame) = translate_event(event.clone(), conversation_id, false)
+    if let Some(frame) = translate_event(event.clone(), conversation_id, false)
         .into_iter()
         .next()
-    else {
-        return;
-    };
-    let mut event_data = match serde_json::to_value(&frame) {
+    {
+        broadcast_session_frame(bus, conversation_id, user_id, &frame);
+    }
+}
+
+fn broadcast_session_frame(bus: &dyn EventBroadcaster, conversation_id: &str, user_id: &str, frame: &AgentStreamEvent) {
+    let mut event_data = match serde_json::to_value(frame) {
         Ok(v) => v,
         Err(err) => {
             tracing::warn!(conversation_id, error = %err, "usage broadcast: serialize failed");
@@ -3802,20 +3874,7 @@ async fn persist_context_usage(
     user_id: &str,
     conversation_id: &str,
     event: &SessionEvent,
-) {
-    let SessionEvent::UsageDelta {
-        input_tokens,
-        output_tokens,
-        context_tokens: used,
-        cost_usd,
-        context_window,
-        breakdown,
-        ..
-    } = event
-    else {
-        return;
-    };
-    let (used, cost_usd, context_window) = (*used, *cost_usd, *context_window);
+) -> Option<serde_json::Value> {
     let mut usage = match repo.load_runtime_state_for_user(user_id, conversation_id).await {
         Ok(Some(state)) => state
             .context_usage_json
@@ -3826,40 +3885,85 @@ async fn persist_context_usage(
         Ok(None) => serde_json::Map::new(),
         Err(err) => {
             tracing::warn!(conversation_id, error = %err, "session-sync: load_runtime_state failed; skipping usage persist");
-            return;
+            return None;
         }
     };
-    if let Some(used) = used {
-        usage.insert("used".into(), serde_json::json!(used));
-    }
-    if let Some(size) = context_window {
-        usage.insert("size".into(), serde_json::json!(size));
-    }
-    if let Some(cost) = cost_usd {
-        usage.insert("cost".into(), serde_json::json!({ "amount": cost, "currency": "USD" }));
-    }
-    // The detail line must survive a reload too — the renderer reads `_meta` off
-    // the GET /usage snapshot exactly as it does off a live frame. Merged like
-    // `size`/`cost`: only replaced when the incoming turn actually reported one.
-    if *input_tokens > 0 || *output_tokens > 0 || !breakdown.is_empty() {
-        usage.insert(
-            "_meta".into(),
-            serde_json::json!({
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "cached_read_tokens": breakdown.cached_read_tokens,
-                "cached_write_tokens": breakdown.cached_write_tokens,
-                "thought_tokens": breakdown.thought_tokens,
-            }),
-        );
-    }
-    let json = match serde_json::to_string(&usage) {
-        Ok(j) => j,
-        Err(err) => {
-            tracing::warn!(conversation_id, error = %err, "session-sync: encode context_usage failed");
-            return;
+    let context_state = match event {
+        SessionEvent::ContextCompacted { .. } => Some("compacted"),
+        SessionEvent::ConfigChanged { .. } if usage.contains_key("context_revision") => {
+            usage.remove("size");
+            Some("pending")
         }
+        SessionEvent::UsageDelta {
+            report_id,
+            input_tokens,
+            output_tokens,
+            context_tokens,
+            cost_usd,
+            context_window,
+            breakdown,
+            ..
+        } => {
+            if let Some(size) = context_window {
+                usage.insert("size".into(), serde_json::json!(size));
+            }
+            if let Some(cost) = cost_usd {
+                usage.insert("cost".into(), serde_json::json!({ "amount": cost, "currency": "USD" }));
+            }
+            if *input_tokens > 0 || *output_tokens > 0 || !breakdown.is_empty() {
+                usage.insert(
+                    "_meta".into(),
+                    serde_json::json!({
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                        "cached_read_tokens": breakdown.cached_read_tokens,
+                        "cached_write_tokens": breakdown.cached_write_tokens,
+                        "thought_tokens": breakdown.thought_tokens,
+                    }),
+                );
+            }
+            let used = context_tokens.filter(|used| {
+                report_id.is_none()
+                    || usage
+                        .get("size")
+                        .and_then(serde_json::Value::as_u64)
+                        .is_none_or(|size| size == 0 || *used <= size)
+            });
+            if let Some(used) = used {
+                usage.insert("used".into(), serde_json::json!(used));
+            }
+            report_id.map(|_| {
+                if used.is_some() {
+                    "ready"
+                } else if usage.get("context_state").and_then(serde_json::Value::as_str) == Some("compacted") {
+                    "compacted"
+                } else {
+                    "pending"
+                }
+            })
+        }
+        _ => return None,
     };
+    let reading = context_state.map(|state| {
+        if state != "ready" {
+            usage.remove("used");
+        }
+        let revision = usage
+            .get("context_revision")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            .saturating_add(1);
+        usage.insert("context_revision".into(), serde_json::json!(revision));
+        usage.insert("context_state".into(), serde_json::json!(state));
+        // Publish only context fields. Billing is emitted once via the report path.
+        serde_json::Value::Object(
+            ["used", "size", "context_state", "context_revision"]
+                .into_iter()
+                .filter_map(|key| usage.get(key).cloned().map(|value| (key.to_owned(), value)))
+                .collect(),
+        )
+    });
+    let json = serde_json::Value::Object(usage).to_string();
     let params = SaveRuntimeStateParams {
         context_usage_json: Some(Some(&json)),
         ..Default::default()
@@ -3869,7 +3973,9 @@ async fn persist_context_usage(
         .await
     {
         tracing::warn!(conversation_id, error = %err, "session-sync: save context_usage failed");
+        return None;
     }
+    reading
 }
 
 /// Extract the picked option id from the confirm `data` payload. The frontend sends
@@ -4591,6 +4697,7 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
         // Current context and per-turn billed counters share a frame, but never
         // a number: only an explicit context measurement may supply `used`.
         SessionEvent::UsageDelta {
+            report_id,
             input_tokens,
             output_tokens,
             context_tokens,
@@ -4608,7 +4715,9 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
             // `size` is emitted only when the backend reported a window; the frontend
             // guards `if size>0`, so `None` degrades to a counter with no percentage.
             let mut usage = serde_json::json!({});
-            if let Some(used) = context_tokens {
+            if let Some(report_id) = report_id {
+                usage["report_id"] = serde_json::json!(report_id);
+            } else if let Some(used) = context_tokens {
                 usage["used"] = serde_json::json!(used);
             }
             if let Some(size) = context_window {
@@ -5655,6 +5764,7 @@ mod translate_tests {
     fn usage_frame(total: u64, cost: Option<f64>, window: Option<u64>) -> serde_json::Value {
         let events = translate_event(
             SessionEvent::UsageDelta {
+                report_id: None,
                 input_tokens: 0,
                 output_tokens: 0,
                 total_tokens: total,
@@ -5691,6 +5801,7 @@ mod translate_tests {
     fn breakdown_rides_meta_under_the_renderer_key_names() {
         let with = translate_event(
             SessionEvent::UsageDelta {
+                report_id: None,
                 input_tokens: 1_100,
                 output_tokens: 194,
                 total_tokens: 18_400,
@@ -5900,6 +6011,7 @@ mod translate_tests {
     fn usage_delta_surfaces_as_context_usage() {
         let events = translate_event(
             SessionEvent::UsageDelta {
+                report_id: None,
                 input_tokens: 10,
                 output_tokens: 20,
                 total_tokens: 1_759_285,
@@ -6330,6 +6442,7 @@ mod persist_tests {
 
     fn usage(total: u64, cost: Option<f64>, window: Option<u64>) -> SessionEvent {
         SessionEvent::UsageDelta {
+            report_id: None,
             input_tokens: 0,
             output_tokens: 0,
             total_tokens: total,
@@ -6351,6 +6464,7 @@ mod persist_tests {
 
     fn measured_usage(context_tokens: Option<u64>, billed: u64) -> SessionEvent {
         SessionEvent::UsageDelta {
+            report_id: None,
             input_tokens: billed,
             output_tokens: 100,
             total_tokens: billed + 100,
@@ -6358,6 +6472,57 @@ mod persist_tests {
             cost_usd: None,
             context_window: None,
             breakdown: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn compaction_invalidates_the_saved_reading_until_a_new_measurement() {
+        let (repo, _db) = seeded_repo().await;
+        persist_side_effects(
+            repo.as_ref(),
+            "user-1",
+            "conv-1",
+            &usage(2_245_701, None, Some(1_000_000)),
+        )
+        .await;
+        let event = SessionEvent::ContextCompacted {
+            id: None,
+            manual: true,
+            epoch: 1,
+        };
+        let snapshot = persist_side_effects(repo.as_ref(), "user-1", "conv-1", &event)
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot,
+            serde_json::json!({
+                "context_state": "compacted", "context_revision": 1, "size": 1_000_000,
+            })
+        );
+        assert_eq!(stored_usage(repo.as_ref()).await, snapshot);
+
+        let id = uuid::Uuid::new_v4();
+        for (measured, revision, state) in [(None, 2, "compacted"), (Some(179_173), 3, "ready")] {
+            let mut report = measured_usage(measured, 19_612_778);
+            if let SessionEvent::UsageDelta { report_id, .. } = &mut report {
+                *report_id = Some(id);
+            }
+            let snapshot = persist_side_effects(repo.as_ref(), "user-1", "conv-1", &report)
+                .await
+                .unwrap();
+            assert_eq!(snapshot["context_revision"], revision);
+            assert_eq!(snapshot["context_state"], state);
+            assert_eq!(snapshot["used"].as_u64(), measured);
+            assert!(snapshot.get("_meta").is_none());
+            let stored = stored_usage(repo.as_ref()).await;
+            assert_eq!(stored["used"].as_u64(), measured);
+            assert_eq!(stored["_meta"]["input_tokens"], 19_612_778);
+            let AgentStreamEvent::AcpContextUsage(frame) = &translate_event(report, "conv-1", false)[0] else {
+                panic!("expected billing frame");
+            };
+            assert_eq!(frame["report_id"], id.to_string());
+            assert_eq!(frame["_meta"]["input_tokens"], 19_612_778);
+            assert!(frame.get("used").is_none());
         }
     }
 
@@ -6490,13 +6655,10 @@ mod persist_tests {
         );
     }
 
-    /// A `/compact` turn ends with an all-zero `usage` object (live-captured on
-    /// claude 2.1.220: `num_turns: 0`, every token bucket 0, `total_cost_usd`
-    /// unchanged). Recording it wiped the real figure to `used: 0` — observed in
-    /// the wild as "the indicator showed 0, then vanished". The zero report must be
-    /// dropped so the last true reading survives until the next real turn.
+    /// All-zero result counters alone must not clear the reading. A confirmed
+    /// compaction has its own invalidation event.
     #[tokio::test]
-    async fn zero_usage_after_compaction_does_not_wipe_the_real_figure() {
+    async fn zero_usage_alone_does_not_wipe_the_real_figure() {
         let (repo, _db) = seeded_repo().await;
         persist_side_effects(
             repo.as_ref(),
@@ -7665,6 +7827,66 @@ mod pump_tests {
         // Keep the task (hence the backend + pump) alive through the whole drain.
         drop(task);
         out
+    }
+
+    #[tokio::test]
+    async fn compact_reports_only_confirmed_manual_completion_before_finish() {
+        use aionui_session::TurnOutcome;
+        for (requested, boundary, outcome, expected) in [
+            (true, Some(true), TurnOutcome::EndTurn, Some("CONTEXT_COMPACTED")),
+            (true, None, TurnOutcome::EndTurn, Some("CONTEXT_COMPACT_UNCONFIRMED")),
+            (
+                true,
+                Some(false),
+                TurnOutcome::EndTurn,
+                Some("CONTEXT_COMPACT_UNCONFIRMED"),
+            ),
+            (false, Some(false), TurnOutcome::EndTurn, Some("ACP_EMPTY_TURN")),
+            (
+                true,
+                None,
+                TurnOutcome::Cancelled {
+                    reason: aionui_session::CancelReason::UserCancel,
+                },
+                None,
+            ),
+        ] {
+            let mut script = vec![env(SessionEvent::TurnStarted { epoch: 1 })];
+            if requested {
+                script.push(env(SessionEvent::ContextCompactionRequested { pending: true }));
+            }
+            if let Some(manual) = boundary {
+                script.push(env(SessionEvent::ContextCompacted {
+                    id: None,
+                    manual,
+                    epoch: 1,
+                }));
+            }
+            script.push(env(SessionEvent::TurnResult {
+                is_error: false,
+                api_error_status: None,
+                result_text: String::new(),
+                epoch: 1,
+                outcome,
+            }));
+            let frames = drain_script(script).await;
+            let finish = frames
+                .iter()
+                .position(|frame| matches!(frame, AgentStreamEvent::Finish(_)))
+                .unwrap();
+            let tips: Vec<_> = frames
+                .iter()
+                .enumerate()
+                .filter_map(|(index, frame)| {
+                    let AgentStreamEvent::Tips(tip) = frame else {
+                        return None;
+                    };
+                    assert!(index < finish);
+                    tip.code.as_deref()
+                })
+                .collect();
+            assert_eq!(tips, expected.into_iter().collect::<Vec<_>>());
+        }
     }
 
     fn frame_name(ev: &AgentStreamEvent) -> &'static str {

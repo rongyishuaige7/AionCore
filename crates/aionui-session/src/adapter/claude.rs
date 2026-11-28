@@ -29,18 +29,11 @@ pub struct ClaudeAdapter {
     /// text fragments emit as incremental `MessageDelta`s (typewriter) and the
     /// consolidated `assistant` frame skips re-emitting text it already streamed.
     stream: StreamState,
-    /// Context occupancy from the most recent API call in the session, summed as
-    /// `input + cache_creation + cache_read + output` off the last
-    /// `message_delta.usage`.
-    ///
-    /// Deliberately NOT per-message state: it must outlive `message_start`, since
-    /// the figure we want is the LAST call of the turn. `result.usage` cannot
-    /// supply it — that field AGGREGATES every API call in the turn, so a
-    /// four-tool-call turn reported 107_974 where the real occupancy was 27_467
-    /// (live-captured, 2.1.220; its `cache_read` 95_709 is exactly the four calls'
-    /// 15_493+26_345+26_485+27_386 summed). Feeding the aggregate to the usage
-    /// indicator drove it past 100% of the context window.
+    /// Last valid main-call usage, from an assistant or streaming frame.
+    /// Cleared when a native result consumes it or compaction rewrites context.
     last_call_tokens: Option<u64>,
+    /// Native result IDs recently consumed by this process, for repeated frames.
+    recent_result_ids: std::collections::VecDeque<uuid::Uuid>,
     /// Thinking tokens accumulated across the turn's API calls. `result.usage`
     /// reports `output_tokens_details: null` (live-captured), so the only source is
     /// each `message_delta.usage.output_tokens_details.thinking_tokens` — 60 on the
@@ -337,6 +330,8 @@ impl ClaudeAdapter {
     fn parse_system(&mut self, v: &Value) -> Vec<SessionEvent> {
         match v.get("subtype").and_then(Value::as_str).unwrap_or("") {
             "init" => {
+                // An interrupted wire turn can leave a call sample without a result.
+                self.last_call_tokens = None;
                 // Carries the live model id; latch it for `result_context_window`.
                 if let Some(model) = v.get("model").and_then(Value::as_str) {
                     self.current_model = Some(model.to_owned());
@@ -344,26 +339,15 @@ impl ClaudeAdapter {
                 Vec::new()
             }
             "compact_boundary" => {
-                // A compaction rewrites the context, so the occupancy latched off
-                // the last API call is now stale — and the compaction turn itself
-                // streams NO `message_delta` to refresh it (live-captured: five
-                // turns climbing to 27_349, then `compact_boundary{pre:27349,
-                // post:3158}` followed by a `result` with `num_turns:0` and a zero
-                // aggregate, then the next real turn reporting 23_779).
-                //
-                // Without this reset the stale 27_349 would survive the fallback
-                // and sail past the zero-usage guard, re-publishing a
-                // pre-compaction figure as if it were current. Dropping it lets the
-                // compaction's zero aggregate be discarded as intended, so the
-                // indicator holds its previous reading until the next real turn
-                // measures the new context.
-                //
-                // The boundary's own `post_tokens` cannot substitute: it counts the
-                // compacted transcript only (3_158 here) while occupancy also
-                // carries the system prompt and tools — the next turn measured
-                // 23_779, ~20k higher. Different baselines.
+                // The summary's token count excludes the system prompt and tools.
+                // Wait for a new main-call measurement after the context rewrite.
                 self.last_call_tokens = None;
-                vec![SessionEvent::Heartbeat]
+                let manual = v.pointer("/compact_metadata/trigger").and_then(Value::as_str) == Some("manual");
+                vec![SessionEvent::ContextCompacted {
+                    id: v.get("uuid").and_then(Value::as_str).map(str::to_owned),
+                    manual,
+                    epoch: 0,
+                }]
             }
             // network backoff + the no-chunk compaction window both = liveness.
             "api_retry" | "compacting" => vec![SessionEvent::Heartbeat],
@@ -388,6 +372,14 @@ impl ClaudeAdapter {
         // main agent. Read once here, threaded into each emitted ToolCall so the
         // conversation TurnFinalizer can hang the tool step under the right node.
         let parent_tool_use_id = v.get("parent_tool_use_id").and_then(Value::as_str).map(str::to_string);
+        if parent_tool_use_id.is_none()
+            && let Some(tokens) = msg
+                .and_then(|m| m.get("usage"))
+                .and_then(Value::as_object)
+                .and_then(primary_call_tokens)
+        {
+            self.last_call_tokens = Some(tokens);
+        }
         let blocks = msg
             .and_then(|m| m.get("content"))
             .and_then(Value::as_array)
@@ -580,9 +572,24 @@ impl ClaudeAdapter {
     /// terminal — codex already emits UsageDelta (map_usage); this closes the
     /// claude/codex asymmetry. The wrapping ClaudeConnection inherits both for free.
     fn parse_result(&mut self, v: &Value) -> Vec<SessionEvent> {
+        let id = v
+            .get("uuid")
+            .and_then(Value::as_str)
+            .and_then(|id| uuid::Uuid::parse_str(id).ok());
+        if let Some(id) = id {
+            if self.recent_result_ids.contains(&id) {
+                return Vec::new();
+            }
+            const RECENT_RESULT_LIMIT: usize = 64;
+            if self.recent_result_ids.len() == RECENT_RESULT_LIMIT {
+                self.recent_result_ids.pop_front();
+            }
+            self.recent_result_ids.push_back(id);
+        }
         // Turn terminal: any TodoWrite whose tool_result never arrived is dead
         // correlation state. Clearing here bounds the set to one turn.
         self.todo_tool_use_ids.clear();
+        let context_tokens = self.last_call_tokens.take();
         let is_error = v.get("is_error").and_then(Value::as_bool).unwrap_or(false);
         let result_text = match v.get("result").and_then(Value::as_str) {
             Some(s) if !s.is_empty() => s.to_string(),
@@ -651,27 +658,14 @@ impl ClaudeAdapter {
             let output_tokens = get("output_tokens");
             let cache_creation = get("cache_creation_input_tokens");
             let cache_read = get("cache_read_input_tokens");
-            // CONTEXT OCCUPANCY, not the turn's billed volume. `result.usage`
-            // aggregates every API call in the turn, so summing its buckets
-            // overstates occupancy by roughly the number of tool rounds (measured
-            // 107_974 vs a true 27_467 on a four-call turn) and pushed the usage
-            // indicator past 100%. Prefer the last call's own usage, tracked off
-            // `message_delta`. The aggregate remains the fallback for a turn that
-            // streamed no `message_delta` at all (no `--include-partial-messages`,
-            // or a resumed/consolidated frame); it is exact for a single-call turn
-            // and only overstates once tool rounds appear.
-            let context_tokens = self.last_call_tokens.unwrap_or_else(|| {
-                usage
-                    .get("total_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(input_tokens + output_tokens + cache_creation + cache_read)
-            });
+            // A result aggregates every call. Its UUID survives delivery through
+            // either the turn relay or the session-scoped late-report path.
             out.push(SessionEvent::UsageDelta {
+                report_id: Some(id.unwrap_or_else(uuid::Uuid::new_v4)),
                 input_tokens,
                 output_tokens,
                 total_tokens: input_tokens + output_tokens + cache_creation + cache_read,
-                // A zero aggregate on a no-op result does not measure context.
-                context_tokens: (context_tokens > 0).then_some(context_tokens),
+                context_tokens,
                 cost_usd: v.get("total_cost_usd").and_then(Value::as_f64),
                 context_window: self.result_context_window(v),
                 // Per-turn detail line. These stay on the AGGREGATE `result.usage`
@@ -886,12 +880,9 @@ impl ClaudeAdapter {
                 // `{input_tokens:2, cache_creation:79, cache_read:27386, output:5}`
                 // = 27_472, against an aggregate of 107_974.
                 if let Some(usage) = event.and_then(|e| e.get("usage")).and_then(Value::as_object) {
-                    let field = |k: &str| usage.get(k).and_then(Value::as_u64).unwrap_or(0);
-                    let occupancy = field("input_tokens")
-                        + field("cache_creation_input_tokens")
-                        + field("cache_read_input_tokens")
-                        + field("output_tokens");
-                    if occupancy > 0 {
+                    if v.get("parent_tool_use_id").is_none_or(Value::is_null)
+                        && let Some(occupancy) = primary_call_tokens(usage)
+                    {
                         self.last_call_tokens = Some(occupancy);
                     }
                     self.turn_thought_tokens += usage
@@ -1046,6 +1037,22 @@ impl ClaudeAdapter {
             phase,
         }]
     }
+}
+
+/// A primary API call can be measured only when its input count is present.
+/// Output-only deltas and all-zero diagnostic frames are not context samples.
+fn primary_call_tokens(usage: &serde_json::Map<String, Value>) -> Option<u64> {
+    let mut total = usage.get("input_tokens")?.as_u64()?;
+    for key in [
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+        "output_tokens",
+    ] {
+        if let Some(value) = usage.get(key) {
+            total = total.checked_add(value.as_u64()?)?;
+        }
+    }
+    (total > 0).then_some(total)
 }
 
 #[async_trait::async_trait]
@@ -2799,27 +2806,78 @@ mod tests {
         assert_eq!(next.thought_tokens, 0, "thinking must not carry into the next turn");
     }
 
-    /// Without any streamed `message_delta` the aggregate is the only figure
-    /// available, and for a single-call turn it IS the occupancy — so the fallback
-    /// must still produce a number rather than nothing.
     #[test]
-    fn without_streamed_calls_the_result_aggregate_is_used() {
-        let line = concat!(
-            r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","#,
-            r#""usage":{"input_tokens":2,"cache_creation_input_tokens":79,"#,
-            r#""cache_read_input_tokens":27386,"output_tokens":5}}"#,
-            "\n"
+    fn result_aggregate_alone_counts_for_billing_but_does_not_measure_context() {
+        let mut adapter = ClaudeAdapter::new();
+        let result = serde_json::json!({"type":"result", "usage":{"input_tokens":2,"cache_creation_input_tokens":79,"cache_read_input_tokens":27386,"output_tokens":5}});
+        assert!(adapter.parse_result(&result).iter().any(|event| matches!(
+            event,
+            SessionEvent::UsageDelta {
+                context_tokens: None,
+                total_tokens: 27_472,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn long_compacting_turn_and_background_turn_keep_distinct_usage() {
+        let mut adapter = ClaudeAdapter::new();
+        let call = |adapter: &mut ClaudeAdapter, tokens, parent| {
+            adapter.parse_assistant(&serde_json::json!({
+                "type":"assistant", "parent_tool_use_id":parent,
+                "message": {"usage":{"input_tokens": 2, "cache_read_input_tokens": tokens - 2}}
+            }));
+        };
+        let result = |id, total| serde_json::json!({"type":"result", "uuid":id, "usage":{"input_tokens":2,"cache_read_input_tokens":total - 2}});
+        for call_number in 1..=126 {
+            if call_number == 65 {
+                assert!(matches!(adapter.parse_system(&serde_json::json!({"type":"system", "subtype":"compact_boundary", "compact_metadata":{"trigger":"auto"}})).as_slice(),
+                    [SessionEvent::ContextCompacted { manual:false, .. }]));
+            }
+            call(
+                &mut adapter,
+                if call_number == 126 { 179_173 } else { 160_000 },
+                None::<&str>,
+            );
+        }
+        call(&mut adapter, 40_000, Some("child"));
+        let first_id = uuid::Uuid::from_u128(1);
+        let first = result(first_id, 19_612_878);
+        let reports = adapter.parse_result(&first);
+        assert!(reports.iter().any(|event| matches!(event, SessionEvent::UsageDelta {
+            report_id: Some(id), context_tokens: Some(179_173), total_tokens: 19_612_878, ..
+        } if *id == first_id)));
+
+        for call_number in 1..=6 {
+            call(
+                &mut adapter,
+                if call_number == 6 { 185_941 } else { 182_000 },
+                None::<&str>,
+            );
+        }
+        assert!(
+            adapter.parse_result(&first).is_empty(),
+            "duplicate result cannot consume the newer measurement"
         );
-        let mut a = ClaudeAdapter::new();
-        let total = a
-            .parse_chunk(line.as_bytes())
-            .into_iter()
-            .find_map(|e| match e {
-                SessionEvent::UsageDelta { context_tokens, .. } => context_tokens,
-                _ => None,
-            })
-            .expect("result emits a UsageDelta");
-        assert_eq!(total, 27_472);
+        let second_id = uuid::Uuid::from_u128(2);
+        assert!(adapter.parse_result(&result(second_id, 1_097_946)).iter().any(
+            |event| matches!(event, SessionEvent::UsageDelta {
+                report_id: Some(id), context_tokens: Some(185_941), total_tokens: 1_097_946, ..
+            } if *id == second_id)
+        ));
+        assert!(
+            adapter
+                .parse_result(&result(uuid::Uuid::from_u128(3), 100))
+                .iter()
+                .any(|event| matches!(
+                    event,
+                    SessionEvent::UsageDelta {
+                        context_tokens: None,
+                        ..
+                    }
+                ))
+        );
     }
 
     /// Replays a live-captured compaction: five turns climbing to 27_349, the
@@ -2859,7 +2917,10 @@ mod tests {
 
         // The compaction: boundary, then a zero-aggregate result with no delta.
         let boundary = r#"{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"manual","pre_tokens":27349,"post_tokens":3158}}"#;
-        a.parse_chunk(format!("{boundary}\n").as_bytes());
+        assert!(matches!(
+            a.parse_chunk(format!("{boundary}\n").as_bytes()).as_slice(),
+            [SessionEvent::ContextCompacted { manual: true, .. }]
+        ));
         let zero_result = r#"{"type":"result","subtype":"success","is_error":false,"result":"","usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0}}"#;
         assert_eq!(
             occupancy_of(a.parse_chunk(format!("{zero_result}\n").as_bytes())),
@@ -3158,12 +3219,17 @@ mod tests {
         assert!(sys("init").is_empty(), "init carries no signal");
 
         // network backoff + compaction window → Heartbeat (liveness).
-        for subtype in ["api_retry", "compact_boundary", "compacting"] {
+        for subtype in ["api_retry", "compacting"] {
             assert!(
                 matches!(sys(subtype).as_slice(), [SessionEvent::Heartbeat]),
                 "`{subtype}` must normalize to a single Heartbeat"
             );
         }
+
+        assert!(matches!(
+            sys("compact_boundary").as_slice(),
+            [SessionEvent::ContextCompacted { .. }]
+        ));
 
         // unknown subtype → opaque AdapterSpecific tagged `system/<subtype>` (never lost,
         // never a Heartbeat). Also the absent-subtype boundary → `system/`.

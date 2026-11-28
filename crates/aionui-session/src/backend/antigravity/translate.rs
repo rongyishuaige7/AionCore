@@ -392,6 +392,7 @@ impl Translator {
                 // Live waterline only. Publish the billed breakdown once, at
                 // result, so the spend ledger does not count each step twice.
                 out.push(SessionEvent::UsageDelta {
+                    report_id: None,
                     input_tokens: 0,
                     output_tokens: 0,
                     total_tokens: 0,
@@ -438,6 +439,7 @@ impl Translator {
             breakdown.thought_tokens = breakdown.thought_tokens.saturating_add(usage.thinking_tokens);
         }
         SessionEvent::UsageDelta {
+            report_id: None,
             input_tokens,
             output_tokens,
             total_tokens,

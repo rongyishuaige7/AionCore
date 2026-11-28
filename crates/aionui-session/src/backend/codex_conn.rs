@@ -3491,6 +3491,7 @@ fn map_usage(params: &Value) -> Vec<SessionEvent> {
     let last = usage.get("last").unwrap_or(&Value::Null);
     let g = |k: &str| last.get(k).and_then(Value::as_u64).unwrap_or(0);
     vec![SessionEvent::UsageDelta {
+        report_id: None,
         input_tokens: g("inputTokens"),
         output_tokens: g("outputTokens"),
         total_tokens: g("totalTokens"),

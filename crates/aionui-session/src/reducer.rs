@@ -183,6 +183,18 @@ pub fn step(state: &SessionState, event: SessionEvent) -> (SessionState, Vec<Tra
             (to, Vec::new())
         }
 
+        // Native manual compact completes without assistant prose. It is a
+        // substantive action only for the turn whose context was rewritten.
+        SessionEvent::ContextCompacted { manual: true, epoch, .. } => {
+            let mut to = state.clone();
+            if let SessionState::Running { since_epoch, saw_substantive_output, .. } = &mut to
+                && (epoch == 0 || epoch == *since_epoch)
+            {
+                *saw_substantive_output = true;
+            }
+            (to, Vec::new())
+        }
+
         // thinking/reasoning is NOT substantive (C5/I5): no state change.
         SessionEvent::ThoughtDelta { .. } => (state.clone(), Vec::new()),
 
@@ -400,6 +412,8 @@ pub fn step(state: &SessionState, event: SessionEvent) -> (SessionState, Vec<Tra
         // ==================================================================
         SessionEvent::PromptAccepted { .. }
         | SessionEvent::UsageDelta { .. }
+        | SessionEvent::ContextCompactionRequested { .. }
+        | SessionEvent::ContextCompacted { manual: false, .. }
         // LC-8a: Plan is a to-do SNAPSHOT — content within a Running turn, NOT a
         // state (cross-protocol verified). The reducer never reads it; only the
         // conversation layer projects it to the UI panel. Pure no-op here.
@@ -1064,6 +1078,7 @@ mod tests {
                 client_msg_id: "m".into(),
             },
             SessionEvent::UsageDelta {
+                report_id: None,
                 input_tokens: 1,
                 output_tokens: 1,
                 total_tokens: 2,
@@ -1220,6 +1235,7 @@ mod tests {
                 client_msg_id: "m".into(),
             },
             SessionEvent::UsageDelta {
+                report_id: None,
                 input_tokens: 1,
                 output_tokens: 1,
                 total_tokens: 2,
@@ -2231,6 +2247,7 @@ mod proptest_totality {
                 client_msg_id: "m".into()
             }),
             Just(SessionEvent::UsageDelta {
+                report_id: None,
                 input_tokens: 1,
                 output_tokens: 1,
                 total_tokens: 2,

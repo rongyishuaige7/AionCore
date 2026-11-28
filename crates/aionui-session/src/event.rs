@@ -137,12 +137,20 @@ pub enum SessionEvent {
         parent_tool_use_id: Option<String>,
     },
     /// backend-neutral "alive, no progress" heartbeat. claude sources (normalized
-    /// two ways by ClaudeAdapter): system/api_retry (network backoff) + compaction
-    /// (compact_boundary / SDK compacting, the no-chunk window). Since the deadline
+    /// by ClaudeAdapter): system/api_retry (network backoff) and SDK compacting
+    /// (the no-chunk window). Since the deadline
     /// janitor was removed (no auto-timeout), this is now a pure reducer no-op kept
     /// as an HONEST liveness/diagnostic signal — a future liveness consumer (e.g. a
     /// UI "still working" hint) can read it without re-introducing a deadline.
     Heartbeat,
+    /// The host sent a native manual compact command. Carries no prompt text.
+    ContextCompactionRequested { pending: bool },
+    /// The backend confirmed that it rewrote the primary conversation context.
+    ContextCompacted {
+        id: Option<String>,
+        manual: bool,
+        epoch: u64,
+    },
     /// Terminal result. Routing is by `is_error` (C7/R10), NEVER by subtype
     /// (measured: error turns still carry subtype="success").
     TurnResult {
@@ -323,6 +331,9 @@ pub enum SessionEvent {
     /// process-cumulative, so its conn re-bases it through a cost ledger before
     /// broadcast (see `claude_conn::CostLedger`).
     UsageDelta {
+        /// Stable report identity when supplied by the backend's terminal frame.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        report_id: Option<uuid::Uuid>,
         input_tokens: u64,
         output_tokens: u64,
         /// Billed token volume for this report; never used as context occupancy.
@@ -953,6 +964,7 @@ pub fn classify(event: &SessionEvent) -> EventClass {
         TurnStarted { .. }
         | Cancel
         | Heartbeat
+        | ContextCompactionRequested { .. }
         | Snapshot { .. }
         | Lagged { .. }
         | BackendBound { .. }
@@ -973,6 +985,7 @@ pub fn classify(event: &SessionEvent) -> EventClass {
         | AskResolved { .. }
         | PromptAccepted { .. }
         | UsageDelta { .. }
+        | ContextCompacted { .. }
         | Provisioning { .. }
         | Rewound { .. }
         | ConfigChanged { .. }
@@ -1020,6 +1033,7 @@ pub fn persist_tier(event: &SessionEvent) -> PersistTier {
             ItemStarted { .. } | ItemCompleted { .. } => PersistTier::Ephemeral, // lifecycle brackets
             CheckpointList { .. } => PersistTier::Ephemeral,                     // query response, not history
             CatalogUpdated { .. } => PersistTier::Ephemeral, // async catalog discovery, re-discovered on open (not history)
+            ContextCompacted { .. } => PersistTier::Ephemeral, // the usage snapshot carries invalidation
             SessionInfo { .. } => PersistTier::Ephemeral, // on-demand query snapshot, re-queryable (not history)
             SessionTitle { .. } => PersistTier::Ephemeral, // applied to conversations.name by the conversation layer, not history
             SubagentDetail { .. } => PersistTier::Ephemeral, // transient per-agent progress (roster fill, re-derivable)
@@ -1053,6 +1067,7 @@ pub fn persist_tier(event: &SessionEvent) -> PersistTier {
             TurnStarted { .. }
             | Cancel
             | Heartbeat
+            | ContextCompactionRequested { .. }
             | Snapshot { .. }
             | Lagged { .. }
             | BackendBound { .. }
@@ -1367,6 +1382,7 @@ mod additive_tests {
             (
                 "UsageDelta",
                 SessionEvent::UsageDelta {
+                    report_id: None,
                     input_tokens: 1,
                     output_tokens: 1,
                     total_tokens: 2,
@@ -1647,6 +1663,7 @@ mod additive_tests {
                 client_msg_id: "m-7".into(),
             },
             SessionEvent::UsageDelta {
+                report_id: None,
                 input_tokens: 100,
                 output_tokens: 50,
                 total_tokens: 150,

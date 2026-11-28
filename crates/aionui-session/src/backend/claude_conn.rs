@@ -1856,11 +1856,20 @@ async fn reader_task(
                 // falls back to cur_gen (first-frames / no regression). The
                 // orchestrator's restamp_epoch then propagates this into
                 // TurnResult.epoch (it copies env.turn_gen when the adapter left 0).
-                let env_gen = if matches!(ev, SessionEvent::TurnResult { .. }) && turn_open_epoch != 0 {
+                let follows_wire_turn = matches!(
+                    ev,
+                    SessionEvent::TurnResult { .. }
+                        | SessionEvent::UsageDelta { .. }
+                        | SessionEvent::ContextCompacted { .. }
+                );
+                let env_gen = if follows_wire_turn && turn_open_epoch != 0 {
                     turn_open_epoch
                 } else {
                     cur_gen
                 };
+                if let SessionEvent::ContextCompacted { epoch, .. } = &mut ev {
+                    *epoch = env_gen;
+                }
                 let _ = event_tx.send(SessionEnvelope {
                     session_id: session_id.clone(),
                     turn_gen: env_gen,
@@ -3137,7 +3146,7 @@ impl SessionBackend for ClaudeSessionBackend {
                 // process mid-turn (the reader clears it at the terminal). Set after
                 // a successful wake, before the wire write.
                 self.turn_in_flight.store(true, Ordering::SeqCst);
-                {
+                let cur_gen = {
                     // first-send-race-500 #2: is this the FIRST send on a process
                     // that has never accepted one? `turn_gen` is bumped only AFTER a
                     // successful delivery (below), so `== 0` ⇔ "no prompt has landed
@@ -3172,11 +3181,33 @@ impl SessionBackend for ClaudeSessionBackend {
                         first_send = starting,
                         "claude dispatch(Send): writing prompt to stdin"
                     );
-                    self.adapter
+                    let compact = matches!(content.as_slice(), [super::types::ContentBlock::Text(text)]
+                        if text.split_whitespace().next() == Some("/compact"));
+                    // Register intent before writing: the reader can see a terminal
+                    // result before dispatch returns. This does not advance the turn.
+                    let requested_gen = self.turn_gen.load(Ordering::SeqCst) + 1;
+                    let notify = |pending| {
+                        let _ = self.event_tx.send(SessionEnvelope {
+                            session_id: self.session_id.clone(),
+                            turn_gen: requested_gen,
+                            event: SessionEvent::ContextCompactionRequested { pending },
+                        });
+                    };
+                    if compact {
+                        notify(true);
+                    }
+                    let delivered = self
+                        .adapter
                         .deliver_prompt(stdin, &content, metadata.client_msg_id.as_deref())
-                        .await
-                        .map_err(|e| wrap(e.to_string()))?;
-                } // stdin lock released (microsecond frame-write lock, §5.4)
+                        .await;
+                    if compact && delivered.is_err() {
+                        notify(false);
+                    }
+                    delivered.map_err(|e| wrap(e.to_string()))?;
+                    // Keep intent and admission in the same write order when
+                    // two concurrent sends are waiting for stdin.
+                    self.turn_gen.fetch_add(1, Ordering::SeqCst) + 1
+                }; // stdin lock released (microsecond frame-write lock, §5.4)
                 tracing::info!(
                     conversation_id = %self.session_id,
                     "claude dispatch(Send): prompt delivered to stdin (awaiting CLI frames)"
@@ -3196,7 +3227,6 @@ impl SessionBackend for ClaudeSessionBackend {
                 // claude may sit on it for seconds, or DROP it if the turn is cancelled
                 // before it is drained — the bubble must not flip to sent until claude
                 // really took it). This brings claude to codex-parity (Native ack).
-                let cur_gen = self.turn_gen.fetch_add(1, Ordering::SeqCst) + 1;
                 Ok(CommandReceipt {
                     accepted: true,
                     admission: Admission::Started,

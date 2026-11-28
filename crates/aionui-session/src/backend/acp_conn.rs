@@ -1791,6 +1791,7 @@ async fn map_update(
                 .or_else(|| (input + output > 0).then_some(input + output));
             let cost_usd = update.get("cost").and_then(|c| c.get("amount")).and_then(Value::as_f64);
             vec![SessionEvent::UsageDelta {
+                report_id: None,
                 input_tokens: input,
                 output_tokens: output,
                 total_tokens: input + output,
@@ -1976,6 +1977,7 @@ fn parse_acp_result_usage(frame: &Value) -> Option<SessionEvent> {
         return None;
     }
     Some(SessionEvent::UsageDelta {
+        report_id: None,
         input_tokens: input,
         output_tokens: output,
         total_tokens: total,
